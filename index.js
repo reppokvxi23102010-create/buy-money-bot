@@ -27,8 +27,6 @@ const {
 
 // ==================== 1. KHỞI TẠO WEB SERVER (RENDER PORT BINDING) ====================
 const PORT = process.env.PORT || 10000;
-
-app.get('/', (req, res) => {
     res.send('👑 KingSMP AutoBuy Bot đang hoạt động 24/7!');
 });
 
