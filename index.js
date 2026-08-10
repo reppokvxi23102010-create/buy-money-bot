@@ -26,7 +26,6 @@ const {
 } = require('discord.js');
 
 // ==================== 1. KHỞI TẠO WEB SERVER (RENDER PORT BINDING) ====================
-const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.get('/', (req, res) => {
