@@ -171,21 +171,9 @@ async function registerSlashCommands() {
     } catch (error) { console.error('Lỗi reg command:', error); }
 }
 
-// ==================== SỰ KIỆN MESSAGE CREATE ====================
+// ==================== SỰ KIỆN MESSAGE CREATE (TỰ ĐỘNG BÁO STOCK) ====================
 client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
-
-    const allowedChannelIds = [
-        process.env.CHAT_CHUNG_CHANNEL_ID,
-        process.env.BLACK_MARKET_CHANNEL_ID
-    ].filter(Boolean);
-
-    const allowedChannelNames = ['chat-chung', 'black-market', 'blackmarket'];
-
-    const isAllowedChannel = allowedChannelIds.includes(message.channelId) || 
-                             allowedChannelNames.includes(message.channel.name?.toLowerCase());
-
-    if (!isAllowedChannel) return;
 
     const contentLower = message.content.toLowerCase();
     if (contentLower.includes('sell') || contentLower.includes('stock')) {
@@ -280,7 +268,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 if (action === 'app') {
                     if (currentStockM < amountM) {
                         return await interaction.followUp({
-                            content: `❌ Kho không đủ! Cần: **${amountM}M$**, Còn: **${formatStock(currentStockM)}**`,
+                            content: `❌ Kho không đủ! Cần: **${amountM.toLocaleString('vi-VN')}M$**, Còn: **${formatStock(currentStockM)}**`,
                             flags: MessageFlags.Ephemeral
                         });
                     }
@@ -324,7 +312,7 @@ client.on(Events.InteractionCreate, async interaction => {
                         new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary)
                     );
 
-                    await interaction.editReply({ embeds: [updatedEmbed], components: [activeRow] });
+                    await interaction.editReply({ embeds: [activeRow] });
 
                     try {
                         const user = await interaction.client.users.fetch(userId);
@@ -380,6 +368,13 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 if (vndAmount < 1000) {
                     return await interaction.reply({ content: '❌ Số tiền không hợp lệ! Vui lòng nhập từ 1.000 VNĐ trở lên.', flags: MessageFlags.Ephemeral });
+                }
+
+                if (moneyReceivedM > currentStockM) {
+                    return await interaction.reply({
+                        content: `❌ **Không thể mua!** Số Money bạn muốn mua (**${moneyReceivedM.toLocaleString('vi-VN')}M$**) vượt quá số dư trong kho hiện tại (**${formatStock(currentStockM)}**). Vui lòng nạp ít hơn!`,
+                        flags: MessageFlags.Ephemeral
+                    });
                 }
 
                 await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -452,6 +447,13 @@ client.on(Events.InteractionCreate, async interaction => {
                 const netVnd = Math.floor(cardValueVnd * 0.8);
                 const moneyReceivedM = netVnd > 0 ? Math.floor(netVnd / RATE) : 0;
 
+                if (moneyReceivedM > currentStockM) {
+                    return await interaction.reply({
+                        content: `❌ **Không thể mua!** Mệnh giá thẻ này quy đổi được **${moneyReceivedM.toLocaleString('vi-VN')}M$**, vượt quá số dư trong kho hiện tại (**${formatStock(currentStockM)}**). Vui lòng chọn thẻ mệnh giá nhỏ hơn!`,
+                        flags: MessageFlags.Ephemeral
+                    });
+                }
+
                 await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
                 try {
@@ -518,8 +520,13 @@ client.on(Events.InteractionCreate, async interaction => {
                 const priceBankVnd = Math.round(moneyM * RATE);
                 const requiredCardVnd = Math.round(priceBankVnd / 0.8);
 
+                let isOverStockWarning = '';
+                if (moneyM > currentStockM) {
+                    isOverStockWarning = `\n⚠️ **Cảnh báo:** Số Money này vượt quá Stock hiện tại trong kho (**${formatStock(currentStockM)}**).`;
+                }
+
                 return await interaction.reply({
-                    content: `🧮 **BẢNG TÍNH GIÁ MONEY**\n• Mua: \`${rawInput}\` $\rightarrow$ \`${moneyM}M$\`\n💵 Thanh toán Bank: \`${priceBankVnd.toLocaleString('vi-VN')} VNĐ\`\n🎟️ Thẻ cào nạp (-20%): \`${requiredCardVnd.toLocaleString('vi-VN')} VNĐ\``,
+                    content: `🧮 **BẢNG TÍNH GIÁ MONEY**\n• Mua: \`${rawInput}\` $\rightarrow$ \`${moneyM.toLocaleString('vi-VN')}M$\`\n💵 Thanh toán Bank: \`${priceBankVnd.toLocaleString('vi-VN')} VNĐ\`\n🎟️ Thẻ cào nạp (-20%): \`${requiredCardVnd.toLocaleString('vi-VN')} VNĐ\`${isOverStockWarning}`,
                     flags: MessageFlags.Ephemeral
                 });
             }
