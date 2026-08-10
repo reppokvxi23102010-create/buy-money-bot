@@ -1,4 +1,11 @@
+const http = require('http');
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.write('Bot is online!');
+  res.end();
+}).listen(process.env.PORT || 10000);
 require('dotenv').config();
+const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const {
@@ -19,6 +26,19 @@ const {
     ChannelType
 } = require('discord.js');
 
+// ==================== 1. KHỞI TẠO WEB SERVER (RENDER PORT BINDING) ====================
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get('/', (req, res) => {
+    res.send('👑 KingSMP AutoBuy Bot đang hoạt động 24/7!');
+});
+
+app.listen(PORT, () => {
+    console.log(`[HTTP Server] Web service listening on port ${PORT}`);
+});
+
+// ==================== 2. KHỞI TẠO DISCORD CLIENT ====================
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -137,25 +157,41 @@ async function updateAutoBuyPanel() {
     } catch (e) { console.error('Lỗi cập nhật Panel:', e.message); }
 }
 
-// ==================== SLASH COMMANDS ====================
+// ==================== SLASH COMMANDS DEFINITION ====================
 const commands = [
     new SlashCommandBuilder().setName('setup').setDescription('Thiết lập Bảng AutoBuy cố định vào kênh này'),
     new SlashCommandBuilder().setName('setstock').setDescription('Cập nhật số lượng kho Money').addStringOption(opt => opt.setName('amount').setDescription('Ví dụ: 10b, 500m...').setRequired(true))
 ];
 
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+// ==================== EVENT: READY ====================
+client.once('ready', async (c) => {
+    console.log(`🤖 Bot đã online thành công với tên: ${c.user.tag}`);
+    
+    // Đăng ký Slash Commands sau khi đã sẵn sàng
+    const token = process.env.DISCORD_TOKEN || process.env.TOKEN;
+    const clientId = process.env.CLIENT_ID || process.env.APPLICATION_ID;
 
-(async () => {
-    try {
-        if (process.env.GUILD_ID) {
-            await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID), { body: commands });
-        } else {
-            await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body: commands });
+    if (token && clientId) {
+        const rest = new REST({ version: '10' }).setToken(token);
+        try {
+            console.log('🔄 Đang đăng ký Slash Commands...');
+            if (process.env.GUILD_ID) {
+                await rest.put(Routes.applicationGuildCommands(clientId, process.env.GUILD_ID), { body: commands });
+            } else {
+                await rest.put(Routes.applicationCommands(clientId), { body: commands });
+            }
+            console.log('✅ Đã đăng ký Slash Commands thành công!');
+        } catch (error) {
+            console.error('❌ Lỗi đăng ký Slash Commands:', error);
         }
-    } catch (error) { console.error('Lỗi reg command:', error); }
-})();
+    } else {
+        console.error('⚠️ Thiếu DISCORD_TOKEN hoặc CLIENT_ID trong Environment Variables!');
+    }
 
-// ==================== SỰ KIỆN MESSAGE CREATE (CHỈ GỬI BÊN DƯỚI) ====================
+    await updateAutoBuyPanel();
+});
+
+// ==================== SỰ KIỆN MESSAGE CREATE ====================
 client.on('messageCreate', async message => {
     if (message.author.bot) return;
 
@@ -513,9 +549,10 @@ client.on('interactionCreate', async interaction => {
     }
 });
 
-client.once('clientReady', async c => {
-    console.log(`🤖 Bot đã online: ${c.user.tag}`);
-    await updateAutoBuyPanel();
-});
-
-client.login(process.env.DISCORD_TOKEN);
+// ==================== ĐĂNG NHẬP BOT ====================
+const token = process.env.DISCORD_TOKEN || process.env.TOKEN;
+if (token) {
+    client.login(token);
+} else {
+    console.error('❌ LỖI: Không tìm thấy Token trong biến môi trường!');
+}
