@@ -1414,6 +1414,81 @@ function createAccEmbed(acc) {
     return embed;
 }
 
+
+async function updateAccListingMessage(acc) {
+    if (!acc?.channelId || !acc?.messageId) {
+        console.log(`⚠️ Không có channelId/messageId để cập nhật listing: ${acc?.username || acc?.id}`);
+        return false;
+    }
+
+    try {
+        const channel = await client.channels.fetch(String(acc.channelId));
+
+        if (!channel || !channel.isTextBased()) {
+            console.error(`❌ Không truy cập được channel listing của acc ${acc.username}`);
+            return false;
+        }
+
+        const message = await channel.messages.fetch(String(acc.messageId));
+
+        const soldRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`sold_${acc.id}`)
+                .setLabel('🔴 Đã Bán')
+                .setStyle(ButtonStyle.Danger)
+                .setDisabled(true)
+        );
+
+        await message.edit({
+            embeds: [createAccEmbed(acc)],
+            components: [soldRow]
+        });
+
+        console.log(`✅ Listing ${acc.username} đã chuyển sang ĐÃ BÁN.`);
+        return true;
+    } catch (err) {
+        console.error(
+            `❌ Không cập nhật được listing ${acc.username}:`,
+            err?.message || err
+        );
+        return false;
+    }
+}
+
+async function updateAccListingAvailable(acc) {
+    if (!acc?.channelId || !acc?.messageId) return false;
+
+    try {
+        const channel = await client.channels.fetch(String(acc.channelId));
+
+        if (!channel || !channel.isTextBased()) return false;
+
+        const message = await channel.messages.fetch(String(acc.messageId));
+
+        const buyRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`buy_single_${acc.id}`)
+                .setLabel('Mua Ngay')
+                .setEmoji('🛒')
+                .setStyle(ButtonStyle.Success)
+        );
+
+        await message.edit({
+            embeds: [createAccEmbed(acc)],
+            components: [buyRow]
+        });
+
+        console.log(`✅ Listing ${acc.username} đã trở lại CÓ SẴN.`);
+        return true;
+    } catch (err) {
+        console.error(
+            `❌ Không cập nhật được listing available ${acc.username}:`,
+            err?.message || err
+        );
+        return false;
+    }
+}
+
 // ============================================================
 // 14. ACCOUNT COMMANDS
 // ============================================================
@@ -1932,8 +2007,13 @@ async function handleAccSelectMenu(interaction) {
         target.status = 'sold';
         target.pendingTicketId = null;
         target.pendingBuyerId = null;
+        target.soldAt = Date.now();
 
         saveDetailedAccs(accs);
+
+        // CỰC QUAN TRỌNG: cập nhật bài đăng gốc ngay sau khi giao acc.
+        // Nếu không có bước này, bài đăng vẫn hiển thị "🟢 Có Sẵn".
+        await updateAccListingMessage(target);
 
         const closeRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -2389,33 +2469,7 @@ async function handleCloseTicket(interaction) {
 
             saveDetailedAccs(accs);
 
-            try {
-                const ch =
-                    await client.channels.fetch(
-                        target.channelId
-                    );
-
-                const msg =
-                    await ch.messages.fetch(
-                        target.messageId
-                    );
-
-                const row =
-                    new ActionRowBuilder().addComponents(
-                        new ButtonBuilder()
-                            .setCustomId(
-                                `buy_single_${target.id}`
-                            )
-                            .setLabel('Mua Ngay')
-                            .setEmoji('🛒')
-                            .setStyle(ButtonStyle.Success)
-                    );
-
-                await msg.edit({
-                    embeds: [createAccEmbed(target)],
-                    components: [row]
-                });
-            } catch (err) {}
+            await updateAccListingAvailable(target);
         }
     }
 
