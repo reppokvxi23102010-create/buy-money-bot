@@ -1094,7 +1094,40 @@ async function handleMoneyModal(interaction) {
             });
 
             orders[orderId].ticketChannelId = ticketChannel.id;
+            orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
             saveMoneyOrders(orders);
+
+            // 🔔 THÔNG BÁO ADMIN KHI CÓ TICKET MONEY MỚI
+            let adminNotified = false;
+            if (process.env.LOG_CHANNEL_ID) {
+                try {
+                    const logChannel = await client.channels.fetch(process.env.LOG_CHANNEL_ID);
+                    if (logChannel?.isTextBased()) {
+                        await logChannel.send({
+                            content: process.env.ADMIN_DISCORD_ID
+                                ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET MONEY MỚI!**`
+                                : '🚨 **CÓ TICKET MONEY MỚI!**',
+                            embeds: [qrEmbed]
+                        });
+                        adminNotified = true;
+                    }
+                } catch (err) {
+                    console.error('❌ Không gửi được log ticket bank:', err?.message || err);
+                }
+            }
+
+            // Nếu không có LOG_CHANNEL_ID hoặc log lỗi thì DM Admin.
+            if (!adminNotified && process.env.ADMIN_DISCORD_ID) {
+                try {
+                    const adminUser = await client.users.fetch(process.env.ADMIN_DISCORD_ID);
+                    await adminUser.send({
+                        content: '🚨 **CÓ TICKET MONEY MỚI!**',
+                        embeds: [qrEmbed]
+                    });
+                } catch (err) {
+                    console.error('❌ Không gửi được DM Admin:', err?.message || err);
+                }
+            }
 
             return safeEditReply(interaction, {
                 content:
@@ -1297,6 +1330,12 @@ async function handleMoneyModal(interaction) {
                 components: [adminRow]
             });
 
+            orders[orderId].ticketChannelId = ticketChannel.id;
+            orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
+            saveMoneyOrders(orders);
+
+            // 🔔 THÔNG BÁO ADMIN KHI CÓ TICKET THẺ MỚI
+            let adminNotified = false;
             if (process.env.LOG_CHANNEL_ID) {
                 try {
                     const logChannel =
@@ -1305,18 +1344,29 @@ async function handleMoneyModal(interaction) {
                     if (logChannel?.isTextBased()) {
                         await logChannel.send({
                             content:
-                                `🎟️ Có đơn nạp thẻ mới: ${ticketChannel}\n` +
-                                `🆔 \`${orderId}\``,
+                                (process.env.ADMIN_DISCORD_ID
+                                    ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET THẺ MỚI!**`
+                                    : '🚨 **CÓ TICKET THẺ MỚI!**'),
                             embeds: [cardEmbed]
                         });
+                        adminNotified = true;
                     }
                 } catch (err) {
-                    console.error('Lỗi log card:', err.message);
+                    console.error('❌ Không gửi được log ticket card:', err?.message || err);
                 }
             }
 
-            orders[orderId].ticketChannelId = ticketChannel.id;
-            saveMoneyOrders(orders);
+            if (!adminNotified && process.env.ADMIN_DISCORD_ID) {
+                try {
+                    const adminUser = await client.users.fetch(process.env.ADMIN_DISCORD_ID);
+                    await adminUser.send({
+                        content: '🚨 **CÓ TICKET THẺ MỚI!**',
+                        embeds: [cardEmbed]
+                    });
+                } catch (err) {
+                    console.error('❌ Không gửi được DM Admin:', err?.message || err);
+                }
+            }
 
             return safeEditReply(interaction, {
                 content:
