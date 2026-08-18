@@ -54,7 +54,7 @@ const client = new Client({
 // 3. CONFIG
 // ============================================================
 
-// RATE được lưu trong config.json và có thể đổi bằng /rate
+const RATE = 120; // VNĐ / 1M$
 const CARD_DISCOUNT = 0.20;
 
 const BANK_CONFIG = {
@@ -253,7 +253,6 @@ function saveMoneyOrders(data) {
 
 let currentStockM = loadStock();
 let moneyConfig = loadMoneyConfig();
-let RATE = Number(moneyConfig.rate) > 0 ? Number(moneyConfig.rate) : 130;
 
 function formatStock(moneyM) {
     moneyM = Number(moneyM) || 0;
@@ -543,36 +542,6 @@ async function handleMoneyCommand(interaction) {
         } catch (err) {
             return safeEditReply(interaction, {
                 content: `❌ Thất bại: \`${err.message}\``
-            });
-        }
-    }
-
-    if (interaction.commandName === 'rate') {
-        if (!(await safeDeferReply(interaction, {
-            flags: MessageFlags.Ephemeral
-        }))) return;
-
-        try {
-            const newRate = interaction.options.getInteger('value');
-
-            if (!Number.isInteger(newRate) || newRate <= 0) {
-                return safeEditReply(interaction, {
-                    content: '❌ Rate không hợp lệ. Ví dụ: `/rate value:130`'
-                });
-            }
-
-            RATE = newRate;
-            moneyConfig.rate = RATE;
-            saveMoneyConfig(moneyConfig);
-
-            await updateAutoBuyPanel();
-
-            return safeEditReply(interaction, {
-                content: `✅ Đã đổi Rate thành **${RATE}đ / 1M$**\n\n📌 Rate được lưu vào config.json nên restart bot vẫn giữ nguyên.`
-            });
-        } catch (err) {
-            return safeEditReply(interaction, {
-                content: `❌ Không thể đổi Rate: \`${err.message}\``
             });
         }
     }
@@ -1094,40 +1063,7 @@ async function handleMoneyModal(interaction) {
             });
 
             orders[orderId].ticketChannelId = ticketChannel.id;
-            orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
             saveMoneyOrders(orders);
-
-            // 🔔 THÔNG BÁO ADMIN KHI CÓ TICKET MONEY MỚI
-            let adminNotified = false;
-            if (process.env.LOG_CHANNEL_ID) {
-                try {
-                    const logChannel = await client.channels.fetch(process.env.LOG_CHANNEL_ID);
-                    if (logChannel?.isTextBased()) {
-                        await logChannel.send({
-                            content: process.env.ADMIN_DISCORD_ID
-                                ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET MONEY MỚI!**`
-                                : '🚨 **CÓ TICKET MONEY MỚI!**',
-                            embeds: [qrEmbed]
-                        });
-                        adminNotified = true;
-                    }
-                } catch (err) {
-                    console.error('❌ Không gửi được log ticket bank:', err?.message || err);
-                }
-            }
-
-            // Nếu không có LOG_CHANNEL_ID hoặc log lỗi thì DM Admin.
-            if (!adminNotified && process.env.ADMIN_DISCORD_ID) {
-                try {
-                    const adminUser = await client.users.fetch(process.env.ADMIN_DISCORD_ID);
-                    await adminUser.send({
-                        content: '🚨 **CÓ TICKET MONEY MỚI!**',
-                        embeds: [qrEmbed]
-                    });
-                } catch (err) {
-                    console.error('❌ Không gửi được DM Admin:', err?.message || err);
-                }
-            }
 
             return safeEditReply(interaction, {
                 content:
@@ -1330,12 +1266,6 @@ async function handleMoneyModal(interaction) {
                 components: [adminRow]
             });
 
-            orders[orderId].ticketChannelId = ticketChannel.id;
-            orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
-            saveMoneyOrders(orders);
-
-            // 🔔 THÔNG BÁO ADMIN KHI CÓ TICKET THẺ MỚI
-            let adminNotified = false;
             if (process.env.LOG_CHANNEL_ID) {
                 try {
                     const logChannel =
@@ -1344,29 +1274,18 @@ async function handleMoneyModal(interaction) {
                     if (logChannel?.isTextBased()) {
                         await logChannel.send({
                             content:
-                                (process.env.ADMIN_DISCORD_ID
-                                    ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET THẺ MỚI!**`
-                                    : '🚨 **CÓ TICKET THẺ MỚI!**'),
+                                `🎟️ Có đơn nạp thẻ mới: ${ticketChannel}\n` +
+                                `🆔 \`${orderId}\``,
                             embeds: [cardEmbed]
                         });
-                        adminNotified = true;
                     }
                 } catch (err) {
-                    console.error('❌ Không gửi được log ticket card:', err?.message || err);
+                    console.error('Lỗi log card:', err.message);
                 }
             }
 
-            if (!adminNotified && process.env.ADMIN_DISCORD_ID) {
-                try {
-                    const adminUser = await client.users.fetch(process.env.ADMIN_DISCORD_ID);
-                    await adminUser.send({
-                        content: '🚨 **CÓ TICKET THẺ MỚI!**',
-                        embeds: [cardEmbed]
-                    });
-                } catch (err) {
-                    console.error('❌ Không gửi được DM Admin:', err?.message || err);
-                }
-            }
+            orders[orderId].ticketChannelId = ticketChannel.id;
+            saveMoneyOrders(orders);
 
             return safeEditReply(interaction, {
                 content:
@@ -2570,8 +2489,7 @@ async function handleCloseTicket(interaction) {
 
 const MONEY_COMMAND_NAMES = [
     'setup',
-    'setstock',
-    'rate'
+    'setstock'
 ];
 
 const ACC_COMMAND_NAMES = [
@@ -2602,17 +2520,6 @@ const commands = [
                 .setDescription(
                     'Ví dụ: 10b, 500m, 5000m'
                 )
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
-        .setName('rate')
-        .setDescription('Đổi tỷ giá Money (VNĐ / 1M$)')
-        .addIntegerOption(opt =>
-            opt
-                .setName('value')
-                .setDescription('Rate mới, ví dụ: 130')
-                .setMinValue(1)
                 .setRequired(true)
         ),
 
