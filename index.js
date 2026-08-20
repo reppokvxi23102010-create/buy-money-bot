@@ -1,3 +1,19 @@
+// 1. Bắt tất cả các Promise bị reject mà không có .catch() (Lỗi API, SSL, Network)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ [Unhandled Rejection] Bắt được lỗi Promise chưa xử lý:');
+  console.error(reason);
+});
+
+// 2. Bắt các ngoại lệ đồng bộ chưa được bọc trong try-catch
+process.on('uncaughtException', (err, origin) => {
+  console.error('💥 [Uncaught Exception] Bắt được lỗi ngoại lệ toàn cục:');
+  console.error(err);
+});
+
+// 3. Giám sát ngoại lệ nâng cao (Tránh trình cắm khác làm đứt đoạn log)
+process.on('uncaughtExceptionMonitor', (err, origin) => {
+  console.error('🔍 [Exception Monitor]:', err);
+});
 require('dotenv').config();
 
 const http = require('http');
