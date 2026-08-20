@@ -1,0 +1,89 @@
+const axios = require('axios');
+const crypto = require('crypto');
+const express = require('express');
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const THEGIARE_CONFIG = {
+    PARTNER_ID: 'YOUR_PARTNER_ID',       // Lấy tại id.thegiare.com
+    PARTNER_KEY: 'YOUR_PARTNER_KEY',     // Lấy tại id.thegiare.com
+    API_URL: 'https://thegiare.com/api/charging-w2'
+};
+
+// 1. HÀM GỬI THẺ CÀO LÊN THEGIARE
+async function sendCardToThegiare({ telco, code, serial, declaredAmount, requestId }) {
+    try {
+        // Tạo chữ ký MD5: md5(partner_key + code + serial)
+        const sign = crypto
+            .createHash('md5')
+            .update(THEGIARE_CONFIG.PARTNER_KEY + code + serial)
+            .digest('hex');
+
+        const formData = new URLSearchParams({
+            telco: telco.toUpperCase(), // VIETTEL, VINAPHONE, MOBIFONE, ZING...
+            code: code,
+            serial: serial,
+            amount: declaredAmount,    // Mệnh giá khai báo (10000, 20000, 50000...)
+            request_id: requestId,      // Mã giao dịch duy nhất do bạn tự tạo
+            partner_id: THEGIARE_CONFIG.PARTNER_ID,
+            sign: sign,
+            command: 'charging'
+        });
+
+        const response = await axios.post(THEGIARE_CONFIG.API_URL, formData.toString(), {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+
+        return response.data; 
+        // Trả về { status: 99, message: "Thẻ đã gửi thành công, chờ xử lý" }
+    } catch (error) {
+        console.error('[THEGIARE ERROR]', error.response?.data || error.message);
+        throw error;
+    }
+}
+
+// 2. WEBHOOK CALLBACK: THEGIARE TRẢ KẾT QUẢ VỀ SERVER CỦA BẠN
+// Đặt URL này vào mục Callback URL trên id.thegiare.com (Ví dụ: http://your-ip:3000/webhook/thegiare)
+app.post('/webhook/thegiare', async (req, res) => {
+    try {
+        const { status, message, request_id, declared_amount, value, amount, code, serial, callback_sign } = req.body;
+
+        // Xác thực callback bằng MD5: md5(partner_key + code + serial)
+        const expectedSign = crypto
+            .createHash('md5')
+            .update(THEGIARE_CONFIG.PARTNER_KEY + code + serial)
+            .digest('hex');
+
+        if (callback_sign !== expectedSign) {
+            return res.status(400).send('Invalid signature');
+        }
+
+        // Xử lý các trạng thái thẻ
+        if (status === 1) {
+            // Thẻ đúng - `amount` là số tiền thực nhận sau chiết khấu
+            console.log(`[SUCCESS] Thẻ ${request_id} thành công! Thực nhận: ${amount} VNĐ`);
+            
+            // TODO: Gọi hàm cộng money in-game / RCON / gửi thông báo Discord tại đây
+            
+        } else if (status === 2) {
+            // Thẻ sai mệnh giá (Thường bị phạt % chiết khấu)
+            console.log(`[WRONG_AMOUNT] Thẻ ${request_id} sai mệnh giá. Khai báo: ${declared_amount}, Thực tế: ${value}`);
+            
+        } else {
+            // Thẻ sai, đã sử dụng hoặc không hợp lệ (status === 3 hoặc khác)
+            console.log(`[FAILED] Thẻ ${request_id} thất bại: ${message}`);
+        }
+
+        // Bắt buộc phản hồi 200 OK để Thegiare xác nhận đã nhận dữ liệu
+        res.status(200).send('OK');
+    } catch (err) {
+        console.error('[CALLBACK ERROR]', err);
+        res.status(500).send('Internal Server Error');
+    }
+});
+
+app.listen(3000, () => console.log('Listening for Thegiare Callback on port 3000'));
+
+module.exports = { sendCardToThegiare };
