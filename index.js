@@ -1012,7 +1012,7 @@ async function handleMoneyModal(interaction) {
         }
 
         const totalVnd = quantity * SPAWNER_PRICE;
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral })))) return;
+        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
 
         const orderId = `SP${Date.now()}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
         const memo = `KSMP SP ${ign}`;
@@ -1078,7 +1078,7 @@ async function handleMoneyModal(interaction) {
             return safeReply(interaction, { content: `❌ Số lượng quy đổi vượt kho Spawner hiện tại (${formatSpawnerStock(currentStockSp)}).`, flags: MessageFlags.Ephemeral });
         }
 
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral })))) return;
+        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
 
         const orderId = `SPC${Date.now()}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
         const orders = getSpawnerOrders();
