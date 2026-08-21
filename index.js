@@ -1,6 +1,6 @@
 const http = require('http');
 
-// Tạo web server ảo để Render không báo lỗi port
+// Web server ảo cho Render
 http.createServer((req, res) => {
     res.write("Bot Discord đang hoạt động!");
     res.end();
@@ -30,7 +30,7 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent, // Quan trọng: Bắt buộc để đọc Bill khách gửi
+        GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildPresences
     ]
@@ -129,8 +129,7 @@ client.once('ready', async () => {
             new SlashCommandBuilder().setName('shop').setDescription('Mở bảng cửa hàng spawner').toJSON(),
             new SlashCommandBuilder()
                 .setName('price')
-                .setDescription('Thay đổi giá (Chỉ Admin)')
-                .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+                .setDescription('Thay đổi giá spawner (Dành cho Admin)')
                 .addStringOption(option => option.setName('type').setDescription('Loại spawner').setRequired(true)
                     .addChoices(
                         { name: 'Skeleton Spawner', value: 'ske' },
@@ -138,12 +137,12 @@ client.once('ready', async () => {
                         { name: 'Creeper Spawner', value: 'creeper' },
                         { name: 'Iron Golem Spawner', value: 'golem' }
                     ))
-                .addIntegerOption(option => option.setName('amount').setDescription('Giá tiền (VNĐ)').setRequired(true))
+                .addIntegerOption(option => option.setName('amount').setDescription('Giá tiền mới (VNĐ)').setRequired(true))
                 .toJSON()
         ];
         await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('✅ Đã đăng ký lệnh!');
-    } catch (error) { console.error('❌ Lỗi:', error); }
+        console.log('✅ Đã đăng ký lệnh thành công!');
+    } catch (error) { console.error('❌ Lỗi đăng ký lệnh:', error); }
 });
 
 // ==========================================
@@ -152,12 +151,11 @@ client.once('ready', async () => {
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
-    // Kiểm tra nếu tin nhắn nằm trong kênh Ticket (Bắt đầu bằng chữ "don-") và có chứa hình ảnh
     if (message.channel.name.startsWith('don-') && message.attachments.size > 0) {
         const adminPing = serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN" ? `<@&${serverConfig.adminRoleId}>` : "@Admin";
         
         await message.channel.send({
-            content: `🚨 **CÓ BIẾN!** ${adminPing}\nKhách hàng <@${message.author.id}> vừa gửi hóa đơn thanh toán. Vui lòng kiểm tra Bill và xác nhận giao hàng nhé! 📦`
+            content: `🚨 **CÓ BIẾN!** ${adminPing}\nKhách hàng <@${message.author.id}> vừa gửi bill/hình ảnh. Admin vào kiểm tra giao dịch nhé! 📦`
         });
     }
 });
@@ -171,15 +169,31 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'shop') {
             await interaction.reply({ embeds: [createShopEmbed()], components: [createShopButtons()] });
         }
+
+        // XỬ LÝ ĐỔI GIÁ /PRICE
         if (interaction.commandName === 'price') {
+            const hasAdminPerms = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+            const hasAdminRole = serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN" ? interaction.member.roles.cache.has(serverConfig.adminRoleId) : false;
+
+            if (!hasAdminPerms && !hasAdminRole) {
+                return interaction.reply({ content: '❌ Bạn không có quyền sử dụng lệnh này!', flags: MessageFlags.Ephemeral });
+            }
+
             const deferred = await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral });
             if (!deferred) return;
+
             const type = interaction.options.getString('type');
             const newPrice = interaction.options.getInteger('amount');
             const spawner = spawnerConfig[type];
-            if (!spawner) return interaction.editReply({ content: "❌ Không tồn tại!" });
+
+            if (!spawner) return interaction.editReply({ content: "❌ Loại spawner không tồn tại!" });
+
+            const oldPrice = spawner.price;
             spawner.price = newPrice;
-            await interaction.editReply({ content: `✅ Đã cập nhật giá **${spawner.name}** thành **${newPrice.toLocaleString('vi-VN')} VNĐ**!` });
+
+            await interaction.editReply({ 
+                content: `✅ Đã cập nhật giá **${spawner.name}** từ **${oldPrice.toLocaleString('vi-VN')} VNĐ** ➡️ **${newPrice.toLocaleString('vi-VN')} VNĐ**!\n*Gõ lại /shop ở kênh chat để tạo bảng giá mới.*` 
+            });
         }
     }
 
@@ -206,7 +220,7 @@ client.on('interactionCreate', async (interaction) => {
         );
 
         await interaction.reply({
-            content: `**Vui lòng chọn phương thức thanh toán cho ${spawner.name}:**\n*(Lưu ý: Mua bằng thẻ cào điện thoại sẽ chịu thêm 20% phí gạch thẻ)*`,
+            content: `**Vui lòng chọn phương thức thanh toán cho ${spawner.name}:**\n*(Lưu ý: Nạp bằng thẻ cào điện thoại chịu thêm 20% phí gạch thẻ)*`,
             components: [row],
             flags: MessageFlags.Ephemeral
         });
@@ -227,14 +241,24 @@ client.on('interactionCreate', async (interaction) => {
             );
             await interaction.showModal(modal);
         } else {
-            // MỞ FORM CARD
+            // MỞ FORM CARD (Đã tối ưu 5 ô theo chuẩn Discord)
             const modal = new ModalBuilder().setCustomId(`modal_card_${key}`).setTitle(`💳 Mua ${spawner.name.split(' ')[0]} (Thẻ Cào)`);
             modal.addComponents(
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ign').setLabel('Tên trong game (IGN):').setStyle(TextInputStyle.Short).setRequired(true)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('qty').setLabel(`Số lượng (Còn: ${spawner.stock}):`).setStyle(TextInputStyle.Short).setValue('1').setRequired(true)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('network').setLabel('Nhà mạng (VD: Viettel, Vina, Mobi):').setStyle(TextInputStyle.Short).setRequired(true)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('amount').setLabel('Mệnh giá thẻ (VD: 100000, 200000):').setStyle(TextInputStyle.Short).setRequired(true)),
-                new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('pin_serial').setLabel('Mã thẻ (PIN) & Số Seri (Nhập cả 2):').setStyle(TextInputStyle.Paragraph).setRequired(true).setPlaceholder('Mã thẻ: ...\nSeri: ...'))
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder().setCustomId('ign').setLabel('Tên trong game (IGN):').setStyle(TextInputStyle.Short).setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder().setCustomId('qty').setLabel(`Số lượng mua (Tối đa: ${spawner.stock}):`).setStyle(TextInputStyle.Short).setValue('1').setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder().setCustomId('net_amount').setLabel('Nhà mạng & Mệnh giá:').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Viettel 100k, Vina 200k...').setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder().setCustomId('pin').setLabel('Mã thẻ (PIN):').setStyle(TextInputStyle.Short).setPlaceholder('Nhập chính xác mã PIN thẻ cào').setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder().setCustomId('serial').setLabel('Số Seri (Serial):').setStyle(TextInputStyle.Short).setPlaceholder('Nhập chính xác số Seri').setRequired(true)
+                )
             );
             await interaction.showModal(modal);
         }
@@ -256,7 +280,6 @@ client.on('interactionCreate', async (interaction) => {
         if (!deferred) return;
 
         try {
-            // Quyền Ticket
             const permissionOverwrites = [
                 { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
                 { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.AttachFiles] },
@@ -273,15 +296,14 @@ client.on('interactionCreate', async (interaction) => {
                 permissionOverwrites: permissionOverwrites
             });
 
-            // Lấy tình trạng Admin Online
-            let adminStatusText = "🟢 **Admin đang có mặt**, vui lòng đợi Admin phản hồi nhé!";
+            let adminStatusText = "🟢 **Admin đang có mặt**, vui lòng chờ phản hồi!";
             try {
                 if (serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN") {
                     const adminRole = interaction.guild.roles.cache.get(serverConfig.adminRoleId);
                     if (adminRole) {
                         await interaction.guild.members.fetch();
                         const onlineAdmins = adminRole.members.filter(m => m.presence && ['online', 'idle', 'dnd'].includes(m.presence.status));
-                        if (onlineAdmins.size === 0) adminStatusText = "🟡 **Hiện tại Admin đang vắng mặt.** Vui lòng kiên nhẫn chờ, Admin sẽ phản hồi ngay khi online!";
+                        if (onlineAdmins.size === 0) adminStatusText = "🟡 **Hiện tại Admin đang vắng mặt.** Bạn vui lòng kiên nhẫn chờ chút nhé!";
                     }
                 }
             } catch (e) {}
@@ -294,7 +316,6 @@ client.on('interactionCreate', async (interaction) => {
 
             if (isBank) {
                 const totalPrice = spawner.price * quantity;
-                // Tạo nội dung CK ẩn danh an toàn: TT + 4 số ngẫu nhiên + Tên viết hoa
                 const randomCode = Math.floor(1000 + Math.random() * 9000);
                 const safeIgn = ign.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
                 const memoContent = `TT ${randomCode} ${safeIgn}`;
@@ -302,42 +323,42 @@ client.on('interactionCreate', async (interaction) => {
                 const qrImageUrl = `https://img.vietqr.io/image/${serverConfig.bank.shortName}-${serverConfig.bank.accountNo}-compact2.png?amount=${totalPrice}&addInfo=${encodeURIComponent(memoContent)}&accountName=${encodeURIComponent(serverConfig.bank.accountName)}`;
 
                 ticketEmbed.setColor('#0099ff')
-                    .setTitle(`🏦 ĐƠN HÀNG NGÂN HÀNG: ${spawner.name.toUpperCase()}`)
+                    .setTitle(`🏦 ĐƠN HÀNG CHUYỂN KHOẢN: ${spawner.name.toUpperCase()}`)
                     .setDescription(
                         `Chào <@${interaction.user.id}>, dưới đây là thông tin đơn của bạn:\n` +
                         `• 👤 **IGN:** \`${ign}\`\n• 📦 **Số lượng:** \`${quantity}\` cái\n` +
                         `• 💰 **Tổng thanh toán:** **${totalPrice.toLocaleString('vi-VN')} VNĐ**\n\n` +
-                        `⚠️ **ĐỢI ADMIN REP TRONG KÊNH NÀY RỒI MỚI CHUYỂN KHOẢN NHÉ!**\n${adminStatusText}\n\n` +
+                        `⚠️ **ĐỜI ADMIN REP TRONG KÊNH NÀY RỒI MỚI CHUYỂN KHOẢN NHÉ!**\n${adminStatusText}\n\n` +
                         `───────────────────────────────────\n` +
-                        `🏦 **THÔNG TIN CHUYỂN KHOẢN (Đã làm ẩn danh an toàn):**\n` +
+                        `🏦 **THÔNG TIN CHUYỂN KHOẢN:**\n` +
                         `• Ngân hàng: **MB Bank**\n• Số tài khoản: \`${serverConfig.bank.accountNo}\`\n` +
                         `• Chủ tài khoản: **${serverConfig.bank.accountName}**\n` +
-                        `• Nội dung CK: \`${memoContent}\` (Vui lòng ghi y hệt chữ này)\n\n` +
-                        `*(Bạn có thể Quét QR bên dưới. Sau khi CK, gửi ảnh bill vào kênh này)*`
+                        `• Nội dung CK: \`${memoContent}\` *(Vui lòng ghi y hệt chữ này)*\n\n` +
+                        `*(Bạn có thể Quét QR bên dưới. Sau khi CK xong, hãy gửi ảnh bill vào đây!)*`
                     )
                     .setImage(qrImageUrl);
             } else {
-                const network = interaction.fields.getTextInputValue('network');
-                const amount = interaction.fields.getTextInputValue('amount');
-                const pinSerial = interaction.fields.getTextInputValue('pin_serial');
+                const netAmount = interaction.fields.getTextInputValue('net_amount');
+                const pin = interaction.fields.getTextInputValue('pin');
+                const serial = interaction.fields.getTextInputValue('serial');
                 
                 const basePrice = spawner.price * quantity;
-                const cardPrice = basePrice * 1.2; // Cộng thêm 20% phí
+                const cardPrice = basePrice * 1.2;
 
                 ticketEmbed.setColor('#E67E22')
                     .setTitle(`💳 ĐƠN HÀNG THẺ CÀO: ${spawner.name.toUpperCase()}`)
                     .setDescription(
-                        `Chào <@${interaction.user.id}>, bạn đã chọn mua bằng thẻ cào.\n` +
+                        `Chào <@${interaction.user.id}>, bạn đã đăng ký mua bằng Thẻ Cào.\n` +
                         `• 👤 **IGN:** \`${ign}\`\n• 📦 **Số lượng:** \`${quantity}\` cái\n` +
                         `• 💰 **Giá Gốc:** ${basePrice.toLocaleString('vi-VN')} VNĐ\n` +
                         `• 📈 **Giá Thẻ (Đã +20% Phí):** **${cardPrice.toLocaleString('vi-VN')} VNĐ**\n\n` +
                         `${adminStatusText}\n\n` +
                         `───────────────────────────────────\n` +
-                        `🧾 **THÔNG TIN THẺ BẠN ĐÃ CUNG CẤP:**\n` +
-                        `• Nhà mạng: **${network}**\n` +
-                        `• Mệnh giá nạp: **${amount}**\n` +
-                        `• Mã thẻ & Seri:\n\`\`\`${pinSerial}\`\`\`\n` +
-                        `*Admin sẽ tiến hành kiểm tra thẻ. Nếu thẻ đúng và đủ số dư, spawner sẽ được giao.*`
+                        `🧾 **THÔNG TIN THẺ NẠP (Chấp nhận copy 1-click):**\n` +
+                        `• 🌐 **Nhà mạng & Mệnh giá:** \`${netAmount}\`\n` +
+                        `• 🔑 **Mã PIN:** \`${pin}\` *(Chạm/Click để copy)*\n` +
+                        `• 🔢 **Số SERI:** \`${serial}\` *(Chạm/Click để copy)*\n\n` +
+                        `*Admin sẽ tiến hành nạp thẻ và giao sản phẩm cho bạn sau ít phút!*`
                     );
             }
 
@@ -387,7 +408,7 @@ client.on('interactionCreate', async (interaction) => {
             content: `🎉 **GIAO DỊCH HOÀN TẤT THÀNH CÔNG!**\n\n` +
                      `👑 Admin <@${interaction.user.id}> đã giao thành công **\`${quantity}\`x ${spawner.name}**.\n` +
                      `📦 Kho hiện tại còn: \`${spawner.stock}\` cái.\n\n` +
-                     `❤️ Cảm ơn bạn! Đừng quên ghé ${legitChannel} để gửi một đánh giá **+1 Legit** kèm ảnh bill ủng hộ shop nhé! 🔥`
+                     `❤️ Cảm ơn bạn! Đừng quên ghé ${legitChannel} để gửi một đánh giá **+1 Legit** ủng hộ shop nhé! 🔥`
         });
     }
 });
