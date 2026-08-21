@@ -8,11 +8,11 @@ const path = require('path');
 const {
     Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
     EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle,
-    ModalBuilder, TextInputBuilder, TextInputStyle, ChannelType, Events, PermissionsBitField
+    ModalBuilder, TextInputBuilder, TextInputStyle, ChannelType, Events, PermissionsBitField, MessageFlags
 } = require('discord.js');
 
 // ============================================================
-// 1. MÁY CHỦ WEB (WEBHOOKS - CHỈ AUTO NGÂN HÀNG SEPAY)
+// 1. MÁY CHỦ WEB (WEBHOOKS - AUTO NGÂN HÀNG SEPAY)
 // ============================================================
 const PORT = Number(process.env.PORT || 10000);
 const WEBHOOK_BODY_LIMIT = 512 * 1024;
@@ -90,7 +90,6 @@ server.listen(PORT, () => console.log(`[Hệ thống] Mở cổng thành công t
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
 const CARD_DISCOUNT = 0.20;
-// Thông tin MB Bank chính chủ của ông
 const BANK_CONFIG = { BANK_ID: 'MB', ACCOUNT_NO: '0357597469', ACCOUNT_NAME: 'TRAN HUU HAI SON' };
 
 const STOCK_FILE = path.join(__dirname, 'stock.json');
@@ -106,7 +105,10 @@ let currentStockM = readJson(STOCK_FILE, { stockM: 2650000 }).stockM;
 let moneyConfig = readJson(CONFIG_FILE, { rate: 120 });
 let RATE = Number(moneyConfig.rate) > 0 ? Number(moneyConfig.rate) : 120;
 
-function saveStock(amountM) { writeJson(STOCK_FILE, { stockM: Math.max(0, Number(amountM) || 0) }); currentStockM = amountM; }
+function saveStock(amountM) { 
+    currentStockM = Math.max(0, Number(amountM) || 0);
+    writeJson(STOCK_FILE, { stockM: currentStockM }); 
+}
 function getMoneyOrders() { return readJson(MONEY_ORDERS_FILE, {}); }
 function saveMoneyOrders(data) { writeJson(MONEY_ORDERS_FILE, data); }
 
@@ -139,7 +141,7 @@ function parseCardValue(input) {
 }
 
 // ============================================================
-// 3. RCON & NẠP TỰ ĐỘNG (DÀNH CHO NGÂN HÀNG)
+// 3. RCON & NẠP TỰ ĐỘNG (TRỪ STOCK VÀ PAY GAME)
 // ============================================================
 async function sendMinecraftPayCommand(order) {
     const host = process.env.RCON_HOST;
@@ -166,6 +168,7 @@ async function sendMinecraftPayCommand(order) {
 async function fulfillMoneyOrder(order) {
     const amountM = Math.floor(Number(order.amountM) || 0);
     
+    // Tự động trừ stock và lưu lại ngay lập tức
     currentStockM -= amountM;
     saveStock(currentStockM);
 
@@ -176,6 +179,7 @@ async function fulfillMoneyOrder(order) {
     orders[order.id] = order; 
     saveMoneyOrders(orders);
     
+    // Cập nhật lại giao diện bảng chính để khách thấy kho đã giảm
     await updateAutoBuyPanel();
 
     if (order.ticketChannelId) {
@@ -257,17 +261,17 @@ client.on(Events.InteractionCreate, async interaction => {
             if (interaction.commandName === 'setup') {
                 const msg = await interaction.channel.send(buildAutoBuyEmbed());
                 moneyConfig.channelId = interaction.channelId; moneyConfig.messageId = msg.id; writeJson(CONFIG_FILE, moneyConfig);
-                return interaction.reply({ content: '✅ Đã tạo bảng giao dịch thành công.', ephemeral: true });
+                return interaction.reply({ content: '✅ Đã tạo bảng giao dịch thành công.', flags: MessageFlags.Ephemeral });
             }
             if (interaction.commandName === 'setstock') {
                 currentStockM = parseMoneyToM(interaction.options.getString('amount'));
                 saveStock(currentStockM); await updateAutoBuyPanel();
-                return interaction.reply({ content: `✅ Đã cập nhật kho: **${formatStockDisplay(currentStockM)}**`, ephemeral: true });
+                return interaction.reply({ content: `✅ Đã cập nhật kho: **${formatStockDisplay(currentStockM)}**`, flags: MessageFlags.Ephemeral });
             }
             if (interaction.commandName === 'rate') {
                 RATE = interaction.options.getInteger('value'); moneyConfig.rate = RATE;
                 writeJson(CONFIG_FILE, moneyConfig); await updateAutoBuyPanel();
-                return interaction.reply({ content: `✅ Đã đổi tỷ giá thành: **${RATE} VNĐ = 1M$**`, ephemeral: true });
+                return interaction.reply({ content: `✅ Đã đổi tỷ giá thành: **${RATE} VNĐ = 1M$**`, flags: MessageFlags.Ephemeral });
             }
         }
 
@@ -275,14 +279,14 @@ client.on(Events.InteractionCreate, async interaction => {
             const id = interaction.customId;
 
             if (id === 'close_ticket') {
-                await interaction.reply({ content: '🔒 Vé sẽ bị xóa sau 5 giây...', ephemeral: true });
+                await interaction.reply({ content: '🔒 Vé sẽ bị xóa sau 5 giây...', flags: MessageFlags.Ephemeral });
                 return setTimeout(() => interaction.channel.delete().catch(()=> {}), 5000);
             }
 
             if (id === 'guide_buy') {
                 return interaction.reply({ 
-                    content: '📖 **HƯỚNG DẪN MUA MONEY:**\n1. **Ngân hàng:** Điền tên, số tiền -> Quét QR chuyển khoản -> Bot tự động nạp vào game sau 1 phút.\n2. **Thẻ cào:** Điền thông tin thẻ -> Bot tạo vé gửi thông tin cho Admin kiểm tra và duyệt thủ công.', 
-                    ephemeral: true 
+                    content: '📖 **HƯỚNG DẪN MUA MONEY:**\n1. **Ngân hàng:** Điền tên, số tiền -> Quét QR chuyển khoản (Yêu cầu chuyển đúng nội dung) -> Bot tự động nạp vào game sau 1 phút.\n2. **Thẻ cào:** Điền thông tin thẻ -> Bot tạo vé gửi thông tin cho Admin kiểm tra và duyệt thủ công.', 
+                    flags: MessageFlags.Ephemeral 
                 });
             }
 
@@ -322,17 +326,17 @@ client.on(Events.InteractionCreate, async interaction => {
                 const num = parseCardValue(rawVal);
                 if (num > 50000) {
                     const received = Math.floor(num / RATE);
-                    return interaction.reply({ content: `🧮 **${num.toLocaleString()} VNĐ** đổi được khoảng **${received.toLocaleString()} M$** (Tỷ giá: ${RATE})`, ephemeral: true });
+                    return interaction.reply({ content: `🧮 **${num.toLocaleString()} VNĐ** đổi được khoảng **${received.toLocaleString()} M$** (Tỷ giá: ${RATE})`, flags: MessageFlags.Ephemeral });
                 } else {
                     const moneyM = parseMoneyToM(rawVal);
                     const costVnd = Math.floor(moneyM * RATE);
-                    return interaction.reply({ content: `🧮 **${moneyM.toLocaleString()} M$** có giá là **${costVnd.toLocaleString()} VNĐ** (Tỷ giá: ${RATE})`, ephemeral: true });
+                    return interaction.reply({ content: `🧮 **${moneyM.toLocaleString()} M$** có giá là **${costVnd.toLocaleString()} VNĐ** (Tỷ giá: ${RATE})`, flags: MessageFlags.Ephemeral });
                 }
             }
 
-            await interaction.deferReply({ ephemeral: true });
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-            // Ngân hàng: Tạo vé kèm QR chuẩn MB Bank
+            // Mua bằng Ngân hàng: Tự động tạo vé và tạo mã QR VietQR chuẩn
             if (interaction.customId === 'modal_bank') {
                 const ign = interaction.fields.getTextInputValue('bank_name').trim();
                 const vndAmount = Math.floor(parseCardValue(interaction.fields.getTextInputValue('bank_vnd')));
@@ -356,7 +360,10 @@ client.on(Events.InteractionCreate, async interaction => {
                 orders[orderId] = { id: orderId, type: 'bank', userId: interaction.user.id, ign, vndAmount, amountM: moneyReceivedM, memo, status: 'dang_cho', ticketChannelId: ticketChannel.id };
                 saveMoneyOrders(orders);
 
-                const embed = new EmbedBuilder().setTitle('💳 THANH TOÁN CHUYỂN KHOẢN').setColor('#3498db').setDescription('Vui lòng quét mã QR hoặc chuyển khoản đúng thông tin dưới đây để hệ thống tự động nạp tiền.')
+                const embed = new EmbedBuilder()
+                    .setTitle('💳 THANH TOÁN CHUYỂN KHOẢN (YÊU CẦU LEGIT)')
+                    .setColor('#3498db')
+                    .setDescription('Vui lòng quét mã QR hoặc chuyển khoản đúng thông tin dưới đây.\n⚠️ **Lưu ý:** Phải chuyển đúng số tiền và nội dung để hệ thống tự động duyệt.')
                     .addFields(
                         { name: 'Ngân hàng', value: 'MB Bank', inline: true },
                         { name: 'Số tài khoản', value: `\`${BANK_CONFIG.ACCOUNT_NO}\``, inline: true },
@@ -364,15 +371,18 @@ client.on(Events.InteractionCreate, async interaction => {
                         { name: 'Tên Ingame', value: ign, inline: true },
                         { name: 'Nhận Được', value: `${moneyReceivedM.toLocaleString()} M$`, inline: true },
                         { name: 'Cần Trả', value: `${vndAmount.toLocaleString()} VNĐ`, inline: true },
-                        { name: 'NỘI DUNG CHUYỂN KHOẢN', value: `\`\`\`${memo}\`\`\`` }
+                        { name: 'NỘI DUNG CHUYỂN KHOẢN (BẮT BUỘC)', value: `\`\`\`${memo}\`\`\`` }
                     ).setImage(qrUrl);
-                const closeRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Vé (Xóa)').setStyle(ButtonStyle.Danger));
+                
+                const closeRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Vé (Xóa)').setStyle(ButtonStyle.Danger)
+                );
                 
                 await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [embed], components: [closeRow] });
                 return interaction.editReply(`✅ Đã tạo vé ngân hàng tại: ${ticketChannel}`);
             }
 
-            // Thẻ cào: Tạo vé gửi thông tin thẻ cho Admin duyệt thủ công
+            // Mua bằng Thẻ cào: Tạo vé gửi thông tin cho Admin duyệt thủ công
             if (interaction.customId === 'modal_card') {
                 const ign = interaction.fields.getTextInputValue('card_ign').trim();
                 const cardType = interaction.fields.getTextInputValue('card_type').trim();
@@ -410,7 +420,7 @@ client.on(Events.InteractionCreate, async interaction => {
                     new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Vé (Xóa)').setStyle(ButtonStyle.Danger)
                 );
 
-                await ticketChannel.send({ content: `<@${interaction.user.id}> | <@&ROLE_ADMIN_ID_NEU_CO>`, embeds: [embed], components: [closeRow] });
+                await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [embed], components: [closeRow] });
                 return interaction.editReply(`✅ Đã tạo vé thẻ cào tại: ${ticketChannel}`);
             }
         }
