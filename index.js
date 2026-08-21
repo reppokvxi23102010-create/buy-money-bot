@@ -41,8 +41,8 @@ async function safeDeferReply(interaction, options) {
 client.once('ready', async () => {
     console.log(`Bot đã đăng nhập thành công với tên ${client.user.tag}!`);
 
-    // Tự động đăng ký lệnh /shop lên Discord API khi bot vừa bật lên
-    const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+    // Sửa lỗi: Sử dụng client.token thay vì process.env.TOKEN để đăng ký lệnh
+    const rest = new REST({ version: '10' }).setToken(client.token);
     try {
         const commands = [
             new SlashCommandBuilder()
