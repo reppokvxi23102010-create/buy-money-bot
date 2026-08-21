@@ -1,7 +1,3 @@
-// ============================================================
-// ERROR HANDLING & MONITORING (GLOBAL)
-// ============================================================
-
 // 1. Bắt tất cả các Promise bị reject mà không có .catch() (Lỗi API, SSL, Network)
 process.on('unhandledRejection', (reason, promise) => {
   console.error('⚠️ [Unhandled Rejection] Bắt được lỗi Promise chưa xử lý:');
@@ -18,10 +14,10 @@ process.on('uncaughtException', (err, origin) => {
 process.on('uncaughtExceptionMonitor', (err, origin) => {
   console.error('🔍 [Exception Monitor]:', err);
 });
-
 require('dotenv').config();
 
 const http = require('http');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -50,13 +46,218 @@ const {
 // 1. WEB SERVER
 // ============================================================
 
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT || 10000);
+const WEBHOOK_BODY_LIMIT = 512 * 1024;
 
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('SMP BOT AutoBuy Money + Account đang hoạt động 24/7!');
-}).listen(PORT, () => {
+function sendJson(res, statusCode, payload) {
+    res.writeHead(statusCode, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store'
+    });
+    res.end(JSON.stringify(payload));
+}
+
+function readRequestBody(req) {
+    return new Promise((resolve, reject) => {
+        let body = '';
+        req.on('data', chunk => {
+            body += chunk.toString('utf8');
+            if (Buffer.byteLength(body, 'utf8') > WEBHOOK_BODY_LIMIT) {
+                reject(new Error('Webhook body quá lớn.'));
+                req.destroy();
+            }
+        });
+        req.on('end', () => {
+            if (!body) return resolve({});
+            try {
+                resolve(JSON.parse(body));
+            } catch {
+                reject(new Error('Webhook body không phải JSON hợp lệ.'));
+            }
+        });
+        req.on('error', reject);
+    });
+}
+
+function safeEqual(a, b) {
+    const aa = Buffer.from(String(a || ''));
+    const bb = Buffer.from(String(b || ''));
+    return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
+}
+
+async function handleSepayWebhook(req, res) {
+    const expectedApiKey = process.env.SEPAY_API_KEY;
+    const expectedSecret = process.env.SEPAY_SECRET_KEY;
+    const auth = String(req.headers.authorization || '');
+    const secret = String(req.headers['x-secret-key'] || '');
+
+    if (!expectedApiKey && !expectedSecret) {
+        return sendJson(res, 503, { success: false, message: 'Webhook SePay chưa được cấu hình bảo mật.' });
+    }
+    const apiKeyOk = Boolean(expectedApiKey) && auth === `Apikey ${expectedApiKey}`;
+    const secretOk = Boolean(expectedSecret) && safeEqual(secret, expectedSecret);
+    if (!apiKeyOk && !secretOk) {
+        return sendJson(res, 401, { success: false, message: 'Unauthorized' });
+    }
+
+    try {
+        const payload = await readRequestBody(req);
+        console.log('💳 [SEPAY] Webhook:', JSON.stringify(payload));
+
+        if (String(payload.transferType || '').toLowerCase() !== 'in') {
+            return sendJson(res, 200, { success: true, ignored: 'not_incoming' });
+        }
+
+        const transactionId = String(payload.id || payload.referenceCode || '');
+        const content = String(payload.content || payload.description || '').trim();
+        const transferAmount = Math.floor(Number(payload.transferAmount || 0));
+
+        if (!transactionId || transferAmount <= 0) {
+            return sendJson(res, 400, { success: false, message: 'Thiếu id/reference hoặc transferAmount.' });
+        }
+
+        const orders = getMoneyOrders();
+        const alreadyProcessed = Object.values(orders).some(
+            order => String(order.paymentReference || '') === transactionId &&
+                ['paid', 'delivered'].includes(String(order.status || ''))
+        );
+        if (alreadyProcessed) {
+            return sendJson(res, 200, { success: true, duplicate: true });
+        }
+
+        const normalizedContent = content.toLowerCase();
+        const candidates = Object.values(orders).filter(order =>
+            order.type === 'bank' &&
+            order.status === 'pending' &&
+            Number(order.vndAmount) === transferAmount
+        );
+
+        const order = candidates.find(item => {
+            const idToken = String(item.id || '').toLowerCase();
+            const memoToken = String(item.memo || '').toLowerCase();
+            const ignToken = String(item.ign || '').trim().toLowerCase();
+            return (idToken && normalizedContent.includes(idToken)) ||
+                   (memoToken && normalizedContent.includes(memoToken)) ||
+                   (ignToken && normalizedContent.includes(`ksmp ${ignToken}`));
+        });
+
+        if (!order) {
+            console.warn(`⚠️ [SEPAY] Không tìm thấy đơn bank khớp: ${transferAmount} / ${content}`);
+            return sendJson(res, 200, { success: true, matched: false });
+        }
+
+        order.paymentVerified = true;
+        order.paymentReference = transactionId;
+        order.paymentReceivedAt = Date.now();
+        order.paymentPayload = {
+            id: payload.id ?? null,
+            gateway: payload.gateway ?? null,
+            content,
+            transferAmount,
+            referenceCode: payload.referenceCode ?? null
+        };
+        orders[order.id] = order;
+        saveMoneyOrders(orders);
+
+        const result = await fulfillMoneyOrder(order, { source: 'sepay', verified: true });
+        return sendJson(res, result.ok ? 200 : 500, {
+            success: result.ok,
+            orderId: order.id,
+            status: result.status,
+            message: result.message
+        });
+    } catch (err) {
+        console.error('❌ [SEPAY] Webhook lỗi:', err);
+        return sendJson(res, 500, { success: false, message: err.message });
+    }
+}
+
+async function handleCardWebhook(req, res) {
+    const expectedApiKey = process.env.CARD_WEBHOOK_API_KEY;
+    const incomingKey = String(req.headers.authorization || req.headers['x-api-key'] || '');
+    if (!expectedApiKey) {
+        return sendJson(res, 503, { success: false, message: 'Card webhook chưa được cấu hình secret.' });
+    }
+    if (incomingKey !== expectedApiKey && incomingKey !== `Bearer ${expectedApiKey}`) {
+        return sendJson(res, 401, { success: false, message: 'Unauthorized' });
+    }
+
+    try {
+        const payload = await readRequestBody(req);
+        console.log('🎟️ [CARD] Webhook:', JSON.stringify(payload));
+
+        const code = String(payload.code ?? payload.pin ?? payload.cardCode ?? '').trim();
+        const seri = String(payload.serial ?? payload.seri ?? payload.cardSerial ?? '').trim();
+        const statusRaw = String(payload.status ?? payload.result ?? payload.message ?? '').toLowerCase();
+        const success = payload.success === true || ['success', 'successful', '1', 'true', 'ok', 'done'].includes(statusRaw);
+        const creditedVnd = Math.floor(Number(payload.amount ?? payload.value ?? payload.cardValue ?? payload.realValue ?? 0));
+
+        if (!code || !seri || !success) {
+            return sendJson(res, 200, { success: true, matched: false, reason: 'card_not_success' });
+        }
+
+        const orders = getMoneyOrders();
+        const order = Object.values(orders).find(item =>
+            item.type === 'card' &&
+            item.status === 'pending' &&
+            String(item.cardCode || '').trim() === code &&
+            String(item.cardSeri || '').trim() === seri
+        );
+
+        if (!order) {
+            return sendJson(res, 200, { success: true, matched: false });
+        }
+
+        if (creditedVnd > 0 && creditedVnd < Math.floor(Number(order.cardValueVnd))) {
+            order.cardVerified = false;
+            order.cardProviderAmount = creditedVnd;
+            orders[order.id] = order;
+            saveMoneyOrders(orders);
+            return sendJson(res, 200, { success: true, matched: true, status: 'amount_mismatch' });
+        }
+
+        order.cardVerified = true;
+        order.cardProviderAmount = creditedVnd || order.cardValueVnd;
+        order.paymentVerified = true;
+        order.paymentReference = String(payload.id ?? payload.transactionId ?? `${code}:${seri}`);
+        order.paymentReceivedAt = Date.now();
+        order.cardProviderPayload = payload;
+        orders[order.id] = order;
+        saveMoneyOrders(orders);
+
+        const result = await fulfillMoneyOrder(order, { source: 'card', verified: true });
+        return sendJson(res, result.ok ? 200 : 500, {
+            success: result.ok,
+            orderId: order.id,
+            status: result.status,
+            message: result.message
+        });
+    } catch (err) {
+        console.error('❌ [CARD] Webhook lỗi:', err);
+        return sendJson(res, 500, { success: false, message: err.message });
+    }
+}
+
+const server = http.createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/') {
+        return sendJson(res, 200, { ok: true, service: 'SMP BOT AutoBuy Money + Account' });
+    }
+
+    if (req.method === 'POST' && req.url === '/webhook/sepay') {
+        return handleSepayWebhook(req, res);
+    }
+
+    if (req.method === 'POST' && req.url === '/webhook/card') {
+        return handleCardWebhook(req, res);
+    }
+
+    return sendJson(res, 404, { success: false, message: 'Not found' });
+});
+
+server.listen(PORT, () => {
     console.log(`[HTTP Server] Đã mở cổng thành công trên Port: ${PORT}`);
+    console.log(`[HTTP Server] SePay webhook: POST /webhook/sepay`);
+    console.log(`[HTTP Server] Card webhook: POST /webhook/card`);
 });
 
 // ============================================================
@@ -75,6 +276,7 @@ const client = new Client({
 // 3. CONFIG
 // ============================================================
 
+// RATE được lưu trong config.json và có thể đổi bằng /rate
 const CARD_DISCOUNT = 0.20;
 
 const BANK_CONFIG = {
@@ -130,6 +332,7 @@ function writeJson(file, data) {
 // 5. INTERACTION SAFETY
 // ============================================================
 
+// Chống cùng một Interaction bị xử lý 2 lần trong cùng process.
 const seenInteractions = new Set();
 
 function claimInteraction(interaction) {
@@ -279,6 +482,7 @@ function isWithinWorkingHours() {
     const start = config.workingHours?.start ?? 10;
     const end = config.workingHours?.end ?? 22;
 
+    // Giờ GMT+7 (Việt Nam)
     const now = new Date();
     const currentHour = (now.getUTCHours() + 7) % 24;
 
@@ -459,15 +663,26 @@ async function updateAutoBuyPanel() {
                 const code = String(err?.code ?? '');
                 const msg = String(err?.message ?? '').toLowerCase();
 
-                const isUnknownMessage = code === '10008' || msg.includes('unknown message');
-                const isUnknownChannel = code === '10003' || msg.includes('unknown channel');
+                const isUnknownMessage =
+                    code === '10008' ||
+                    msg.includes('unknown message');
+
+                const isUnknownChannel =
+                    code === '10003' ||
+                    msg.includes('unknown channel');
 
                 if (!isUnknownMessage && !isUnknownChannel) {
-                    console.error('❌ [PANEL V3] Không sửa được panel:', `code=${code || 'none'}`, err?.message || err);
+                    console.error(
+                        '❌ [PANEL V3] Không sửa được panel:',
+                        `code=${code || 'none'}`,
+                        err?.message || err
+                    );
                     return;
                 }
 
-                console.warn(`⚠️ [PANEL V3] Panel cũ không tồn tại (${isUnknownMessage ? 'Unknown Message' : 'Unknown Channel'}). Tạo panel mới...`);
+                console.warn(
+                    `⚠️ [PANEL V3] Panel cũ không tồn tại (${isUnknownMessage ? 'Unknown Message' : 'Unknown Channel'}). Tạo panel mới...`
+                );
             }
         }
 
@@ -496,7 +711,11 @@ async function updateAutoBuyPanel() {
             return;
         }
 
-        console.error('❌ [PANEL V3] Lỗi cập nhật/tạo panel:', `code=${code || 'none'}`, err?.message || err);
+        console.error(
+            '❌ [PANEL V3] Lỗi cập nhật/tạo panel:',
+            `code=${code || 'none'}`,
+            err?.message || err
+        );
     }
 }
 
@@ -513,7 +732,9 @@ async function handleMoneyCommand(interaction) {
     }
 
     if (interaction.commandName === 'setup') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
         try {
             const msg = await interaction.channel.send(buildAutoBuyEmbed());
@@ -534,7 +755,9 @@ async function handleMoneyCommand(interaction) {
     }
 
     if (interaction.commandName === 'setstock') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
         try {
             const amountInput = interaction.options.getString('amount');
@@ -562,7 +785,9 @@ async function handleMoneyCommand(interaction) {
     }
 
     if (interaction.commandName === 'rate') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
         try {
             const newRate = interaction.options.getInteger('value');
@@ -590,13 +815,18 @@ async function handleMoneyCommand(interaction) {
     }
 
     if (interaction.commandName === 'time') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
         try {
             const start = interaction.options.getInteger('start');
             const end = interaction.options.getInteger('end');
 
-            moneyConfig.workingHours = { start, end };
+            moneyConfig.workingHours = {
+                start,
+                end
+            };
             saveMoneyConfig(moneyConfig);
 
             await updateAutoBuyPanel();
@@ -609,17 +839,192 @@ async function handleMoneyCommand(interaction) {
                 content: `❌ Lỗi khi cập nhật giờ: \`${err.message}\``
             });
         }
+    if (interaction.commandName === 'autopay') {
+        return safeReply(interaction, {
+            content:
+                `🤖 **AUTO PAYMENT STATUS**\n` +
+                `🏦 Bank webhook: **${process.env.SEPAY_API_KEY || process.env.SEPAY_SECRET_KEY ? 'Đã cấu hình' : 'Chưa cấu hình'}**\n` +
+                `🎟️ Card webhook: **${process.env.CARD_WEBHOOK_API_KEY ? 'Đã cấu hình' : 'Chưa cấu hình secret (có thể nhận webhook không secret)'}**\n` +
+                `🎮 RCON AutoPay: **${process.env.RCON_HOST && process.env.RCON_PASSWORD ? 'Đã cấu hình' : 'Chưa cấu hình'}**\n` +
+                `🧩 Pay command: \`${process.env.MINECRAFT_PAY_COMMAND || 'pay %IGN% %MONEY%'}\``,
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
     }
 }
 
 // ============================================================
 // 11. MONEY BUTTONS
 // ============================================================
+// ============================================================
+// 11.1 MONEY FULFILLMENT / AUTO PAY
+// ============================================================
+
+function renderPayCommand(order) {
+    const template = String(process.env.MINECRAFT_PAY_COMMAND || 'pay %IGN% %MONEY%');
+    return template
+        .replace(/%IGN%/g, String(order.ign || ''))
+        .replace(/%MONEY%/g, String(Math.floor(Number(order.amountM) || 0)));
+}
+
+async function sendMinecraftPayCommand(order) {
+    const host = process.env.RCON_HOST;
+    const port = Number(process.env.RCON_PORT || 25575);
+    const password = process.env.RCON_PASSWORD;
+
+    if (!host || !password) {
+        return {
+            ok: false,
+            message: 'Chưa cấu hình RCON_HOST/RCON_PASSWORD để tự pay Money.'
+        };
+    }
+
+    let Rcon;
+    try {
+        ({ Rcon } = require('rcon-client'));
+    } catch {
+        return {
+            ok: false,
+            message: 'Thiếu package rcon-client. Chạy: npm i rcon-client'
+        };
+    }
+
+    const command = renderPayCommand(order);
+    const rcon = new Rcon({ host, port, password });
+
+    try {
+        await rcon.connect();
+        const response = await rcon.send(command);
+        await rcon.end();
+        console.log(`✅ [RCON] Đã chạy lệnh: ${command} | ${response || ''}`);
+        return { ok: true, response };
+    } catch (err) {
+        try { await rcon.end(); } catch {}
+        console.error('❌ [RCON] Không thể pay Money:', err);
+        return { ok: false, message: err.message };
+    }
+}
+
+async function updateMoneyOrderTicket(order, status, note = '') {
+    if (!order?.ticketChannelId) return;
+
+    try {
+        const channel = await client.channels.fetch(String(order.ticketChannelId));
+        if (!channel?.isTextBased()) return;
+
+        const title = status === 'delivered'
+            ? '✅ GIAO DỊCH ĐÃ TỰ ĐỘNG HOÀN TẤT'
+            : status === 'paid'
+                ? '💳 ĐÃ NHẬN THANH TOÁN'
+                : '⚠️ GIAO DỊCH CẦN XỬ LÝ';
+
+        const color = status === 'delivered' ? '#2ecc71' : status === 'paid' ? '#3498db' : '#e67e22';
+        const embed = new EmbedBuilder()
+            .setTitle(title)
+            .setColor(color)
+            .setDescription(
+                `<@${order.userId}>\n` +
+                `📌 Đơn: \`${order.id}\`\n` +
+                `👤 Ingame: \`${order.ign}\`\n` +
+                `💰 Money: **${Number(order.amountM).toLocaleString('vi-VN')}M$**\n` +
+                (note ? `\n📝 ${note}` : '')
+            )
+            .setTimestamp();
+
+        await channel.send({ embeds: [embed] });
+    } catch (err) {
+        console.error('❌ Không cập nhật được ticket money:', err?.message || err);
+    }
+}
+
+async function fulfillMoneyOrder(order, source = { source: 'manual', verified: false }) {
+    const orders = getMoneyOrders();
+    const current = orders[order.id];
+
+    if (!current) return { ok: false, status: 'missing', message: 'Không tìm thấy đơn hàng.' };
+    if (current.status === 'delivered') return { ok: true, status: 'delivered', message: 'Đơn đã giao trước đó.' };
+
+    if (source.verified && !current.paymentVerified) {
+        return { ok: false, status: 'not_verified', message: 'Thanh toán chưa được xác minh.' };
+    }
+
+    const amountM = Math.floor(Number(current.amountM) || 0);
+    if (amountM <= 0) {
+        return { ok: false, status: 'invalid_amount', message: 'Số Money không hợp lệ.' };
+    }
+
+    if (!current.stockReserved) {
+        if (currentStockM < amountM) {
+            await updateMoneyOrderTicket(current, 'paid', 'Đã nhận tiền nhưng kho Money hiện không đủ. Admin cần bổ sung Stock.');
+            current.status = 'paid';
+            current.paymentVerified = true;
+            current.paidAt = Date.now();
+            orders[current.id] = current;
+            saveMoneyOrders(orders);
+            return { ok: false, status: 'paid', message: 'Đã nhận thanh toán nhưng Stock không đủ.' };
+        }
+
+        currentStockM -= amountM;
+        saveStock(currentStockM);
+        current.stockReserved = true;
+        current.stockReservedAt = Date.now();
+    }
+
+    const payResult = await sendMinecraftPayCommand(current);
+
+    if (!payResult.ok) {
+        if (current.stockReserved) {
+            currentStockM += amountM;
+            saveStock(currentStockM);
+            current.stockReserved = false;
+        }
+        current.status = 'paid';
+        current.paymentVerified = Boolean(current.paymentVerified || source.verified);
+        current.paidAt = current.paidAt || Date.now();
+        current.deliveryError = payResult.message;
+        orders[current.id] = current;
+        saveMoneyOrders(orders);
+        await updateAutoBuyPanel();
+        await updateMoneyOrderTicket(current, 'paid', `Đã nhận thanh toán. Chưa tự pay được: ${payResult.message}`);
+        return { ok: false, status: 'paid', message: payResult.message };
+    }
+
+    current.status = 'delivered';
+    current.paymentVerified = Boolean(current.paymentVerified || source.verified);
+    current.paidAt = current.paidAt || Date.now();
+    current.deliveredAt = Date.now();
+    current.deliverySource = source.source;
+    current.deliveryCommand = renderPayCommand(current);
+    current.deliveryResponse = payResult.response || '';
+    delete current.deliveryError;
+    orders[current.id] = current;
+    saveMoneyOrders(orders);
+
+    await updateAutoBuyPanel();
+    await updateMoneyOrderTicket(current, 'delivered', 'Bot đã tự giao Money vào server.');
+
+    try {
+        const user = await client.users.fetch(current.userId);
+        await user.send(
+            `✅ **Giao dịch tự động hoàn tất!**\n` +
+            `💰 Money nhận được: **${amountM.toLocaleString('vi-VN')}M$**\n` +
+            `👤 Ingame: **${current.ign}**\n` +
+            `🆔 Đơn: \`${current.id}\``
+        );
+    } catch {}
+
+    return { ok: true, status: 'delivered', message: 'Đã nhận thanh toán và tự giao Money.' };
+}
+
 
 async function handleMoneyButton(interaction) {
     const id = interaction.customId;
 
-    if (id.startsWith('money_approve_') || id.startsWith('money_reject_')) {
+    if (
+        id.startsWith('money_approve_') ||
+        id.startsWith('money_reject_')
+    ) {
         if (!isAdminUser(interaction)) {
             return safeReply(interaction, {
                 content: '❌ Chỉ Admin mới có quyền duyệt hoặc từ chối đơn!',
@@ -630,7 +1035,10 @@ async function handleMoneyButton(interaction) {
         if (!(await safeDeferUpdate(interaction))) return;
 
         const isApprove = id.startsWith('money_approve_');
-        const orderId = id.replace(isApprove ? 'money_approve_' : 'money_reject_', '');
+        const orderId = id.replace(
+            isApprove ? 'money_approve_' : 'money_reject_',
+            ''
+        );
 
         const orders = getMoneyOrders();
         const order = orders[orderId];
@@ -650,51 +1058,42 @@ async function handleMoneyButton(interaction) {
         }
 
         if (isApprove) {
-            if (order.status !== 'pending' && order.status !== 'rejected') {
+            if (!['pending', 'rejected', 'paid'].includes(order.status)) {
                 return safeEditReply(interaction, {
                     content: `⚠️ Đơn này đang ở trạng thái: \`${order.status}\`.`,
                     components: []
                 });
             }
 
-            if (currentStockM < order.amountM) {
-                return safeEditReply(interaction, {
-                    content:
-                        `❌ Kho không đủ!\n` +
-                        `Cần: **${order.amountM.toLocaleString('vi-VN')}M$**\n` +
-                        `Còn: **${formatStock(currentStockM)}**`
-                });
-            }
-
-            currentStockM -= order.amountM;
-            saveStock(currentStockM);
-
-            order.status = 'approved';
+            order.paymentVerified = true;
             order.approvedBy = interaction.user.id;
             order.approvedAt = Date.now();
-
             orders[orderId] = order;
             saveMoneyOrders(orders);
 
-            await updateAutoBuyPanel();
-
-            const updatedEmbed = EmbedBuilder.from(interaction.message.embeds[0])
-                .setColor('#2ecc71')
-                .setTitle('✅ ĐƠN ĐÃ ĐƯỢC DUYỆT')
+            const result = await fulfillMoneyOrder(order, { source: 'manual', verified: true });
+            const color = result.status === 'delivered' ? '#2ecc71' : '#f1c40f';
+            const updatedEmbed = EmbedBuilder.from(
+                interaction.message.embeds[0] || new EmbedBuilder().setTitle('Đơn Money')
+            )
+                .setColor(color)
+                .setTitle(result.ok ? '✅ ĐƠN ĐÃ GIAO' : '💳 ĐÃ NHẬN THANH TOÁN')
                 .addFields({
                     name: '📌 Trạng thái',
                     value:
-                        `✅ Duyệt bởi <@${interaction.user.id}>\n` +
-                        `📉 Đã trừ **${order.amountM.toLocaleString('vi-VN')}M$**`
+                        `${result.ok ? '✅ AutoPay thành công' : '⚠️ Chờ xử lý AutoPay'}\n` +
+                        `👮 Xác nhận bởi <@${interaction.user.id}>\n` +
+                        `💵 ${Number(order.vndAmount || 0).toLocaleString('vi-VN')} VNĐ\n` +
+                        `💰 ${Number(order.amountM).toLocaleString('vi-VN')}M$\n` +
+                        (result.message ? `📝 ${result.message}` : '')
                 });
 
             const closeRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId('money_done')
-                    .setLabel('✅ Đã Duyệt Đơn')
-                    .setStyle(ButtonStyle.Success)
+                    .setLabel(result.ok ? '✅ Đã Giao' : '💳 Đã Nhận Tiền')
+                    .setStyle(result.ok ? ButtonStyle.Success : ButtonStyle.Secondary)
                     .setDisabled(true),
-
                 new ButtonBuilder()
                     .setCustomId('close_ticket')
                     .setLabel('Đóng Ticket')
@@ -702,37 +1101,10 @@ async function handleMoneyButton(interaction) {
                     .setStyle(ButtonStyle.Secondary)
             );
 
-            await safeEditReply(interaction, {
+            return safeEditReply(interaction, {
                 embeds: [updatedEmbed],
                 components: [closeRow]
             });
-
-            try {
-                const user = await client.users.fetch(order.userId);
-                await user.send(
-                    `🎉 **Đơn nạp của bạn đã được Admin duyệt!**\n` +
-                    `💰 Money nhận được: **${order.amountM.toLocaleString('vi-VN')}M$**`
-                );
-            } catch (err) {}
-
-            if (
-                interaction.channel &&
-                (
-                    interaction.channel.name?.startsWith('ticket-bank-') ||
-                    interaction.channel.name?.startsWith('ticket-card-')
-                )
-            ) {
-                const legitChannelId = process.env.LEGIT_CHANNEL_ID || process.env.LOG_CHANNEL_ID;
-                const legitText = legitChannelId ? ` tại <#${legitChannelId}>` : '';
-
-                await interaction.channel.send(
-                    `✨ <@${order.userId}> **Giao dịch đã hoàn tất!**\n` +
-                    `Vui lòng gửi đánh giá/legit${legitText} để ủng hộ shop.\n` +
-                    `🔒 Sau khi gửi legit, Admin có thể bấm **Đóng Ticket**.`
-                );
-            }
-
-            return;
         }
 
         order.status = 'rejected';
@@ -742,7 +1114,9 @@ async function handleMoneyButton(interaction) {
         orders[orderId] = order;
         saveMoneyOrders(orders);
 
-        const updatedEmbed = EmbedBuilder.from(interaction.message.embeds[0])
+        const updatedEmbed = EmbedBuilder.from(
+            interaction.message.embeds[0]
+        )
             .setColor('#e74c3c')
             .setTitle('❌ ĐƠN TẠM BỊ TỪ CHỐI')
             .addFields({
@@ -773,6 +1147,7 @@ async function handleMoneyButton(interaction) {
 
         try {
             const user = await client.users.fetch(order.userId);
+
             await user.send(
                 `❌ **Đơn nạp của bạn đang bị từ chối/tạm dừng.**\n` +
                 `Vui lòng phản hồi trong Ticket để được Admin hỗ trợ.`
@@ -781,6 +1156,10 @@ async function handleMoneyButton(interaction) {
 
         return;
     }
+
+    // ========================================================
+    // CHECK GIỜ LÀM VIỆC & STOCK KHI BẤM NÚT MUA
+    // ========================================================
 
     if (!isWithinWorkingHours() && id !== 'guide') {
         const startHour = moneyConfig.workingHours?.start ?? 10;
@@ -824,7 +1203,10 @@ async function handleMoneyButton(interaction) {
         try {
             return await interaction.showModal(modal);
         } catch (err) {
-            if (err?.code === 40060) return;
+            if (err?.code === 40060) {
+                console.log('⚠️ Modal bank đã được acknowledge.');
+                return;
+            }
             console.error('Lỗi show modal bank:', err.message);
         }
     }
@@ -877,7 +1259,10 @@ async function handleMoneyButton(interaction) {
         try {
             return await interaction.showModal(modal);
         } catch (err) {
-            if (err?.code === 40060) return;
+            if (err?.code === 40060) {
+                console.log('⚠️ Modal card đã được acknowledge.');
+                return;
+            }
             console.error('Lỗi show modal card:', err.message);
         }
     }
@@ -900,7 +1285,10 @@ async function handleMoneyButton(interaction) {
         try {
             return await interaction.showModal(modal);
         } catch (err) {
-            if (err?.code === 40060) return;
+            if (err?.code === 40060) {
+                console.log('⚠️ Modal calc đã được acknowledge.');
+                return;
+            }
             console.error('Lỗi show modal calc:', err.message);
         }
     }
@@ -926,11 +1314,18 @@ async function handleMoneyButton(interaction) {
 
 async function handleMoneyModal(interaction) {
     if (interaction.customId === 'modal_bank') {
-        const ign = interaction.fields.getTextInputValue('bank_name').trim();
-        const rawVnd = interaction.fields.getTextInputValue('bank_vnd');
+        const ign = interaction.fields
+            .getTextInputValue('bank_name')
+            .trim();
+
+        const rawVnd = interaction.fields
+            .getTextInputValue('bank_vnd');
 
         const vndAmount = Math.floor(parseCardValue(rawVnd));
-        const moneyReceivedM = vndAmount > 0 ? Math.floor(vndAmount / RATE) : 0;
+        const moneyReceivedM =
+            vndAmount > 0
+                ? Math.floor(vndAmount / RATE)
+                : 0;
 
         if (vndAmount < 1000) {
             return safeReply(interaction, {
@@ -941,7 +1336,9 @@ async function handleMoneyModal(interaction) {
 
         if (moneyReceivedM <= 0) {
             return safeReply(interaction, {
-                content: `❌ Số tiền quá thấp. Với Rate ${RATE}đ/1M, số tiền phải đủ để nhận ít nhất 1M$.`,
+                content:
+                    `❌ Số tiền quá thấp. Với Rate ${RATE}đ/1M, ` +
+                    `số tiền phải đủ để nhận ít nhất 1M$.`,
                 flags: MessageFlags.Ephemeral
             });
         }
@@ -956,10 +1353,16 @@ async function handleMoneyModal(interaction) {
             });
         }
 
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const orderId = `M${Date.now()}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
-        const memo = `KSMP ${ign}`;
+        const orderId = `M${Date.now()}${Math.random()
+            .toString(36)
+            .slice(2, 7)
+            .toUpperCase()}`;
+
+        const memo = `KSMP ${orderId}`;
 
         const qrUrl =
             `https://img.vietqr.io/image/` +
@@ -978,6 +1381,7 @@ async function handleMoneyModal(interaction) {
             ign,
             vndAmount,
             amountM: moneyReceivedM,
+            memo,
             status: 'pending',
             createdAt: Date.now()
         };
@@ -988,6 +1392,7 @@ async function handleMoneyModal(interaction) {
             const ticketChannel = await interaction.guild.channels.create({
                 name: `ticket-bank-${ign.toLowerCase().replace(/[^a-z0-9-_]/gi, '').slice(0, 70)}`,
                 type: ChannelType.GuildText,
+
                 permissionOverwrites: [
                     {
                         id: interaction.guild.id,
@@ -1016,15 +1421,38 @@ async function handleMoneyModal(interaction) {
                     `📸 **SAU KHI CHUYỂN TIỀN, GỬI ẢNH BILL VÀO KÊNH NÀY.**`
                 )
                 .addFields(
-                    { name: '👤 Ingame', value: `\`${ign}\``, inline: true },
-                    { name: '💰 Money nhận', value: `\`${moneyReceivedM.toLocaleString('vi-VN')}M$\``, inline: true },
-                    { name: '💵 Số tiền', value: `\`${vndAmount.toLocaleString('vi-VN')} VNĐ\``, inline: true },
-                    { name: '🏦 Ngân hàng', value: `\`MBBANK\` - STK: \`${BANK_CONFIG.ACCOUNT_NO}\`` },
-                    { name: '👤 Chủ tài khoản', value: `\`${BANK_CONFIG.ACCOUNT_NAME}\`` },
-                    { name: '📌 Nội dung CK', value: `\`\`\`${memo}\`\`\`` }
+                    {
+                        name: '👤 Ingame',
+                        value: `\`${ign}\``,
+                        inline: true
+                    },
+                    {
+                        name: '💰 Money nhận',
+                        value: `\`${moneyReceivedM.toLocaleString('vi-VN')}M$\``,
+                        inline: true
+                    },
+                    {
+                        name: '💵 Số tiền',
+                        value: `\`${vndAmount.toLocaleString('vi-VN')} VNĐ\``,
+                        inline: true
+                    },
+                    {
+                        name: '🏦 Ngân hàng',
+                        value: `\`MBBANK\` - STK: \`${BANK_CONFIG.ACCOUNT_NO}\``
+                    },
+                    {
+                        name: '👤 Chủ tài khoản',
+                        value: `\`${BANK_CONFIG.ACCOUNT_NAME}\``
+                    },
+                    {
+                        name: '📌 Nội dung CK',
+                        value: `\`\`\`${memo}\`\`\``
+                    }
                 )
                 .setImage(qrUrl)
-                .setFooter({ text: `Mã đơn: ${orderId} • Admin kiểm tra bill trước khi duyệt` })
+                .setFooter({
+                    text: `Mã đơn: ${orderId} • Admin kiểm tra bill trước khi duyệt`
+                })
                 .setTimestamp();
 
             const adminRow = new ActionRowBuilder().addComponents(
@@ -1092,24 +1520,40 @@ async function handleMoneyModal(interaction) {
                     `✅ **ĐÃ TẠO TICKET NẠP BANK!**\n` +
                     `👉 ${ticketChannel}\n` +
                     `🆔 Mã đơn: \`${orderId}\`\n` +
-                    `📸 Gửi ảnh Bill vào ticket.`
+                    `📸 Hệ thống sẽ tự xác minh thanh toán; Bill chỉ dùng để đối chiếu khi cần.`
             });
         } catch (err) {
             delete orders[orderId];
             saveMoneyOrders(orders);
 
             return safeEditReply(interaction, {
-                content: `❌ Không thể tạo Ticket: \`${err.message}\`\nKiểm tra quyền **Manage Channels** của Bot.`
+                content:
+                    `❌ Không thể tạo Ticket: \`${err.message}\`\n` +
+                    `Kiểm tra quyền **Manage Channels** của Bot.`
             });
         }
     }
 
     if (interaction.customId === 'modal_card') {
-        const ign = interaction.fields.getTextInputValue('card_ign').trim();
-        const type = interaction.fields.getTextInputValue('card_type').trim();
-        const val = interaction.fields.getTextInputValue('card_val').trim();
-        const code = interaction.fields.getTextInputValue('card_code').trim();
-        const seri = interaction.fields.getTextInputValue('card_seri').trim();
+        const ign = interaction.fields
+            .getTextInputValue('card_ign')
+            .trim();
+
+        const type = interaction.fields
+            .getTextInputValue('card_type')
+            .trim();
+
+        const val = interaction.fields
+            .getTextInputValue('card_val')
+            .trim();
+
+        const code = interaction.fields
+            .getTextInputValue('card_code')
+            .trim();
+
+        const seri = interaction.fields
+            .getTextInputValue('card_seri')
+            .trim();
 
         const cardValueVnd = Math.floor(parseCardValue(val));
 
@@ -1120,8 +1564,12 @@ async function handleMoneyModal(interaction) {
             });
         }
 
-        const netVnd = Math.floor(cardValueVnd * (1 - CARD_DISCOUNT));
-        const moneyReceivedM = Math.floor(netVnd / RATE);
+        const netVnd = Math.floor(
+            cardValueVnd * (1 - CARD_DISCOUNT)
+        );
+
+        const moneyReceivedM =
+            Math.floor(netVnd / RATE);
 
         if (moneyReceivedM <= 0) {
             return safeReply(interaction, {
@@ -1140,9 +1588,14 @@ async function handleMoneyModal(interaction) {
             });
         }
 
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const orderId = `C${Date.now()}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+        const orderId = `C${Date.now()}${Math.random()
+            .toString(36)
+            .slice(2, 7)
+            .toUpperCase()}`;
 
         const orders = getMoneyOrders();
 
@@ -1158,6 +1611,8 @@ async function handleMoneyModal(interaction) {
             amountM: moneyReceivedM,
             cardCode: code,
             cardSeri: seri,
+            paymentVerified: false,
+            cardVerified: false,
             status: 'pending',
             createdAt: Date.now()
         };
@@ -1168,6 +1623,7 @@ async function handleMoneyModal(interaction) {
             const ticketChannel = await interaction.guild.channels.create({
                 name: `ticket-card-${ign.toLowerCase().replace(/[^a-z0-9-_]/gi, '').slice(0, 70)}`,
                 type: ChannelType.GuildText,
+
                 permissionOverwrites: [
                     {
                         id: interaction.guild.id,
@@ -1193,17 +1649,41 @@ async function handleMoneyModal(interaction) {
                 .setDescription(
                     `Chào <@${interaction.user.id}>!\n` +
                     `Đơn nạp thẻ đã được ghi nhận.\n` +
-                    `⏳ **Admin sẽ kiểm tra thẻ trước khi duyệt.**`
+                    `⏳ **Hệ thống sẽ tự xác minh thẻ qua Card Webhook; nếu lỗi, Admin có thể kiểm tra thủ công.**`
                 )
                 .addFields(
-                    { name: '👤 Ingame', value: `\`${ign}\``, inline: true },
-                    { name: '💳 Loại thẻ', value: `\`${type}\``, inline: true },
-                    { name: '💵 Mệnh giá', value: `\`${cardValueVnd.toLocaleString('vi-VN')} VNĐ\``, inline: true },
-                    { name: '💰 Money quy đổi', value: `\`${moneyReceivedM.toLocaleString('vi-VN')}M$\``, inline: true },
-                    { name: '🔑 Mã thẻ', value: `\`\`\`${code}\`\`\`` },
-                    { name: '🔢 Seri', value: `\`\`\`${seri}\`\`\`` }
+                    {
+                        name: '👤 Ingame',
+                        value: `\`${ign}\``,
+                        inline: true
+                    },
+                    {
+                        name: '💳 Loại thẻ',
+                        value: `\`${type}\``,
+                        inline: true
+                    },
+                    {
+                        name: '💵 Mệnh giá',
+                        value: `\`${cardValueVnd.toLocaleString('vi-VN')} VNĐ\``,
+                        inline: true
+                    },
+                    {
+                        name: '💰 Money quy đổi',
+                        value: `\`${moneyReceivedM.toLocaleString('vi-VN')}M$\``,
+                        inline: true
+                    },
+                    {
+                        name: '🔑 Mã thẻ',
+                        value: `\`\`\`${code}\`\`\``
+                    },
+                    {
+                        name: '🔢 Seri',
+                        value: `\`\`\`${seri}\`\`\``
+                    }
                 )
-                .setFooter({ text: `Mã đơn: ${orderId}` })
+                .setFooter({
+                    text: `Mã đơn: ${orderId}`
+                })
                 .setTimestamp();
 
             const adminRow = new ActionRowBuilder().addComponents(
@@ -1239,12 +1719,15 @@ async function handleMoneyModal(interaction) {
             let adminNotified = false;
             if (process.env.LOG_CHANNEL_ID) {
                 try {
-                    const logChannel = await client.channels.fetch(process.env.LOG_CHANNEL_ID);
+                    const logChannel =
+                        await client.channels.fetch(process.env.LOG_CHANNEL_ID);
+
                     if (logChannel?.isTextBased()) {
                         await logChannel.send({
-                            content: (process.env.ADMIN_DISCORD_ID
-                                ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET THẺ MỚI!**`
-                                : '🚨 **CÓ TICKET THẺ MỚI!**'),
+                            content:
+                                (process.env.ADMIN_DISCORD_ID
+                                    ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET THẺ MỚI!**`
+                                    : '🚨 **CÓ TICKET THẺ MỚI!**'),
                             embeds: [cardEmbed]
                         });
                         adminNotified = true;
@@ -1277,13 +1760,16 @@ async function handleMoneyModal(interaction) {
             saveMoneyOrders(orders);
 
             return safeEditReply(interaction, {
-                content: `❌ Không thể tạo Ticket: \`${err.message}\``
+                content:
+                    `❌ Không thể tạo Ticket: \`${err.message}\``
             });
         }
     }
 
     if (interaction.customId === 'modal_calc') {
-        const rawInput = interaction.fields.getTextInputValue('calc_money');
+        const rawInput =
+            interaction.fields.getTextInputValue('calc_money');
+
         const moneyM = parseMoneyToM(rawInput);
 
         if (moneyM <= 0) {
@@ -1293,12 +1779,16 @@ async function handleMoneyModal(interaction) {
             });
         }
 
-        const priceBankVnd = Math.round(moneyM * RATE);
-        const requiredCardVnd = Math.round(priceBankVnd / (1 - CARD_DISCOUNT));
+        const priceBankVnd =
+            Math.round(moneyM * RATE);
 
-        const warning = moneyM > currentStockM
-            ? `\n⚠️ Số Money này vượt Stock hiện tại: **${formatStock(currentStockM)}**`
-            : '';
+        const requiredCardVnd =
+            Math.round(priceBankVnd / (1 - CARD_DISCOUNT));
+
+        const warning =
+            moneyM > currentStockM
+                ? `\n⚠️ Số Money này vượt Stock hiện tại: **${formatStock(currentStockM)}**`
+                : '';
 
         return safeReply(interaction, {
             content:
@@ -1355,10 +1845,24 @@ function createAccEmbed(acc) {
             }`
         )
         .addFields(
-            { name: '🏷️ Username', value: `\`${acc.username}\`` },
-            { name: '👕 Cape Số Lượng', value: `\`${acc.capeCount}\``, inline: true },
-            { name: '✨ Cape Chi Tiết', value: `\`${acc.capeList || 'Không'}\``, inline: true },
-            { name: '⭐ Rank', value: `\`${acc.rank}\`` }
+            {
+                name: '🏷️ Username',
+                value: `\`${acc.username}\``
+            },
+            {
+                name: '👕 Cape Số Lượng',
+                value: `\`${acc.capeCount}\``,
+                inline: true
+            },
+            {
+                name: '✨ Cape Chi Tiết',
+                value: `\`${acc.capeList || 'Không'}\``,
+                inline: true
+            },
+            {
+                name: '⭐ Rank',
+                value: `\`${acc.rank}\``
+            }
         );
 
     if (acc.imageUrl) {
@@ -1400,7 +1904,10 @@ async function updateAccListingMessage(acc) {
         console.log(`✅ Listing ${acc.username} đã chuyển sang ĐÃ BÁN.`);
         return true;
     } catch (err) {
-        console.error(`❌ Không cập nhật được listing ${acc.username}:`, err?.message || err);
+        console.error(
+            `❌ Không cập nhật được listing ${acc.username}:`,
+            err?.message || err
+        );
         return false;
     }
 }
@@ -1410,6 +1917,7 @@ async function updateAccListingAvailable(acc) {
 
     try {
         const channel = await client.channels.fetch(String(acc.channelId));
+
         if (!channel || !channel.isTextBased()) return false;
 
         const message = await channel.messages.fetch(String(acc.messageId));
@@ -1430,7 +1938,10 @@ async function updateAccListingAvailable(acc) {
         console.log(`✅ Listing ${acc.username} đã trở lại CÓ SẴN.`);
         return true;
     } catch (err) {
-        console.error(`❌ Không cập nhật được listing available ${acc.username}:`, err?.message || err);
+        console.error(
+            `❌ Không cập nhật được listing available ${acc.username}:`,
+            err?.message || err
+        );
         return false;
     }
 }
@@ -1448,24 +1959,38 @@ async function handleAccCommand(interaction) {
     }
 
     if (interaction.commandName === 'setstockacc') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const rawData = interaction.options.getString('danh_sach');
-        const lines = rawData.split('\n').map(line => line.trim()).filter(Boolean);
+        const rawData =
+            interaction.options.getString('danh_sach');
+
+        const lines = rawData
+            .split('\n')
+            .map(line => line.trim())
+            .filter(Boolean);
 
         const stock = getAccStock();
+
         let count = 0;
 
         for (const line of lines) {
-            const parts = line.split('|').map(p => p.trim());
+            const parts = line
+                .split('|')
+                .map(p => p.trim());
 
             if (parts.length >= 2) {
                 stock.push({
-                    id: `stock_${Date.now()}_` + Math.random().toString(36).slice(2, 8),
+                    id:
+                        `stock_${Date.now()}_` +
+                        Math.random().toString(36).slice(2, 8),
+
                     name: parts[0] || 'Chưa đặt tên',
                     email: parts[1] || 'Không có email',
                     recoveryCode: parts[2] || 'Không có'
                 });
+
                 count++;
             }
         }
@@ -1480,19 +2005,25 @@ async function handleAccCommand(interaction) {
     }
 
     if (interaction.commandName === 'acc') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
         const stock = getAccStock();
 
         if (stock.length === 0) {
             return safeEditReply(interaction, {
-                content: '❌ Kho tài khoản đang trống! Dùng `/setstockacc` để thêm.'
+                content:
+                    '❌ Kho tài khoản đang trống! Dùng `/setstockacc` để thêm.'
             });
         }
 
         const options = stock.slice(0, 25).map(item => {
-            const safeName = String(item.name || 'Không có tên').slice(0, 100);
-            const safeEmail = String(item.email || 'Không có email').slice(0, 90);
+            const safeName =
+                String(item.name || 'Không có tên').slice(0, 100);
+
+            const safeEmail =
+                String(item.email || 'Không có email').slice(0, 90);
 
             return new StringSelectMenuOptionBuilder()
                 .setLabel(safeName)
@@ -1506,13 +2037,19 @@ async function handleAccCommand(interaction) {
             .addOptions(options);
 
         return safeEditReply(interaction, {
-            content: `📦 **Kho tài khoản: ${stock.length} acc**\nChọn tài khoản bên dưới:`,
-            components: [new ActionRowBuilder().addComponents(selectMenu)]
+            content:
+                `📦 **Kho tài khoản: ${stock.length} acc**\n` +
+                `Chọn tài khoản bên dưới:`,
+            components: [
+                new ActionRowBuilder().addComponents(selectMenu)
+            ]
         });
     }
 
     if (interaction.commandName === 'deleteacc') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
         const stock = getAccStock();
 
@@ -1523,8 +2060,11 @@ async function handleAccCommand(interaction) {
         }
 
         const options = stock.slice(0, 25).map(item => {
-            const safeName = String(item.name || 'Không tên').slice(0, 100);
-            const safeEmail = String(item.email || 'Không email').slice(0, 90);
+            const safeName =
+                String(item.name || 'Không tên').slice(0, 100);
+
+            const safeEmail =
+                String(item.email || 'Không email').slice(0, 90);
 
             return new StringSelectMenuOptionBuilder()
                 .setLabel(safeName)
@@ -1538,21 +2078,40 @@ async function handleAccCommand(interaction) {
             .addOptions(options);
 
         return safeEditReply(interaction, {
-            content: `🗑️ **Kho hiện có ${stock.length} acc**\nChọn tài khoản muốn xóa:`,
-            components: [new ActionRowBuilder().addComponents(selectMenu)]
+            content:
+                `🗑️ **Kho hiện có ${stock.length} acc**\n` +
+                `Chọn tài khoản muốn xóa:`,
+            components: [
+                new ActionRowBuilder().addComponents(selectMenu)
+            ]
         });
     }
 
     if (interaction.commandName === 'thongtin') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const username = interaction.options.getString('username').trim();
-        const priceBank = interaction.options.getInteger('price_bank');
-        const priceCard = interaction.options.getInteger('price_card');
-        const capeCount = interaction.options.getInteger('cape_count');
-        const capeList = interaction.options.getString('cape_list').trim();
-        const rank = interaction.options.getString('rank');
-        const imageUrl = interaction.options.getString('image_url') || null;
+        const username =
+            interaction.options.getString('username').trim();
+
+        const priceBank =
+            interaction.options.getInteger('price_bank');
+
+        const priceCard =
+            interaction.options.getInteger('price_card');
+
+        const capeCount =
+            interaction.options.getInteger('cape_count');
+
+        const capeList =
+            interaction.options.getString('cape_list').trim();
+
+        const rank =
+            interaction.options.getString('rank');
+
+        const imageUrl =
+            interaction.options.getString('image_url') || null;
 
         const accs = getDetailedAccs();
 
@@ -1591,19 +2150,30 @@ async function handleAccCommand(interaction) {
         saveDetailedAccs(accs);
 
         return safeEditReply(interaction, {
-            content: `✅ Đã đăng bán Acc \`${username}\` thành công!`
+            content:
+                `✅ Đã đăng bán Acc \`${username}\` thành công!`
         });
     }
 
     if (interaction.commandName === 'price') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const username = interaction.options.getString('username').trim();
-        const newBank = interaction.options.getInteger('price_bank');
-        const newCard = interaction.options.getInteger('price_card');
+        const username =
+            interaction.options.getString('username').trim();
+
+        const newBank =
+            interaction.options.getInteger('price_bank');
+
+        const newCard =
+            interaction.options.getInteger('price_card');
 
         const accs = getDetailedAccs();
-        const target = accs.find(a => a.username.toLowerCase() === username.toLowerCase());
+
+        const target = accs.find(
+            a => a.username.toLowerCase() === username.toLowerCase()
+        );
 
         if (!target) {
             return safeEditReply(interaction, {
@@ -1626,19 +2196,30 @@ async function handleAccCommand(interaction) {
         } catch (err) {}
 
         return safeEditReply(interaction, {
-            content: `✅ Đã cập nhật giá cho Acc \`${username}\`!`
+            content:
+                `✅ Đã cập nhật giá cho Acc \`${username}\`!`
         });
     }
 
     if (interaction.commandName === 'cape') {
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const username = interaction.options.getString('username').trim();
-        const count = interaction.options.getInteger('cape_count');
-        const list = interaction.options.getString('cape_list').trim();
+        const username =
+            interaction.options.getString('username').trim();
+
+        const count =
+            interaction.options.getInteger('cape_count');
+
+        const list =
+            interaction.options.getString('cape_list').trim();
 
         const accs = getDetailedAccs();
-        const target = accs.find(a => a.username.toLowerCase() === username.toLowerCase());
+
+        const target = accs.find(
+            a => a.username.toLowerCase() === username.toLowerCase()
+        );
 
         if (!target) {
             return safeEditReply(interaction, {
@@ -1661,7 +2242,9 @@ async function handleAccCommand(interaction) {
         } catch (err) {}
 
         return safeEditReply(interaction, {
-            content: `✅ Đã cập nhật Cape cho Acc \`${username}\`: **${count} Cape (${list})**!`
+            content:
+                `✅ Đã cập nhật Cape cho Acc \`${username}\`: ` +
+                `**${count} Cape (${list})**!`
         });
     }
 }
@@ -1684,7 +2267,9 @@ async function handleAccSelectMenu(interaction) {
         const selectedId = interaction.values[0];
         const stock = getAccStock();
 
-        const target = stock.find(a => String(a.id) === String(selectedId));
+        const target = stock.find(
+            a => String(a.id) === String(selectedId)
+        );
 
         if (!target) {
             return safeEditReply(interaction, {
@@ -1729,7 +2314,9 @@ async function handleAccSelectMenu(interaction) {
         const selectedId = interaction.values[0];
         const stock = getAccStock();
 
-        const index = stock.findIndex(a => String(a.id) === String(selectedId));
+        const index = stock.findIndex(
+            a => String(a.id) === String(selectedId)
+        );
 
         if (index === -1) {
             return safeEditReply(interaction, {
@@ -1739,20 +2326,34 @@ async function handleAccSelectMenu(interaction) {
         }
 
         const [foundAcc] = stock.splice(index, 1);
+
         saveAccStock(stock);
 
         const embed = new EmbedBuilder()
             .setTitle(`🔑 THÔNG TIN ACC: ${foundAcc.name}`)
             .setColor('#3498db')
             .addFields(
-                { name: '🏷️ Tên / Ghi chú', value: `\`${foundAcc.name || 'Không có'}\`` },
-                { name: '📧 Email', value: `\`\`\`${foundAcc.email || 'Không có'}\`\`\`` },
-                { name: '🔑 Recovery Code', value: `\`\`\`${foundAcc.recoveryCode || 'Không có'}\`\`\`` }
+                {
+                    name: '🏷️ Tên / Ghi chú',
+                    value: `\`${foundAcc.name || 'Không có'}\``
+                },
+                {
+                    name: '📧 Email',
+                    value: `\`\`\`${foundAcc.email || 'Không có'}\`\`\``
+                },
+                {
+                    name: '🔑 Recovery Code',
+                    value:
+                        `\`\`\`${foundAcc.recoveryCode || 'Không có'}\`\`\``
+                }
             )
-            .setFooter({ text: '⚠️ Tài khoản đã được rút khỏi kho!' });
+            .setFooter({
+                text: '⚠️ Tài khoản đã được rút khỏi kho!'
+            });
 
         return safeEditReply(interaction, {
-            content: `✅ Đã rút thành công: \`${foundAcc.name}\``,
+            content:
+                `✅ Đã rút thành công: \`${foundAcc.name}\``,
             embeds: [embed],
             components: []
         });
@@ -1768,15 +2369,21 @@ async function handleAccSelectMenu(interaction) {
 
         if (!(await safeDeferUpdate(interaction))) return;
 
-        const targetMessageId = interaction.customId.replace('select_deliver_acc_', '');
+        const targetMessageId =
+            interaction.customId.replace('select_deliver_acc_', '');
+
         const selectedId = interaction.values[0];
+
         const stock = getAccStock();
 
-        const index = stock.findIndex(a => String(a.id) === String(selectedId));
+        const index = stock.findIndex(
+            a => String(a.id) === String(selectedId)
+        );
 
         if (index === -1) {
             return safeEditReply(interaction, {
-                content: '❌ Tài khoản đã bị lấy hoặc không tồn tại!',
+                content:
+                    '❌ Tài khoản đã bị lấy hoặc không tồn tại!',
                 components: []
             });
         }
@@ -1791,8 +2398,12 @@ async function handleAccSelectMenu(interaction) {
         }
 
         const accId = topic.replace('accOrder:', '');
+
         const accs = getDetailedAccs();
-        const target = accs.find(a => a.id === accId);
+
+        const target = accs.find(
+            a => a.id === accId
+        );
 
         if (!target) {
             return safeEditReply(interaction, {
@@ -1803,12 +2414,15 @@ async function handleAccSelectMenu(interaction) {
 
         if (target.status !== 'pending') {
             return safeEditReply(interaction, {
-                content: `⚠️ Đơn này không còn ở trạng thái chờ. Hiện tại: \`${target.status}\``,
+                content:
+                    `⚠️ Đơn này không còn ở trạng thái chờ. ` +
+                    `Hiện tại: \`${target.status}\``,
                 components: []
             });
         }
 
         const [deliveredAcc] = stock.splice(index, 1);
+
         saveAccStock(stock);
 
         target.status = 'sold';
@@ -1831,13 +2445,30 @@ async function handleAccSelectMenu(interaction) {
         const deliverEmbed = new EmbedBuilder()
             .setTitle('🎉 THANH TOÁN THÀNH CÔNG!')
             .setColor('#2ecc71')
-            .setDescription('Đơn hàng đã được Admin duyệt. Thông tin tài khoản:')
-            .addFields(
-                { name: '🎮 Tên / Ghi chú', value: `\`${deliveredAcc.name || 'Acc'}\`` },
-                { name: '📧 Email', value: `\`\`\`${deliveredAcc.email || 'Không có'}\`\`\`` },
-                { name: '🔑 Recovery Code', value: `\`\`\`${deliveredAcc.recoveryCode || 'Không có'}\`\`\`` }
+            .setDescription(
+                'Đơn hàng đã được Admin duyệt. ' +
+                'Thông tin tài khoản:'
             )
-            .setFooter({ text: `Còn lại ${stock.length} acc trong kho.` });
+            .addFields(
+                {
+                    name: '🎮 Tên / Ghi chú',
+                    value: `\`${deliveredAcc.name || 'Acc'}\``
+                },
+                {
+                    name: '📧 Email',
+                    value:
+                        `\`\`\`${deliveredAcc.email || 'Không có'}\`\`\``
+                },
+                {
+                    name: '🔑 Recovery Code',
+                    value:
+                        `\`\`\`${deliveredAcc.recoveryCode || 'Không có'}\`\`\``
+                }
+            )
+            .setFooter({
+                text:
+                    `Còn lại ${stock.length} acc trong kho.`
+            });
 
         await interaction.channel.send({
             embeds: [deliverEmbed],
@@ -1845,20 +2476,26 @@ async function handleAccSelectMenu(interaction) {
         });
 
         try {
-            const billMsg = await interaction.channel.messages.fetch(targetMessageId);
-            const disabledRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId('approved')
-                    .setLabel('Đã Duyệt & Gửi Acc')
-                    .setStyle(ButtonStyle.Success)
-                    .setDisabled(true)
-            );
+            const billMsg =
+                await interaction.channel.messages.fetch(targetMessageId);
 
-            await billMsg.edit({ components: [disabledRow] });
+            const disabledRow =
+                new ActionRowBuilder().addComponents(
+                    new ButtonBuilder()
+                        .setCustomId('approved')
+                        .setLabel('Đã Duyệt & Gửi Acc')
+                        .setStyle(ButtonStyle.Success)
+                        .setDisabled(true)
+                );
+
+            await billMsg.edit({
+                components: [disabledRow]
+            });
         } catch (err) {}
 
         return safeEditReply(interaction, {
-            content: `✅ Đã gửi acc \`${deliveredAcc.name || 'Acc'}\` cho khách!`,
+            content:
+                `✅ Đã gửi acc \`${deliveredAcc.name || 'Acc'}\` cho khách!`,
             components: []
         });
     }
@@ -1881,15 +2518,21 @@ async function handleAccButton(interaction) {
 
         if (!(await safeDeferUpdate(interaction))) return;
 
-        const targetId = id.replace('confirm_delete_', '');
+        const targetId =
+            id.replace('confirm_delete_', '');
+
         let stock = getAccStock();
+
         const initialLength = stock.length;
 
-        stock = stock.filter(a => String(a.id) !== String(targetId));
+        stock = stock.filter(
+            a => String(a.id) !== String(targetId)
+        );
 
         if (stock.length === initialLength) {
             return safeEditReply(interaction, {
-                content: '❌ Tài khoản đã bị xóa hoặc không tồn tại!',
+                content:
+                    '❌ Tài khoản đã bị xóa hoặc không tồn tại!',
                 components: []
             });
         }
@@ -1923,46 +2566,61 @@ async function handleAccButton(interaction) {
             });
         }
 
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const accId = id.replace('buy_single_', '');
+        const accId =
+            id.replace('buy_single_', '');
+
         const accs = getDetailedAccs();
-        const target = accs.find(a => a.id === accId);
+
+        const target =
+            accs.find(a => a.id === accId);
 
         if (!target || target.status !== 'available') {
             return safeEditReply(interaction, {
-                content: '❌ Sản phẩm hiện không có sẵn hoặc đang được người khác mua.'
+                content:
+                    '❌ Sản phẩm hiện không có sẵn hoặc đang được người khác mua.'
             });
         }
 
         const guild = interaction.guild;
-        const channelName = `ticket-${interaction.user.username}`
-            .toLowerCase()
-            .replace(/[^a-z0-9-_]/g, '')
-            .slice(0, 70);
+
+        const channelName =
+            `ticket-${interaction.user.username}`
+                .toLowerCase()
+                .replace(/[^a-z0-9-_]/g, '')
+                .slice(0, 70);
 
         try {
-            const ticketChannel = await guild.channels.create({
-                name: channelName,
-                type: ChannelType.GuildText,
-                permissionOverwrites: [
-                    {
-                        id: guild.id,
-                        deny: [PermissionsBitField.Flags.ViewChannel]
-                    },
-                    {
-                        id: interaction.user.id,
-                        allow: [
-                            PermissionsBitField.Flags.ViewChannel,
-                            PermissionsBitField.Flags.SendMessages,
-                            PermissionsBitField.Flags.AttachFiles
-                        ]
-                    },
-                    ...adminOverwrite(guild.id)
-                ]
-            });
+            const ticketChannel =
+                await guild.channels.create({
+                    name: channelName,
+                    type: ChannelType.GuildText,
 
-            await ticketChannel.setTopic(`accOrder:${target.id}`);
+                    permissionOverwrites: [
+                        {
+                            id: guild.id,
+                            deny: [
+                                PermissionsBitField.Flags.ViewChannel
+                            ]
+                        },
+                        {
+                            id: interaction.user.id,
+                            allow: [
+                                PermissionsBitField.Flags.ViewChannel,
+                                PermissionsBitField.Flags.SendMessages,
+                                PermissionsBitField.Flags.AttachFiles
+                            ]
+                        },
+                        ...adminOverwrite(guild.id)
+                    ]
+                });
+
+            await ticketChannel.setTopic(
+                `accOrder:${target.id}`
+            );
 
             target.status = 'pending';
             target.pendingTicketId = ticketChannel.id;
@@ -1970,8 +2628,15 @@ async function handleAccButton(interaction) {
 
             saveDetailedAccs(accs);
 
-            const addInfoEncoded = encodeURIComponent(`THANH TOAN DON HANG ${target.username}`);
-            const accountNameEncoded = encodeURIComponent(BANK_CONFIG.ACCOUNT_NAME);
+            const addInfoEncoded =
+                encodeURIComponent(
+                    `THANH TOAN DON HANG ${target.username}`
+                );
+
+            const accountNameEncoded =
+                encodeURIComponent(
+                    BANK_CONFIG.ACCOUNT_NAME
+                );
 
             const qrUrl =
                 `https://img.vietqr.io/image/` +
@@ -1980,19 +2645,49 @@ async function handleAccButton(interaction) {
                 `&addInfo=${addInfoEncoded}` +
                 `&accountName=${accountNameEncoded}`;
 
-            const payEmbed = new EmbedBuilder()
-                .setTitle(`💳 THANH TOÁN: ${target.username}`)
-                .setColor('#2ecc71')
-                .setDescription('Vui lòng chuyển khoản đúng số tiền bên dưới.')
-                .addFields(
-                    { name: '🏦 Ngân Hàng', value: `\`${BANK_CONFIG.BANK_ID}\``, inline: true },
-                    { name: '🔢 Số Tài Khoản', value: `\`${BANK_CONFIG.ACCOUNT_NO}\``, inline: true },
-                    { name: '👤 Chủ Tài Khoản', value: `\`${BANK_CONFIG.ACCOUNT_NAME}\``, inline: true },
-                    { name: '💵 Giá Bank', value: `\`${target.priceBank.toLocaleString('vi-VN')} VNĐ\``, inline: true },
-                    { name: '📲 Giá Thẻ Cào', value: `\`${target.priceCard.toLocaleString('vi-VN')} VNĐ\``, inline: true }
-                )
-                .setImage(qrUrl)
-                .setFooter({ text: 'Gửi ảnh Bill chuyển khoản vào kênh này sau khi thanh toán!' });
+            const payEmbed =
+                new EmbedBuilder()
+                    .setTitle(
+                        `💳 THANH TOÁN: ${target.username}`
+                    )
+                    .setColor('#2ecc71')
+                    .setDescription(
+                        'Vui lòng chuyển khoản đúng số tiền bên dưới.'
+                    )
+                    .addFields(
+                        {
+                            name: '🏦 Ngân Hàng',
+                            value: `\`${BANK_CONFIG.BANK_ID}\``,
+                            inline: true
+                        },
+                        {
+                            name: '🔢 Số Tài Khoản',
+                            value: `\`${BANK_CONFIG.ACCOUNT_NO}\``,
+                            inline: true
+                        },
+                        {
+                            name: '👤 Chủ Tài Khoản',
+                            value: `\`${BANK_CONFIG.ACCOUNT_NAME}\``,
+                            inline: true
+                        },
+                        {
+                            name: '💵 Giá Bank',
+                            value:
+                                `\`${target.priceBank.toLocaleString('vi-VN')} VNĐ\``,
+                            inline: true
+                        },
+                        {
+                            name: '📲 Giá Thẻ Cào',
+                            value:
+                                `\`${target.priceCard.toLocaleString('vi-VN')} VNĐ\``,
+                            inline: true
+                        }
+                    )
+                    .setImage(qrUrl)
+                    .setFooter({
+                        text:
+                            'Gửi ảnh Bill chuyển khoản vào kênh này sau khi thanh toán!'
+                    });
 
             await ticketChannel.send({
                 content: `<@${interaction.user.id}>`,
@@ -2011,7 +2706,8 @@ async function handleAccButton(interaction) {
             saveDetailedAccs(accs);
 
             return safeEditReply(interaction, {
-                content: `❌ Lỗi khi tạo Ticket: \`${err.message}\``
+                content:
+                    `❌ Lỗi khi tạo Ticket: \`${err.message}\``
             });
         }
     }
@@ -2019,91 +2715,125 @@ async function handleAccButton(interaction) {
     if (id === 'approve_bill') {
         if (!isAdminUser(interaction)) {
             return safeReply(interaction, {
-                content: '❌ Chỉ Admin mới có quyền duyệt đơn!',
+                content:
+                    '❌ Chỉ Admin mới có quyền duyệt đơn!',
                 flags: MessageFlags.Ephemeral
             });
         }
 
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
 
-        const topic = interaction.channel.topic || '';
+        const topic =
+            interaction.channel.topic || '';
 
         if (!topic.startsWith('accOrder:')) {
             return safeEditReply(interaction, {
-                content: '❌ Ticket này không phải Ticket mua Account.'
+                content:
+                    '❌ Ticket này không phải Ticket mua Account.'
             });
         }
 
-        const accId = topic.replace('accOrder:', '');
-        const accs = getDetailedAccs();
-        const target = accs.find(a => a.id === accId);
+        const accId =
+            topic.replace('accOrder:', '');
+
+        const accs =
+            getDetailedAccs();
+
+        const target =
+            accs.find(a => a.id === accId);
 
         if (!target) {
             return safeEditReply(interaction, {
-                content: '❌ Không tìm thấy sản phẩm Account.'
+                content:
+                    '❌ Không tìm thấy sản phẩm Account.'
             });
         }
 
         if (target.status !== 'pending') {
             return safeEditReply(interaction, {
-                content: `⚠️ Sản phẩm không còn chờ duyệt. Trạng thái: \`${target.status}\``
+                content:
+                    `⚠️ Sản phẩm không còn chờ duyệt. ` +
+                    `Trạng thái: \`${target.status}\``
             });
         }
 
-        const stock = getAccStock();
+        const stock =
+            getAccStock();
 
         if (stock.length === 0) {
             return safeEditReply(interaction, {
-                content: '❌ Kho Account đang trống! Dùng `/setstockacc` để thêm acc.'
+                content:
+                    '❌ Kho Account đang trống! Dùng `/setstockacc` để thêm acc.'
             });
         }
 
-        const options = stock.slice(0, 25).map(item => {
-            const safeName = String(item.name || 'Không tên').slice(0, 100);
-            const safeEmail = String(item.email || 'Không email').slice(0, 90);
+        const options =
+            stock.slice(0, 25).map(item => {
+                const safeName =
+                    String(item.name || 'Không tên')
+                        .slice(0, 100);
 
-            return new StringSelectMenuOptionBuilder()
-                .setLabel(safeName)
-                .setDescription(`Email: ${safeEmail}`)
-                .setValue(String(item.id));
-        });
+                const safeEmail =
+                    String(item.email || 'Không email')
+                        .slice(0, 90);
 
-        const selectMenu = new StringSelectMenuBuilder()
-            .setCustomId(`select_deliver_acc_${interaction.message.id}`)
-            .setPlaceholder('📦 Chọn tài khoản trong kho để gửi...')
-            .addOptions(options);
+                return new StringSelectMenuOptionBuilder()
+                    .setLabel(safeName)
+                    .setDescription(`Email: ${safeEmail}`)
+                    .setValue(String(item.id));
+            });
+
+        const selectMenu =
+            new StringSelectMenuBuilder()
+                .setCustomId(
+                    `select_deliver_acc_${interaction.message.id}`
+                )
+                .setPlaceholder(
+                    '📦 Chọn tài khoản trong kho để gửi...'
+                )
+                .addOptions(options);
 
         return safeEditReply(interaction, {
-            content: `📋 Kho hiện có **${stock.length} acc**.\nChọn 1 acc để gửi cho khách:`,
-            components: [new ActionRowBuilder().addComponents(selectMenu)]
+            content:
+                `📋 Kho hiện có **${stock.length} acc**.\n` +
+                `Chọn 1 acc để gửi cho khách:`,
+            components: [
+                new ActionRowBuilder().addComponents(selectMenu)
+            ]
         });
     }
 
     if (id === 'reject_bill') {
         if (!isAdminUser(interaction)) {
             return safeReply(interaction, {
-                content: '❌ Chỉ Admin mới có quyền từ chối!',
+                content:
+                    '❌ Chỉ Admin mới có quyền từ chối!',
                 flags: MessageFlags.Ephemeral
             });
         }
 
         if (!(await safeDeferUpdate(interaction))) return;
 
-        const resetRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId('approve_bill')
-                .setLabel('Duyệt - Chọn Acc')
-                .setEmoji('✅')
-                .setStyle(ButtonStyle.Success),
+        const resetRow =
+            new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('approve_bill')
+                    .setLabel('Duyệt - Chọn Acc')
+                    .setEmoji('✅')
+                    .setStyle(ButtonStyle.Success),
 
-            new ButtonBuilder()
-                .setCustomId('reject_bill')
-                .setLabel('Từ Chối')
-                .setEmoji('❌')
-                .setStyle(ButtonStyle.Danger)
-        );
+                new ButtonBuilder()
+                    .setCustomId('reject_bill')
+                    .setLabel('Từ Chối')
+                    .setEmoji('❌')
+                    .setStyle(ButtonStyle.Danger)
+            );
 
-        await interaction.message.edit({ components: [resetRow] });
+        await interaction.message.edit({
+            components: [resetRow]
+        });
 
         return interaction.channel.send(
             '⚠️ **Bill chưa hợp lệ hoặc giao dịch chưa hoàn tất.**\n' +
@@ -2119,17 +2849,24 @@ async function handleAccButton(interaction) {
 async function handleCloseTicket(interaction) {
     if (!isAdminUser(interaction)) {
         return safeReply(interaction, {
-            content: '❌ Chỉ Admin mới có quyền đóng Ticket!',
+            content:
+                '❌ Chỉ Admin mới có quyền đóng Ticket!',
             flags: MessageFlags.Ephemeral
         });
     }
 
-    const topic = interaction.channel?.topic || '';
+    const topic =
+        interaction.channel?.topic || '';
 
     if (topic.startsWith('accOrder:')) {
-        const accId = topic.replace('accOrder:', '');
-        const accs = getDetailedAccs();
-        const target = accs.find(a => a.id === accId);
+        const accId =
+            topic.replace('accOrder:', '');
+
+        const accs =
+            getDetailedAccs();
+
+        const target =
+            accs.find(a => a.id === accId);
 
         if (target && target.status === 'pending') {
             target.status = 'available';
@@ -2137,12 +2874,14 @@ async function handleCloseTicket(interaction) {
             target.pendingBuyerId = null;
 
             saveDetailedAccs(accs);
+
             await updateAccListingAvailable(target);
         }
     }
 
     await safeReply(interaction, {
-        content: '🔒 **Kênh Ticket sẽ tự động xóa sau 5 giây...**'
+        content:
+            '🔒 **Kênh Ticket sẽ tự động xóa sau 5 giây...**'
     });
 
     setTimeout(() => {
@@ -2154,21 +2893,42 @@ async function handleCloseTicket(interaction) {
 // 18. SLASH COMMANDS
 // ============================================================
 
-const MONEY_COMMAND_NAMES = ['setup', 'setstock', 'rate', 'time'];
-const ACC_COMMAND_NAMES = ['setstockacc', 'acc', 'deleteacc', 'thongtin', 'price', 'cape'];
+const MONEY_COMMAND_NAMES = [
+    'setup',
+    'setstock',
+    'rate',
+    'time',
+    'autopay'
+];
+
+const ACC_COMMAND_NAMES = [
+    'setstockacc',
+    'acc',
+    'deleteacc',
+    'thongtin',
+    'price',
+    'cape'
+];
 
 const commands = [
     // MONEY
     new SlashCommandBuilder()
         .setName('setup')
-        .setDescription('Thiết lập Bảng AutoBuy Money cố định vào kênh này'),
+        .setDescription(
+            'Thiết lập Bảng AutoBuy Money cố định vào kênh này'
+        ),
 
     new SlashCommandBuilder()
         .setName('setstock')
-        .setDescription('Cập nhật số lượng kho Money')
+        .setDescription(
+            'Cập nhật số lượng kho Money'
+        )
         .addStringOption(opt =>
-            opt.setName('amount')
-                .setDescription('Ví dụ: 10b, 500m, 5000m')
+            opt
+                .setName('amount')
+                .setDescription(
+                    'Ví dụ: 10b, 500m, 5000m'
+                )
                 .setRequired(true)
         ),
 
@@ -2176,7 +2936,8 @@ const commands = [
         .setName('rate')
         .setDescription('Đổi tỷ giá Money (VNĐ / 1M$)')
         .addIntegerOption(opt =>
-            opt.setName('value')
+            opt
+                .setName('value')
                 .setDescription('Rate mới, ví dụ: 130')
                 .setMinValue(1)
                 .setRequired(true)
@@ -2186,111 +2947,145 @@ const commands = [
         .setName('time')
         .setDescription('Cài đặt giờ hoạt động của Bot (Giờ GMT+7)')
         .addIntegerOption(opt =>
-            opt.setName('start')
+            opt
+                .setName('start')
                 .setDescription('Giờ bắt đầu (0-23), ví dụ: 10')
                 .setMinValue(0)
                 .setMaxValue(23)
                 .setRequired(true)
         )
         .addIntegerOption(opt =>
-            opt.setName('end')
+            opt
+                .setName('end')
                 .setDescription('Giờ kết thúc (0-23), ví dụ: 22')
                 .setMinValue(0)
                 .setMaxValue(23)
                 .setRequired(true)
         ),
 
+    new SlashCommandBuilder()
+        .setName('autopay')
+        .setDescription('Kiểm tra trạng thái AutoApprove/AutoPay'),
+
     // ACCOUNT
     new SlashCommandBuilder()
         .setName('setstockacc')
-        .setDescription('Nạp danh sách tài khoản vào kho')
+        .setDescription(
+            'Nạp danh sách tài khoản vào kho'
+        )
         .addStringOption(o =>
-            o.setName('danh_sach')
-                .setDescription('Tên Acc | Email | Recovery Code. Mỗi acc một dòng.')
+            o
+                .setName('danh_sach')
+                .setDescription(
+                    'Tên Acc | Email | Recovery Code. Mỗi acc một dòng.'
+                )
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName('acc')
-        .setDescription('Xem danh sách và lấy tài khoản ra khỏi kho'),
+        .setDescription(
+            'Xem danh sách và lấy tài khoản ra khỏi kho'
+        ),
 
     new SlashCommandBuilder()
         .setName('deleteacc')
-        .setDescription('Xóa tài khoản khỏi kho accounts.json'),
+        .setDescription(
+            'Xóa tài khoản khỏi kho accounts.json'
+        ),
 
     new SlashCommandBuilder()
         .setName('thongtin')
-        .setDescription('Đăng tin bán Acc Minecraft')
+        .setDescription(
+            'Đăng tin bán Acc Minecraft'
+        )
         .addStringOption(o =>
-            o.setName('username')
+            o
+                .setName('username')
                 .setDescription('Tên Username Minecraft')
                 .setRequired(true)
         )
         .addIntegerOption(o =>
-            o.setName('price_bank')
+            o
+                .setName('price_bank')
                 .setDescription('Giá Bank VNĐ')
                 .setRequired(true)
         )
         .addIntegerOption(o =>
-            o.setName('price_card')
+            o
+                .setName('price_card')
                 .setDescription('Giá Thẻ Cào VNĐ')
                 .setRequired(true)
         )
         .addIntegerOption(o =>
-            o.setName('cape_count')
+            o
+                .setName('cape_count')
                 .setDescription('Số lượng Cape')
                 .setRequired(true)
         )
         .addStringOption(o =>
-            o.setName('cape_list')
+            o
+                .setName('cape_list')
                 .setDescription('Danh sách Cape')
                 .setRequired(true)
         )
         .addStringOption(o =>
-            o.setName('rank')
+            o
+                .setName('rank')
                 .setDescription('Rank Ingame')
                 .setRequired(true)
         )
         .addStringOption(o =>
-            o.setName('image_url')
+            o
+                .setName('image_url')
                 .setDescription('Link ảnh banner')
                 .setRequired(false)
         ),
 
     new SlashCommandBuilder()
         .setName('price')
-        .setDescription('Cập nhật giá Acc')
+        .setDescription(
+            'Cập nhật giá Acc'
+        )
         .addStringOption(o =>
-            o.setName('username')
+            o
+                .setName('username')
                 .setDescription('Tên Username Minecraft')
                 .setRequired(true)
         )
         .addIntegerOption(o =>
-            o.setName('price_bank')
+            o
+                .setName('price_bank')
                 .setDescription('Giá Bank mới')
                 .setRequired(true)
         )
         .addIntegerOption(o =>
-            o.setName('price_card')
+            o
+                .setName('price_card')
                 .setDescription('Giá Card mới')
                 .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName('cape')
-        .setDescription('Cập nhật Cape cho Acc')
+        .setDescription(
+            'Cập nhật Cape cho Acc'
+        )
         .addStringOption(o =>
-            o.setName('username')
+            o
+                .setName('username')
                 .setDescription('Tên Username Minecraft')
                 .setRequired(true)
         )
         .addIntegerOption(o =>
-            o.setName('cape_count')
+            o
+                .setName('cape_count')
                 .setDescription('Số lượng Cape mới')
                 .setRequired(true)
         )
         .addStringOption(o =>
-            o.setName('cape_list')
+            o
+                .setName('cape_list')
                 .setDescription('Danh sách Cape mới')
                 .setRequired(true)
         )
@@ -2301,20 +3096,32 @@ const commands = [
 // ============================================================
 
 async function registerSlashCommands() {
-    const token = process.env.DISCORD_TOKEN || process.env.TOKEN;
-    const clientId = process.env.CLIENT_ID || process.env.APPLICATION_ID;
+    const token =
+        process.env.DISCORD_TOKEN ||
+        process.env.TOKEN;
+
+    const clientId =
+        process.env.CLIENT_ID ||
+        process.env.APPLICATION_ID;
 
     if (!token || !clientId) {
-        console.error('❌ Thiếu DISCORD_TOKEN hoặc CLIENT_ID trong .env');
+        console.error(
+            '❌ Thiếu DISCORD_TOKEN hoặc CLIENT_ID trong .env'
+        );
         return;
     }
 
-    const rest = new REST({ version: '10' }).setToken(token);
+    const rest =
+        new REST({ version: '10' })
+            .setToken(token);
 
     try {
         if (process.env.GUILD_ID) {
             await rest.put(
-                Routes.applicationGuildCommands(clientId, process.env.GUILD_ID),
+                Routes.applicationGuildCommands(
+                    clientId,
+                    process.env.GUILD_ID
+                ),
                 { body: commands.map(c => c.toJSON()) }
             );
         } else {
@@ -2326,7 +3133,10 @@ async function registerSlashCommands() {
 
         console.log(`✅ Đã đăng ký ${commands.length} Slash Commands thành công!`);
     } catch (error) {
-        console.error('❌ Lỗi đăng ký command:', error);
+        console.error(
+            '❌ Lỗi đăng ký command:',
+            error
+        );
     }
 }
 
@@ -2338,26 +3148,38 @@ client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
 
     try {
-        const contentLower = message.content.toLowerCase();
+        const contentLower =
+            message.content.toLowerCase();
 
-        if (contentLower.includes('sell') || contentLower.includes('stock')) {
-            const stockText = formatStock(currentStockM);
-            const autoBuyChannelText = moneyConfig.channelId
-                ? ` tại <#${moneyConfig.channelId}>`
-                : '';
+        if (
+            contentLower.includes('sell') ||
+            contentLower.includes('stock')
+        ) {
+            const stockText =
+                formatStock(currentStockM);
 
-            const replyEmbed = new EmbedBuilder()
-                .setColor('#3498db')
-                .setTitle('📦 THÔNG TIN KHO MONEY KINGSMP')
-                .setDescription(
-                    `📦 **Stock:** \`${stockText}\`\n` +
-                    `💸 **Tỷ giá:** \`${RATE} VNĐ = 1M$\`\n` +
-                    `🎟️ **Thẻ cào:** -20%\n\n` +
-                    `👉 Mua trực tiếp${autoBuyChannelText}!`
-                )
-                .setTimestamp();
+            const autoBuyChannelText =
+                moneyConfig.channelId
+                    ? ` tại <#${moneyConfig.channelId}>`
+                    : '';
 
-            await message.channel.send({ embeds: [replyEmbed] });
+            const replyEmbed =
+                new EmbedBuilder()
+                    .setColor('#3498db')
+                    .setTitle(
+                        '📦 THÔNG TIN KHO MONEY KINGSMP'
+                    )
+                    .setDescription(
+                        `📦 **Stock:** \`${stockText}\`\n` +
+                        `💸 **Tỷ giá:** \`${RATE} VNĐ = 1M$\`\n` +
+                        `🎟️ **Thẻ cào:** -20%\n\n` +
+                        `👉 Mua trực tiếp${autoBuyChannelText}!`
+                    )
+                    .setTimestamp();
+
+            await message.channel.send({
+                embeds: [replyEmbed]
+            });
         }
 
         if (
@@ -2365,34 +3187,45 @@ client.on(Events.MessageCreate, async message => {
             message.channel.name?.startsWith('ticket-') &&
             message.channel.topic?.startsWith('accOrder:')
         ) {
-            const hasImage = message.attachments.some(
-                att => att.contentType && att.contentType.startsWith('image/')
-            );
+            const hasImage =
+                message.attachments.some(
+                    att =>
+                        att.contentType &&
+                        att.contentType.startsWith('image/')
+                );
 
             if (!hasImage) return;
 
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId('approve_bill')
-                    .setLabel('Duyệt - Chọn Acc')
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success),
+            const row =
+                new ActionRowBuilder().addComponents(
+                    new ButtonBuilder()
+                        .setCustomId('approve_bill')
+                        .setLabel('Duyệt - Chọn Acc')
+                        .setEmoji('✅')
+                        .setStyle(ButtonStyle.Success),
 
-                new ButtonBuilder()
-                    .setCustomId('reject_bill')
-                    .setLabel('Từ Chối')
-                    .setEmoji('❌')
-                    .setStyle(ButtonStyle.Danger)
-            );
+                    new ButtonBuilder()
+                        .setCustomId('reject_bill')
+                        .setLabel('Từ Chối')
+                        .setEmoji('❌')
+                        .setStyle(ButtonStyle.Danger)
+                );
 
-            const embed = new EmbedBuilder()
-                .setTitle('🧾 PHÁT HIỆN BILL CHUYỂN KHOẢN')
-                .setColor('#f1c40f')
-                .setDescription(
-                    `Khách hàng <@${message.author.id}> đã gửi bill.\n` +
-                    `Admin kiểm tra và duyệt bên dưới.`
-                )
-                .setFooter({ text: 'Chỉ Admin mới có quyền duyệt!' });
+            const embed =
+                new EmbedBuilder()
+                    .setTitle(
+                        '🧾 PHÁT HIỆN BILL CHUYỂN KHOẢN'
+                    )
+                    .setColor('#f1c40f')
+                    .setDescription(
+                        `Khách hàng <@${message.author.id}> ` +
+                        `đã gửi bill.\n` +
+                        `Admin kiểm tra và duyệt bên dưới.`
+                    )
+                    .setFooter({
+                        text:
+                            'Chỉ Admin mới có quyền duyệt!'
+                    });
 
             await message.channel.send({
                 embeds: [embed],
@@ -2400,7 +3233,10 @@ client.on(Events.MessageCreate, async message => {
             });
         }
     } catch (err) {
-        console.error('Lỗi MessageCreate:', err.message);
+        console.error(
+            'Lỗi MessageCreate:',
+            err.message
+        );
     }
 });
 
@@ -2411,16 +3247,26 @@ client.on(Events.MessageCreate, async message => {
 client.on(Events.InteractionCreate, async interaction => {
     try {
         if (!claimInteraction(interaction)) {
-            console.log(`⚠️ Bỏ qua interaction trùng: ${interaction.id}`);
+            console.log(
+                `⚠️ Bỏ qua interaction trùng: ${interaction.id}`
+            );
             return;
         }
 
         if (interaction.isChatInputCommand()) {
-            if (MONEY_COMMAND_NAMES.includes(interaction.commandName)) {
+            if (
+                MONEY_COMMAND_NAMES.includes(
+                    interaction.commandName
+                )
+            ) {
                 return await handleMoneyCommand(interaction);
             }
 
-            if (ACC_COMMAND_NAMES.includes(interaction.commandName)) {
+            if (
+                ACC_COMMAND_NAMES.includes(
+                    interaction.commandName
+                )
+            ) {
                 return await handleAccCommand(interaction);
             }
 
@@ -2437,7 +3283,12 @@ client.on(Events.InteractionCreate, async interaction => {
             if (
                 id.startsWith('money_approve_') ||
                 id.startsWith('money_reject_') ||
-                ['buy_bank', 'buy_card', 'calc_price', 'guide'].includes(id)
+                [
+                    'buy_bank',
+                    'buy_card',
+                    'calc_price',
+                    'guide'
+                ].includes(id)
             ) {
                 return await handleMoneyButton(interaction);
             }
@@ -2470,25 +3321,41 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         if (interaction.isModalSubmit()) {
-            if (['modal_bank', 'modal_card', 'modal_calc'].includes(interaction.customId)) {
+            if (
+                [
+                    'modal_bank',
+                    'modal_card',
+                    'modal_calc'
+                ].includes(interaction.customId)
+            ) {
                 return await handleMoneyModal(interaction);
             }
 
             return;
         }
     } catch (err) {
-        console.error('❌ Lỗi Xử Lý Interaction:', err);
+        console.error(
+            '❌ Lỗi Xử Lý Interaction:',
+            err
+        );
 
         try {
-            if (!interaction.replied && !interaction.deferred) {
+            if (
+                !interaction.replied &&
+                !interaction.deferred
+            ) {
                 await interaction.reply({
-                    content: '❌ Có lỗi xảy ra khi xử lý thao tác.',
+                    content:
+                        '❌ Có lỗi xảy ra khi xử lý thao tác.',
                     flags: MessageFlags.Ephemeral
                 });
             }
         } catch (replyErr) {
             if (replyErr?.code !== 40060) {
-                console.error('❌ Không thể gửi lỗi:', replyErr.message);
+                console.error(
+                    '❌ Không thể gửi lỗi:',
+                    replyErr.message
+                );
             }
         }
     }
@@ -2499,7 +3366,9 @@ client.on(Events.InteractionCreate, async interaction => {
 // ============================================================
 
 client.once(Events.ClientReady, async c => {
-    console.log(`🤖 Bot đã online thành công: ${c.user.tag}`);
+    console.log(
+        `🤖 Bot đã online thành công: ${c.user.tag}`
+    );
 
     ensureJsonFile(STOCK_FILE, { stockM: 5000 });
     ensureJsonFile(CONFIG_FILE, {});
@@ -2514,18 +3383,43 @@ client.once(Events.ClientReady, async c => {
 });
 
 // ============================================================
-// 23. LOGIN
+// 23. ERROR HANDLING
 // ============================================================
 
-const botToken = process.env.DISCORD_TOKEN || process.env.TOKEN;
+process.on('unhandledRejection', err => {
+    console.error(
+        '⚠️ [Unhandled Rejection]:',
+        err
+    );
+});
+
+process.on('uncaughtException', err => {
+    console.error(
+        '⚠️ [Uncaught Exception]:',
+        err
+    );
+});
+
+// ============================================================
+// 24. LOGIN
+// ============================================================
+
+const botToken =
+    process.env.DISCORD_TOKEN ||
+    process.env.TOKEN;
 
 console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
 console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
 
 if (!botToken) {
-    console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong .env!');
+    console.error(
+        '❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong .env!'
+    );
 } else {
     client.login(botToken).catch(err => {
-        console.error('❌ Login Discord thất bại:', err.message);
+        console.error(
+            '❌ Login Discord thất bại:',
+            err.message
+        );
     });
 }
