@@ -1945,8 +1945,53 @@ async function handleAccCommand(interaction) {
             flags: MessageFlags.Ephemeral
         }))) return;
 
-        const username =
-            interaction.options.getString('username').trim();
+        const usernameRaw = interaction.options.getString('username');
+
+        // Tương thích với command /price cũ (type + amount) nếu Discord
+        // đang còn cache phiên bản command Spawner trước đó.
+        if (!usernameRaw) {
+            const legacyType = interaction.options.getString('type');
+            const legacyAmount = interaction.options.getInteger('amount');
+
+            if (legacyType && Number.isInteger(legacyAmount)) {
+                const legacySpawner = spawnerConfig[legacyType];
+
+                if (!legacySpawner) {
+                    return safeEditReply(interaction, {
+                        content: '❌ Loại spawner không tồn tại!'
+                    });
+                }
+
+                if (legacyAmount <= 0) {
+                    return safeEditReply(interaction, {
+                        content: '❌ Giá Spawner phải lớn hơn 0 VNĐ!'
+                    });
+                }
+
+                const oldPrice = legacySpawner.price;
+                legacySpawner.price = legacyAmount;
+
+                return safeEditReply(interaction, {
+                    content:
+                        `✅ Đã cập nhật giá **${legacySpawner.name}** từ ` +
+                        `**${oldPrice.toLocaleString('vi-VN')} VNĐ** ➡️ ` +
+                        `**${legacyAmount.toLocaleString('vi-VN')} VNĐ**!\n` +
+                        `*Gõ lại /shop để tạo bảng giá mới.*`
+                });
+            }
+
+            return safeEditReply(interaction, {
+                content: '❌ Thiếu Username. Để chỉnh giá Spawner, hãy dùng lệnh **/spawnerprice**.'
+            });
+        }
+
+        const username = usernameRaw.trim();
+
+        if (!username) {
+            return safeEditReply(interaction, {
+                content: '❌ Username không được để trống!'
+            });
+        }
 
         const newBank =
             interaction.options.getInteger('price_bank');
@@ -2725,6 +2770,46 @@ async function handleSpawnerCommand(interaction) {
             flags: MessageFlags.Ephemeral
         });
     }
+
+
+    if (interaction.commandName === 'spawnerstock') {
+        if (!isAdminUser(interaction)) {
+            return safeReply(interaction, {
+                content: '❌ Bạn không có quyền sử dụng lệnh này!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        const type = interaction.options.getString('type');
+        const newStock = interaction.options.getInteger('amount');
+        const spawner = spawnerConfig[type];
+
+        if (!spawner) {
+            return safeReply(interaction, {
+                content: '❌ Loại spawner không tồn tại!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        if (!Number.isInteger(newStock) || newStock < 0) {
+            return safeReply(interaction, {
+                content: '❌ Số lượng Spawner phải là số nguyên từ 0 trở lên!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        const oldStock = spawner.stock;
+        spawner.stock = newStock;
+
+        return safeReply(interaction, {
+            content:
+                `✅ Đã cập nhật kho **${spawner.name}** từ ` +
+                `**${oldStock.toLocaleString('vi-VN')}** cái ➡️ ` +
+                `**${newStock.toLocaleString('vi-VN')}** cái!\n` +
+                `*Gõ lại /shop để tạo bảng kho mới.*`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
 }
 
 async function handleSpawnerButton(interaction) {
@@ -3388,7 +3473,8 @@ const MONEY_COMMAND_NAMES = [
 
 const SPAWNER_COMMAND_NAMES = [
     'shop',
-    'spawnerprice'
+    'spawnerprice',
+    'spawnerstock'
 ];
 
 const ACC_COMMAND_NAMES = [
@@ -3438,6 +3524,29 @@ const commands = [
                 .setName('amount')
                 .setDescription('Giá tiền mới (VNĐ)')
                 .setMinValue(1)
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('spawnerstock')
+        .setDescription('Thay đổi số lượng tồn kho Spawner (Dành cho Admin)')
+        .addStringOption(option =>
+            option
+                .setName('type')
+                .setDescription('Loại spawner')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Skeleton Spawner', value: 'ske' },
+                    { name: 'Blaze Spawner', value: 'blaze' },
+                    { name: 'Creeper Spawner', value: 'creeper' },
+                    { name: 'Iron Golem Spawner', value: 'golem' }
+                )
+        )
+        .addIntegerOption(option =>
+            option
+                .setName('amount')
+                .setDescription('Số lượng tồn kho mới')
+                .setMinValue(0)
                 .setRequired(true)
         ),
 
