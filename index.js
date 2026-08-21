@@ -939,7 +939,7 @@ async function handleMoneyModal(interaction) {
             return safeReply(interaction, { content: `❌ Số tiền quy đổi không hợp lệ hoặc vượt kho (${formatStock(currentStockM)}).`, flags: MessageFlags.Ephemeral });
         }
 
-        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral })))) return;
+        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
 
         const orderId = `C${Date.now()}${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
         const orders = getMoneyOrders();
