@@ -146,16 +146,18 @@ client.once('ready', async () => {
 });
 
 // ==========================================
-// 📸 BẮT SỰ KIỆN KHÁCH GỬI BILL ĐỂ TAG ADMIN
+// 📸 BẮT SỰ KIỆN KHÁCH GỬI BILL ĐỂ TAG ADMIN (ĐÃ TỐI ƯU PING SÁNG)
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
     if (message.channel.name.startsWith('don-') && message.attachments.size > 0) {
-        const adminPing = serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN" ? `<@&${serverConfig.adminRoleId}>` : "@Admin";
+        const hasValidAdminRole = serverConfig.adminRoleId && serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN";
+        const adminMention = hasValidAdminRole ? `<@&${serverConfig.adminRoleId}>` : "@Admin";
         
         await message.channel.send({
-            content: `🚨 **CÓ BIẾN!** ${adminPing}\nKhách hàng <@${message.author.id}> vừa gửi bill/hình ảnh. Admin vào kiểm tra giao dịch nhé! 📦`
+            content: `🔔 ${adminMention} ơi! Khách hàng <@${message.author.id}> vừa gửi ảnh bill thanh toán. Nhờ Admin vào kiểm tra và giao hàng nhé! 📦`,
+            allowedMentions: { roles: hasValidAdminRole ? [serverConfig.adminRoleId] : [] }
         });
     }
 });
@@ -233,7 +235,7 @@ client.on('interactionCreate', async (interaction) => {
         const spawner = spawnerConfig[key];
 
         if (isBank) {
-            // MỞ FORM BANK
+            // FORM BANK
             const modal = new ModalBuilder().setCustomId(`modal_bank_${key}`).setTitle(`🏦 Mua ${spawner.name.split(' ')[0]} (CK)`);
             modal.addComponents(
                 new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('ign').setLabel('Tên trong game (IGN):').setStyle(TextInputStyle.Short).setRequired(true)),
@@ -241,20 +243,20 @@ client.on('interactionCreate', async (interaction) => {
             );
             await interaction.showModal(modal);
         } else {
-            // MỞ FORM CARD (Đã tối ưu 5 ô theo chuẩn Discord)
-            const modal = new ModalBuilder().setCustomId(`modal_card_${key}`).setTitle(`💳 Mua ${spawner.name.split(' ')[0]} (Thẻ Cào)`);
+            // FORM CARD (BỎ SỐ LƯỢNG - TỰ TÍNH THEO MỆNH GIÁ)
+            const modal = new ModalBuilder().setCustomId(`modal_card_${key}`).setTitle(`💳 Nạp Thẻ Mua ${spawner.name.split(' ')[0]}`);
             modal.addComponents(
                 new ActionRowBuilder().addComponents(
                     new TextInputBuilder().setCustomId('ign').setLabel('Tên trong game (IGN):').setStyle(TextInputStyle.Short).setRequired(true)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('qty').setLabel(`Số lượng mua (Tối đa: ${spawner.stock}):`).setStyle(TextInputStyle.Short).setValue('1').setRequired(true)
+                    new TextInputBuilder().setCustomId('card_net').setLabel('Nhà mạng:').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Viettel, Vinaphone, Mobifone...').setRequired(true)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('net_amount').setLabel('Nhà mạng & Mệnh giá:').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Viettel 100k, Vina 200k...').setRequired(true)
+                    new TextInputBuilder().setCustomId('card_val').setLabel('Mệnh giá thẻ (VNĐ):').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: 100000 hoặc 100k').setRequired(true)
                 ),
                 new ActionRowBuilder().addComponents(
-                    new TextInputBuilder().setCustomId('pin').setLabel('Mã thẻ (PIN):').setStyle(TextInputStyle.Short).setPlaceholder('Nhập chính xác mã PIN thẻ cào').setRequired(true)
+                    new TextInputBuilder().setCustomId('pin').setLabel('Mã thẻ (PIN):').setStyle(TextInputStyle.Short).setPlaceholder('Nhập chính xác mã PIN').setRequired(true)
                 ),
                 new ActionRowBuilder().addComponents(
                     new TextInputBuilder().setCustomId('serial').setLabel('Số Seri (Serial):').setStyle(TextInputStyle.Short).setPlaceholder('Nhập chính xác số Seri').setRequired(true)
@@ -270,11 +272,51 @@ client.on('interactionCreate', async (interaction) => {
         const key = interaction.customId.replace(isBank ? 'modal_bank_' : 'modal_card_', '');
         const spawner = spawnerConfig[key];
 
-        const ign = interaction.fields.getTextInputValue('ign');
-        const quantity = parseInt(interaction.fields.getTextInputValue('qty'));
+        let ign = "";
+        let quantity = 1;
+        let cardValue = 0;
+        let cardNet = "";
+        let pin = "";
+        let serial = "";
 
-        if (isNaN(quantity) || quantity <= 0) return interaction.reply({ content: '❌ Số lượng không hợp lệ!', flags: MessageFlags.Ephemeral });
-        if (quantity > spawner.stock) return interaction.reply({ content: `❌ Kho chỉ còn \`${spawner.stock}\` cái!`, flags: MessageFlags.Ephemeral });
+        if (isBank) {
+            ign = interaction.fields.getTextInputValue('ign');
+            quantity = parseInt(interaction.fields.getTextInputValue('qty'));
+
+            if (isNaN(quantity) || quantity <= 0) return interaction.reply({ content: '❌ Số lượng không hợp lệ!', flags: MessageFlags.Ephemeral });
+            if (quantity > spawner.stock) return interaction.reply({ content: `❌ Kho chỉ còn \`${spawner.stock}\` cái!`, flags: MessageFlags.Ephemeral });
+        } else {
+            ign = interaction.fields.getTextInputValue('ign');
+            cardNet = interaction.fields.getTextInputValue('card_net');
+            const rawVal = interaction.fields.getTextInputValue('card_val').toLowerCase().trim();
+            pin = interaction.fields.getTextInputValue('pin');
+            serial = interaction.fields.getTextInputValue('serial');
+
+            // Xử lý mệnh giá nhập vào (VD: 100k -> 100000)
+            let multiplier = 1;
+            let cleanVal = rawVal;
+            if (rawVal.endsWith('k')) {
+                multiplier = 1000;
+                cleanVal = rawVal.replace('k', '');
+            }
+            cardValue = parseInt(cleanVal.replace(/[^0-9]/g, '')) * multiplier;
+
+            if (isNaN(cardValue) || cardValue <= 0) {
+                return interaction.reply({ content: '❌ Mệnh giá thẻ nhập vào không hợp lệ!', flags: MessageFlags.Ephemeral });
+            }
+
+            // TỰ ĐỘNG TÍNH SỐ SPAWNER NHẬN ĐƯỢC (SỐ NGUYÊN)
+            const pricePerSpawnerCard = Math.round(spawner.price * 1.2);
+            quantity = Math.floor(cardValue / pricePerSpawnerCard);
+
+            if (quantity < 1) {
+                return interaction.reply({
+                    content: `❌ Thẻ mệnh giá **${cardValue.toLocaleString('vi-VN')} VNĐ** không đủ để mua 1 **${spawner.name}**!\n` +
+                             `*(Giá spawner qua thẻ cào đã +20% phí là: **${pricePerSpawnerCard.toLocaleString('vi-VN')} VNĐ**/cái)*`,
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+        }
 
         const deferred = await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral });
         if (!deferred) return;
@@ -328,7 +370,7 @@ client.on('interactionCreate', async (interaction) => {
                         `Chào <@${interaction.user.id}>, dưới đây là thông tin đơn của bạn:\n` +
                         `• 👤 **IGN:** \`${ign}\`\n• 📦 **Số lượng:** \`${quantity}\` cái\n` +
                         `• 💰 **Tổng thanh toán:** **${totalPrice.toLocaleString('vi-VN')} VNĐ**\n\n` +
-                        `⚠️ **ĐỜI ADMIN REP TRONG KÊNH NÀY RỒI MỚI CHUYỂN KHOẢN NHÉ!**\n${adminStatusText}\n\n` +
+                        `⚠️ **ĐỢI ADMIN REP TRONG KÊNH NÀY RỒI MỚI CHUYỂN KHOẢN NHÉ!**\n${adminStatusText}\n\n` +
                         `───────────────────────────────────\n` +
                         `🏦 **THÔNG TIN CHUYỂN KHOẢN:**\n` +
                         `• Ngân hàng: **MB Bank**\n• Số tài khoản: \`${serverConfig.bank.accountNo}\`\n` +
@@ -338,32 +380,35 @@ client.on('interactionCreate', async (interaction) => {
                     )
                     .setImage(qrImageUrl);
             } else {
-                const netAmount = interaction.fields.getTextInputValue('net_amount');
-                const pin = interaction.fields.getTextInputValue('pin');
-                const serial = interaction.fields.getTextInputValue('serial');
-                
-                const basePrice = spawner.price * quantity;
-                const cardPrice = basePrice * 1.2;
+                const pricePerSpawnerCard = Math.round(spawner.price * 1.2);
 
                 ticketEmbed.setColor('#E67E22')
                     .setTitle(`💳 ĐƠN HÀNG THẺ CÀO: ${spawner.name.toUpperCase()}`)
                     .setDescription(
-                        `Chào <@${interaction.user.id}>, bạn đã đăng ký mua bằng Thẻ Cào.\n` +
-                        `• 👤 **IGN:** \`${ign}\`\n• 📦 **Số lượng:** \`${quantity}\` cái\n` +
-                        `• 💰 **Giá Gốc:** ${basePrice.toLocaleString('vi-VN')} VNĐ\n` +
-                        `• 📈 **Giá Thẻ (Đã +20% Phí):** **${cardPrice.toLocaleString('vi-VN')} VNĐ**\n\n` +
+                        `Chào <@${interaction.user.id}>, thông tin nạp thẻ của bạn đã được ghi nhận.\n` +
+                        `• 👤 **IGN:** \`${ign}\`\n` +
+                        `• 💵 **Mệnh giá thẻ:** **${cardValue.toLocaleString('vi-VN')} VNĐ**\n` +
+                        `• 🎯 **Số ${spawner.name} nhận được:** \`${quantity}\` **cái** *(Tự động tính phần nguyên)*\n` +
+                        `• ℹ️ *(Đơn giá thẻ cào +20% phí: ${pricePerSpawnerCard.toLocaleString('vi-VN')} VNĐ/cái)*\n\n` +
                         `${adminStatusText}\n\n` +
                         `───────────────────────────────────\n` +
-                        `🧾 **THÔNG TIN THẺ NẠP (Chấp nhận copy 1-click):**\n` +
-                        `• 🌐 **Nhà mạng & Mệnh giá:** \`${netAmount}\`\n` +
+                        `🧾 **THÔNG TIN THẺ NẠP (Chạm để copy):**\n` +
+                        `• 🌐 **Nhà mạng:** \`${cardNet}\`\n` +
                         `• 🔑 **Mã PIN:** \`${pin}\` *(Chạm/Click để copy)*\n` +
                         `• 🔢 **Số SERI:** \`${serial}\` *(Chạm/Click để copy)*\n\n` +
-                        `*Admin sẽ tiến hành nạp thẻ và giao sản phẩm cho bạn sau ít phút!*`
+                        `*Admin sẽ tiến hành nạp thẻ và giao sản phẩm cho bạn ngay khi kiểm tra xong!*`
                     );
             }
 
-            const adminPing = serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN" ? `<@&${serverConfig.adminRoleId}>` : "@Admin";
-            await ticketChannel.send({ content: `🔔 Khách: <@${interaction.user.id}> | Admin: ${adminPing}`, embeds: [ticketEmbed], components: [ticketButtons] });
+            const hasValidAdminRole = serverConfig.adminRoleId && serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN";
+            const adminMention = hasValidAdminRole ? `<@&${serverConfig.adminRoleId}>` : "@Admin";
+            
+            await ticketChannel.send({ 
+                content: `🔔 Khách: <@${interaction.user.id}> | Admin: ${adminMention}`, 
+                embeds: [ticketEmbed], 
+                components: [ticketButtons],
+                allowedMentions: { roles: hasValidAdminRole ? [serverConfig.adminRoleId] : [] }
+            });
             await interaction.editReply({ content: `✅ Vui lòng vào kênh <#${ticketChannel.id}> để hoàn tất giao dịch!` });
 
         } catch (error) {
