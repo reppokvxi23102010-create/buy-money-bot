@@ -108,34 +108,47 @@ const serverConfig = {
 };
 
 const spawnerConfig = {
-    ske: {
-        name: "Skeleton Spawner",
-        price: 50000,
-        stock: 10,
-        emoji: "💀"
-    },
-    blaze: {
-        name: "Blaze Spawner",
-        price: 150000,
-        stock: 5,
-        emoji: "🔥"
-    },
-    creeper: {
-        name: "Creeper Spawner",
-        price: 100000,
-        stock: 8,
-        emoji: "💥"
-    },
-    golem: {
-        name: "Iron Golem Spawner",
-        price: 300000,
-        stock: 3,
-        emoji: "🤖"
-    }
+    ske: { name: "Skeleton Spawner", price: 50000, stock: 10, emoji: "💀" },
+    blaze: { name: "Blaze Spawner", price: 150000, stock: 5, emoji: "🔥" },
+    creeper: { name: "Creeper Spawner", price: 100000, stock: 8, emoji: "💥" },
+    golem: { name: "Iron Golem Spawner", price: 300000, stock: 3, emoji: "🤖" }
 };
 
 const STOCK_FILE = path.join(__dirname, 'stock.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
+
+function loadSpawnerConfigFromDisk() {
+    const config = readJson(CONFIG_FILE, {});
+    const saved = config.spawners || {};
+
+    Object.keys(spawnerConfig).forEach(key => {
+        if (!saved[key]) return;
+
+        const price = Number(saved[key].price);
+        const stock = Number(saved[key].stock);
+
+        if (Number.isInteger(price) && price > 0) {
+            spawnerConfig[key].price = price;
+        }
+
+        if (Number.isInteger(stock) && stock >= 0) {
+            spawnerConfig[key].stock = stock;
+        }
+    });
+}
+
+function saveSpawnerConfig() {
+    const config = readJson(CONFIG_FILE, {});
+    config.spawners = Object.fromEntries(
+        Object.entries(spawnerConfig).map(([key, item]) => [
+            key,
+            { price: item.price, stock: item.stock }
+        ])
+    );
+    writeJson(CONFIG_FILE, config);
+}
+
+loadSpawnerConfigFromDisk();
 
 const ACC_STOCK_FILE = path.join(__dirname, 'accounts.json');
 const ACC_DETAIL_FILE = path.join(__dirname, 'accounts_detail.json');
@@ -633,6 +646,59 @@ function createShopButtons() {
     });
 
     return row;
+}
+
+function buildSpawnerPanel() {
+    return {
+        embeds: [createShopEmbed()],
+        components: [createShopButtons()]
+    };
+}
+
+async function updateSpawnerPanel() {
+    const config = readJson(CONFIG_FILE, {});
+    const panel = config.spawnerPanel || {};
+
+    if (!panel.channelId) {
+        console.log('ℹ️ [SPAWNER PANEL] Chưa có panel. Dùng /setupspawner để tạo.');
+        return;
+    }
+
+    try {
+        const channel = await client.channels.fetch(String(panel.channelId));
+
+        if (!channel || !channel.isTextBased()) {
+            console.error('❌ [SPAWNER PANEL] Kênh panel không hợp lệ.');
+            return;
+        }
+
+        if (panel.messageId) {
+            try {
+                const message = await channel.messages.fetch(String(panel.messageId));
+                await message.edit(buildSpawnerPanel());
+                console.log(`✅ [SPAWNER PANEL] Đã cập nhật panel: ${message.id}`);
+                return;
+            } catch (err) {
+                const code = String(err?.code ?? '');
+                const msg = String(err?.message ?? '').toLowerCase();
+                const unknown = code === '10008' || code === '10003' || msg.includes('unknown message') || msg.includes('unknown channel');
+                if (!unknown) {
+                    console.error('❌ [SPAWNER PANEL] Không thể cập nhật panel:', err?.message || err);
+                    return;
+                }
+            }
+        }
+
+        const newMessage = await channel.send(buildSpawnerPanel());
+        config.spawnerPanel = {
+            channelId: channel.id,
+            messageId: newMessage.id
+        };
+        writeJson(CONFIG_FILE, config);
+        console.log(`✅ [SPAWNER PANEL] Đã tạo panel mới: ${newMessage.id}`);
+    } catch (err) {
+        console.error('❌ [SPAWNER PANEL] Lỗi cập nhật/tạo panel:', err?.message || err);
+    }
 }
 
 // ============================================================
@@ -2725,11 +2791,33 @@ async function handleCloseTicket(interaction) {
 // ============================================================
 
 async function handleSpawnerCommand(interaction) {
-    if (interaction.commandName === 'shop') {
-        return safeReply(interaction, {
-            embeds: [createShopEmbed()],
-            components: [createShopButtons()]
-        });
+    if (interaction.commandName === 'setupspawner') {
+        if (!isAdminUser(interaction)) {
+            return safeReply(interaction, {
+                content: '❌ Bạn không có quyền sử dụng lệnh này!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+
+        try {
+            const msg = await interaction.channel.send(buildSpawnerPanel());
+            const config = readJson(CONFIG_FILE, {});
+            config.spawnerPanel = {
+                channelId: interaction.channelId,
+                messageId: msg.id
+            };
+            writeJson(CONFIG_FILE, config);
+
+            return safeEditReply(interaction, {
+                content: `✅ Đã thiết lập **Bảng Spawner cố định** tại <#${interaction.channelId}>!\n📌 Từ giờ không cần dùng /shop nữa.`
+            });
+        } catch (err) {
+            return safeEditReply(interaction, {
+                content: `❌ Không thể tạo bảng Spawner: \`${err.message}\``
+            });
+        }
     }
 
     if (interaction.commandName === 'spawnerprice') {
@@ -2760,13 +2848,15 @@ async function handleSpawnerCommand(interaction) {
 
         const oldPrice = spawner.price;
         spawner.price = newPrice;
+        saveSpawnerConfig();
+        await updateSpawnerPanel();
 
         return safeReply(interaction, {
             content:
                 `✅ Đã cập nhật giá **${spawner.name}** từ ` +
                 `**${oldPrice.toLocaleString('vi-VN')} VNĐ** ➡️ ` +
                 `**${newPrice.toLocaleString('vi-VN')} VNĐ**!\n` +
-                `*Gõ lại /shop để tạo bảng giá mới.*`,
+                `📌 Bảng Spawner cố định đã được cập nhật.`,
             flags: MessageFlags.Ephemeral
         });
     }
@@ -2800,13 +2890,15 @@ async function handleSpawnerCommand(interaction) {
 
         const oldStock = spawner.stock;
         spawner.stock = newStock;
+        saveSpawnerConfig();
+        await updateSpawnerPanel();
 
         return safeReply(interaction, {
             content:
                 `✅ Đã cập nhật kho **${spawner.name}** từ ` +
                 `**${oldStock.toLocaleString('vi-VN')}** cái ➡️ ` +
                 `**${newStock.toLocaleString('vi-VN')}** cái!\n` +
-                `*Gõ lại /shop để tạo bảng kho mới.*`,
+                `📌 Bảng Spawner cố định đã được cập nhật.`,
             flags: MessageFlags.Ephemeral
         });
     }
@@ -3439,6 +3531,8 @@ async function handleSpawnerModal(interaction) {
         }
 
         spawner.stock -= quantity;
+        saveSpawnerConfig();
+        await updateSpawnerPanel();
 
         const legitChannel =
             serverConfig.legitChannelId !==
@@ -3472,7 +3566,7 @@ const MONEY_COMMAND_NAMES = [
 ];
 
 const SPAWNER_COMMAND_NAMES = [
-    'shop',
+    'setupspawner',
     'spawnerprice',
     'spawnerstock'
 ];
@@ -3489,8 +3583,8 @@ const ACC_COMMAND_NAMES = [
 const commands = [
     // SPAWNER
     new SlashCommandBuilder()
-        .setName('shop')
-        .setDescription('Mở bảng cửa hàng Spawner'),
+        .setName('setupspawner')
+        .setDescription('Thiết lập Bảng Spawner cố định vào kênh này'),
 
     new SlashCommandBuilder()
         .setName('spawnerprice')
@@ -4064,10 +4158,13 @@ client.once(Events.ClientReady, async c => {
     ensureJsonFile(ACC_DETAIL_FILE, []);
     ensureJsonFile(MONEY_ORDERS_FILE, {});
 
+    loadSpawnerConfigFromDisk();
+
     console.log(`📦 [STARTUP] Money stock: ${currentStockM}M$`);
     console.log(`🧩 [STARTUP] Panel config: channel=${moneyConfig?.channelId || 'none'} message=${moneyConfig?.messageId || 'none'}`);
     await registerSlashCommands();
     await updateAutoBuyPanel();
+    await updateSpawnerPanel();
 });
 
 // ============================================================
