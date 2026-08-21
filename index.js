@@ -380,4 +380,4 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
-client.login(process.env.TOKEN || 'NHAP_TOKEN_BOT_CUA_BAN_NEU_KHONG_DUNG_ENV');
+client.login(process.env.TOKEN);
