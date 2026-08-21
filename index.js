@@ -1,3 +1,10 @@
+const http = require('http');
+
+// Tạo web server ảo để Render không báo lỗi port
+http.createServer((req, res) => {
+    res.write("Bot Discord đang hoạt động!");
+    res.end();
+}).listen(process.env.PORT || 3000);
 const { 
     Client, 
     GatewayIntentBits, 
