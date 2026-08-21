@@ -4,7 +4,10 @@ const {
     ActionRowBuilder, 
     ButtonBuilder, 
     ButtonStyle, 
-    MessageFlags 
+    MessageFlags,
+    REST,
+    Routes,
+    SlashCommandBuilder
 } = require('discord.js');
 
 const client = new Client({
@@ -15,7 +18,7 @@ const client = new Client({
     ]
 });
 
-// Cấu hình 4 loại Spawner rõ ràng với Emoji riêng
+// Cấu hình 4 loại Spawner
 const spawnerConfig = {
     ske: { name: "Skeleton Spawner", price: 5000, stock: 10, emoji: "💀" },
     blaze: { name: "Blaze Spawner", price: 15000, stock: 5, emoji: "🔥" },
@@ -35,8 +38,27 @@ async function safeDeferReply(interaction, options) {
     }
 }
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`Bot đã đăng nhập thành công với tên ${client.user.tag}!`);
+
+    // Tự động đăng ký lệnh /shop lên Discord API khi bot vừa bật lên
+    const rest = new REST({ version: '10' }).setToken(process.env.TOKEN);
+    try {
+        const commands = [
+            new SlashCommandBuilder()
+                .setName('shop')
+                .setDescription('Mở cửa hàng mua spawner (Skeleton, Blaze, Creeper, Golem)')
+                .toJSON()
+        ];
+
+        await rest.put(
+            Routes.applicationCommands(client.user.id),
+            { body: commands }
+        );
+        console.log('✅ Đã tự động đăng ký thành công lệnh /shop lên Discord!');
+    } catch (error) {
+        console.error('❌ Lỗi khi đăng ký lệnh:', error);
+    }
 });
 
 client.on('interactionCreate', async (interaction) => {
