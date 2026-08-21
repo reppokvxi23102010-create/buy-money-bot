@@ -40,7 +40,6 @@ function readRequestBody(req) {
     });
 }
 
-// Xử lý Ngân hàng (SePay) - Tự động 100%
 async function handleSepayWebhook(req, res) {
     try {
         const payload = await readRequestBody(req);
@@ -141,7 +140,7 @@ function parseCardValue(input) {
 }
 
 // ============================================================
-// 3. RCON & NẠP TỰ ĐỘNG (TRỪ STOCK VÀ PAY GAME)
+// 3. RCON & NẠP TỰ ĐỘNG
 // ============================================================
 async function sendMinecraftPayCommand(order) {
     const host = process.env.RCON_HOST;
@@ -168,7 +167,6 @@ async function sendMinecraftPayCommand(order) {
 async function fulfillMoneyOrder(order) {
     const amountM = Math.floor(Number(order.amountM) || 0);
     
-    // Tự động trừ stock và lưu lại ngay lập tức
     currentStockM -= amountM;
     saveStock(currentStockM);
 
@@ -179,7 +177,6 @@ async function fulfillMoneyOrder(order) {
     orders[order.id] = order; 
     saveMoneyOrders(orders);
     
-    // Cập nhật lại giao diện bảng chính để khách thấy kho đã giảm
     await updateAutoBuyPanel();
 
     if (order.ticketChannelId) {
@@ -336,7 +333,6 @@ client.on(Events.InteractionCreate, async interaction => {
 
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-            // Mua bằng Ngân hàng: Tự động tạo vé và tạo mã QR VietQR chuẩn
             if (interaction.customId === 'modal_bank') {
                 const ign = interaction.fields.getTextInputValue('bank_name').trim();
                 const vndAmount = Math.floor(parseCardValue(interaction.fields.getTextInputValue('bank_vnd')));
@@ -344,6 +340,8 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 const orderId = `M${Date.now()}`;
                 const memo = `KSMP ${orderId}`;
+                
+                // Chuẩn hóa link VietQR đầy đủ thông số
                 const qrUrl = `https://img.vietqr.io/image/${BANK_CONFIG.BANK_ID}-${BANK_CONFIG.ACCOUNT_NO}-compact2.png?amount=${vndAmount}&addInfo=${encodeURIComponent(memo)}&accountName=${encodeURIComponent(BANK_CONFIG.ACCOUNT_NAME)}`;
 
                 const ticketChannel = await interaction.guild.channels.create({
@@ -363,7 +361,7 @@ client.on(Events.InteractionCreate, async interaction => {
                 const embed = new EmbedBuilder()
                     .setTitle('💳 THANH TOÁN CHUYỂN KHOẢN (YÊU CẦU LEGIT)')
                     .setColor('#3498db')
-                    .setDescription('Vui lòng quét mã QR hoặc chuyển khoản đúng thông tin dưới đây.\n⚠️ **Lưu ý:** Phải chuyển đúng số tiền và nội dung để hệ thống tự động duyệt.')
+                    .setDescription(`Vui lòng quét mã QR hoặc chuyển khoản theo thông tin bên dưới.\n🔗 [Bấm vào đây để mở/tải mã QR trực tiếp](${qrUrl})\n\n⚠️ **Lưu ý:** Phải chuyển đúng số tiền và nội dung để hệ thống tự động duyệt.`)
                     .addFields(
                         { name: 'Ngân hàng', value: 'MB Bank', inline: true },
                         { name: 'Số tài khoản', value: `\`${BANK_CONFIG.ACCOUNT_NO}\``, inline: true },
@@ -382,7 +380,6 @@ client.on(Events.InteractionCreate, async interaction => {
                 return interaction.editReply(`✅ Đã tạo vé ngân hàng tại: ${ticketChannel}`);
             }
 
-            // Mua bằng Thẻ cào: Tạo vé gửi thông tin cho Admin duyệt thủ công
             if (interaction.customId === 'modal_card') {
                 const ign = interaction.fields.getTextInputValue('card_ign').trim();
                 const cardType = interaction.fields.getTextInputValue('card_type').trim();
