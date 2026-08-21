@@ -146,7 +146,7 @@ client.once('ready', async () => {
 });
 
 // ==========================================
-// 📸 BẮT SỰ KIỆN KHÁCH GỬI BILL ĐỂ TAG ADMIN (ĐÃ TỐI ƯU PING SÁNG)
+// 📸 BẮT SỰ KIỆN KHÁCH GỬI BILL ĐỂ TAG ADMIN
 // ==========================================
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
@@ -216,13 +216,13 @@ client.on('interactionCreate', async (interaction) => {
                 .setStyle(ButtonStyle.Primary),
             new ButtonBuilder()
                 .setCustomId(`method_card_${key}`)
-                .setLabel('Thanh toán Thẻ Cào (+20% Phí)')
+                .setLabel('Thanh toán Thẻ Cào (-20% Phí gạch thẻ)')
                 .setEmoji('💳')
                 .setStyle(ButtonStyle.Danger)
         );
 
         await interaction.reply({
-            content: `**Vui lòng chọn phương thức thanh toán cho ${spawner.name}:**\n*(Lưu ý: Nạp bằng thẻ cào điện thoại chịu thêm 20% phí gạch thẻ)*`,
+            content: `**Vui lòng chọn phương thức thanh toán cho ${spawner.name}:**\n*(Lưu ý: Nạp bằng thẻ cào điện thoại bị trừ 20% phí gạch thẻ)*`,
             components: [row],
             flags: MessageFlags.Ephemeral
         });
@@ -243,7 +243,7 @@ client.on('interactionCreate', async (interaction) => {
             );
             await interaction.showModal(modal);
         } else {
-            // FORM CARD (BỎ SỐ LƯỢNG - TỰ TÍNH THEO MỆNH GIÁ)
+            // FORM CARD
             const modal = new ModalBuilder().setCustomId(`modal_card_${key}`).setTitle(`💳 Nạp Thẻ Mua ${spawner.name.split(' ')[0]}`);
             modal.addComponents(
                 new ActionRowBuilder().addComponents(
@@ -275,6 +275,7 @@ client.on('interactionCreate', async (interaction) => {
         let ign = "";
         let quantity = 1;
         let cardValue = 0;
+        let effectiveValue = 0;
         let cardNet = "";
         let pin = "";
         let serial = "";
@@ -305,14 +306,15 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: '❌ Mệnh giá thẻ nhập vào không hợp lệ!', flags: MessageFlags.Ephemeral });
             }
 
-            // TỰ ĐỘNG TÍNH SỐ SPAWNER NHẬN ĐƯỢC (SỐ NGUYÊN)
-            const pricePerSpawnerCard = Math.round(spawner.price * 1.2);
-            quantity = Math.floor(cardValue / pricePerSpawnerCard);
+            // TÍNH SỐ TIỀN CÒN LẠI SAU KHI TRỪ 20% PHÍ GẠCH THỂ (100k -> 80k)
+            effectiveValue = Math.floor(cardValue * 0.8);
+            
+            // CHIA CHO GIÁ SPAWNER ĐỂ TÍNH SỐ NGUYÊN SPAWNER NHẬN ĐƯỢC
+            quantity = Math.floor(effectiveValue / spawner.price);
 
             if (quantity < 1) {
                 return interaction.reply({
-                    content: `❌ Thẻ mệnh giá **${cardValue.toLocaleString('vi-VN')} VNĐ** không đủ để mua 1 **${spawner.name}**!\n` +
-                             `*(Giá spawner qua thẻ cào đã +20% phí là: **${pricePerSpawnerCard.toLocaleString('vi-VN')} VNĐ**/cái)*`,
+                    content: `❌ Thẻ mệnh giá **${cardValue.toLocaleString('vi-VN')} VNĐ** (Sau khi trừ 20% phí gạch thẻ còn **${effectiveValue.toLocaleString('vi-VN')} VNĐ**) không đủ để mua 1 **${spawner.name}** (Giá: **${spawner.price.toLocaleString('vi-VN')} VNĐ**)!\n`,
                     flags: MessageFlags.Ephemeral
                 });
             }
@@ -380,16 +382,14 @@ client.on('interactionCreate', async (interaction) => {
                     )
                     .setImage(qrImageUrl);
             } else {
-                const pricePerSpawnerCard = Math.round(spawner.price * 1.2);
-
                 ticketEmbed.setColor('#E67E22')
                     .setTitle(`💳 ĐƠN HÀNG THẺ CÀO: ${spawner.name.toUpperCase()}`)
                     .setDescription(
                         `Chào <@${interaction.user.id}>, thông tin nạp thẻ của bạn đã được ghi nhận.\n` +
                         `• 👤 **IGN:** \`${ign}\`\n` +
-                        `• 💵 **Mệnh giá thẻ:** **${cardValue.toLocaleString('vi-VN')} VNĐ**\n` +
-                        `• 🎯 **Số ${spawner.name} nhận được:** \`${quantity}\` **cái** *(Tự động tính phần nguyên)*\n` +
-                        `• ℹ️ *(Đơn giá thẻ cào +20% phí: ${pricePerSpawnerCard.toLocaleString('vi-VN')} VNĐ/cái)*\n\n` +
+                        `• 💵 **Mệnh giá thẻ nạp:** **${cardValue.toLocaleString('vi-VN')} VNĐ**\n` +
+                        `• 📉 **Thực nhận (Sau -20% phí):** **${effectiveValue.toLocaleString('vi-VN')} VNĐ**\n` +
+                        `• 🎯 **Số ${spawner.name} nhận được:** \`${quantity}\` **cái** *(Giá: ${spawner.price.toLocaleString('vi-VN')} VNĐ/cái)*\n\n` +
                         `${adminStatusText}\n\n` +
                         `───────────────────────────────────\n` +
                         `🧾 **THÔNG TIN THẺ NẠP (Chạm để copy):**\n` +
