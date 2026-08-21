@@ -12,7 +12,7 @@ const {
 } = require('discord.js');
 
 // ============================================================
-// 1. MÁY CHỦ WEB (WEBHOOKS - AUTO MONEY)
+// 1. MÁY CHỦ WEB (WEBHOOKS - CHỈ AUTO NGÂN HÀNG SEPAY)
 // ============================================================
 const PORT = Number(process.env.PORT || 10000);
 const WEBHOOK_BODY_LIMIT = 512 * 1024;
@@ -40,7 +40,7 @@ function readRequestBody(req) {
     });
 }
 
-// Xử lý Ngân hàng (SePay)
+// Xử lý Ngân hàng (SePay) - Tự động 100%
 async function handleSepayWebhook(req, res) {
     try {
         const payload = await readRequestBody(req);
@@ -77,39 +77,8 @@ async function handleSepayWebhook(req, res) {
     }
 }
 
-// Xử lý Thẻ cào
-async function handleCardWebhook(req, res) {
-    try {
-        const payload = await readRequestBody(req);
-        const code = String(payload.code ?? payload.pin ?? '').trim();
-        const seri = String(payload.serial ?? payload.seri ?? '').trim();
-        const statusRaw = String(payload.status ?? payload.message ?? '').toLowerCase();
-        const success = payload.success === true || ['success', 'thanhcong', '1', 'true', 'ok'].includes(statusRaw);
-
-        if (!code || !seri || !success) return sendJson(res, 200, { success: true, matched: false });
-
-        const orders = getMoneyOrders();
-        const order = Object.values(orders).find(item =>
-            item.type === 'card' && item.status === 'dang_cho' &&
-            String(item.cardCode || '').trim() === code && String(item.cardSeri || '').trim() === seri
-        );
-
-        if (!order) return sendJson(res, 200, { success: true, matched: false });
-
-        order.status = 'da_thanh_toan';
-        orders[order.id] = order;
-        saveMoneyOrders(orders);
-
-        const result = await fulfillMoneyOrder(order);
-        return sendJson(res, 200, { success: result.ok });
-    } catch (err) {
-        return sendJson(res, 500, { success: false });
-    }
-}
-
 const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && req.url === '/webhook/sepay') return handleSepayWebhook(req, res);
-    if (req.method === 'POST' && req.url === '/webhook/card') return handleCardWebhook(req, res);
     return sendJson(res, 404, { success: false, message: 'Khong tim thay' });
 });
 server.listen(PORT, () => console.log(`[Hệ thống] Mở cổng thành công trên Port: ${PORT}`));
@@ -121,6 +90,7 @@ server.listen(PORT, () => console.log(`[Hệ thống] Mở cổng thành công t
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 
 const CARD_DISCOUNT = 0.20;
+// Thông tin MB Bank chính chủ của ông
 const BANK_CONFIG = { BANK_ID: 'MB', ACCOUNT_NO: '0357597469', ACCOUNT_NAME: 'TRAN HUU HAI SON' };
 
 const STOCK_FILE = path.join(__dirname, 'stock.json');
@@ -169,7 +139,7 @@ function parseCardValue(input) {
 }
 
 // ============================================================
-// 3. RCON & NẠP TỰ ĐỘNG
+// 3. RCON & NẠP TỰ ĐỘNG (DÀNH CHO NGÂN HÀNG)
 // ============================================================
 async function sendMinecraftPayCommand(order) {
     const host = process.env.RCON_HOST;
@@ -246,13 +216,11 @@ function buildAutoBuyEmbed() {
             `💰 **Chọn phương thức mua bên dưới:**`
         );
 
-    // Hàng 1: Mua bằng Ngân hàng & Mua bằng Thẻ cào
     const row1 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('buy_bank').setLabel('💳 Mua Bằng Ngân Hàng').setStyle(ButtonStyle.Success).setDisabled(isOutOfStock),
         new ButtonBuilder().setCustomId('buy_card').setLabel('🎟️ Mua Bằng Thẻ Cào (-20%)').setStyle(ButtonStyle.Primary).setDisabled(isOutOfStock)
     );
 
-    // Hàng 2: Tính tiền & Hướng dẫn
     const row2 = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('calc_money').setLabel('🧮 Tính Tiền').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId('guide_buy').setLabel('📖 Hướng Dẫn').setStyle(ButtonStyle.Secondary)
@@ -313,7 +281,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (id === 'guide_buy') {
                 return interaction.reply({ 
-                    content: '📖 **HƯỚNG DẪN MUA MONEY TỰ ĐỘNG:**\n1. Bấm **Mua Bằng Ngân Hàng** hoặc **Thẻ Cào**.\n2. Điền tên Ingame và số tiền muốn thanh toán.\n3. Quét mã QR chuyển khoản đúng nội dung Bot cung cấp.\n4. Hệ thống tự động quét và cộng tiền vào game sau 1-3 phút!', 
+                    content: '📖 **HƯỚNG DẪN MUA MONEY:**\n1. **Ngân hàng:** Điền tên, số tiền -> Quét QR chuyển khoản -> Bot tự động nạp vào game sau 1 phút.\n2. **Thẻ cào:** Điền thông tin thẻ -> Bot tạo vé gửi thông tin cho Admin kiểm tra và duyệt thủ công.', 
                     ephemeral: true 
                 });
             }
@@ -327,7 +295,7 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             if (id === 'buy_bank') {
-                const modal = new ModalBuilder().setCustomId('modal_bank').setTitle(`Mua Tiền - Giá ${RATE} VNĐ/1M$`);
+                const modal = new ModalBuilder().setCustomId('modal_bank').setTitle(`Mua Tiền (Ngân Hàng) - Giá ${RATE} VNĐ/1M$`);
                 modal.addComponents(
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bank_name').setLabel('Tên Ingame (Minecraft)').setStyle(TextInputStyle.Short).setRequired(true)),
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('bank_vnd').setLabel('Số tiền thanh toán (VNĐ)').setStyle(TextInputStyle.Short).setRequired(true))
@@ -336,7 +304,7 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             if (id === 'buy_card') {
-                const modal = new ModalBuilder().setCustomId('modal_card').setTitle(`Nạp Thẻ - Giá ${RATE} VNĐ/1M$ (-20%)`);
+                const modal = new ModalBuilder().setCustomId('modal_card').setTitle(`Nạp Thẻ Cào (Admin Duyệt) - Trừ 20%`);
                 modal.addComponents(
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('card_ign').setLabel('Tên Ingame (Minecraft)').setStyle(TextInputStyle.Short).setRequired(true)),
                     new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('card_type').setLabel('Nhà Mạng (Viettel, Mobi, Vina)').setStyle(TextInputStyle.Short).setRequired(true)),
@@ -364,6 +332,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
             await interaction.deferReply({ ephemeral: true });
 
+            // Ngân hàng: Tạo vé kèm QR chuẩn MB Bank
             if (interaction.customId === 'modal_bank') {
                 const ign = interaction.fields.getTextInputValue('bank_name').trim();
                 const vndAmount = Math.floor(parseCardValue(interaction.fields.getTextInputValue('bank_vnd')));
@@ -389,6 +358,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
                 const embed = new EmbedBuilder().setTitle('💳 THANH TOÁN CHUYỂN KHOẢN').setColor('#3498db').setDescription('Vui lòng quét mã QR hoặc chuyển khoản đúng thông tin dưới đây để hệ thống tự động nạp tiền.')
                     .addFields(
+                        { name: 'Ngân hàng', value: 'MB Bank', inline: true },
+                        { name: 'Số tài khoản', value: `\`${BANK_CONFIG.ACCOUNT_NO}\``, inline: true },
+                        { name: 'Chủ tài khoản', value: BANK_CONFIG.ACCOUNT_NAME, inline: true },
                         { name: 'Tên Ingame', value: ign, inline: true },
                         { name: 'Nhận Được', value: `${moneyReceivedM.toLocaleString()} M$`, inline: true },
                         { name: 'Cần Trả', value: `${vndAmount.toLocaleString()} VNĐ`, inline: true },
@@ -400,12 +372,17 @@ client.on(Events.InteractionCreate, async interaction => {
                 return interaction.editReply(`✅ Đã tạo vé ngân hàng tại: ${ticketChannel}`);
             }
 
+            // Thẻ cào: Tạo vé gửi thông tin thẻ cho Admin duyệt thủ công
             if (interaction.customId === 'modal_card') {
                 const ign = interaction.fields.getTextInputValue('card_ign').trim();
-                const cardValueVnd = Math.floor(parseCardValue(interaction.fields.getTextInputValue('card_val')));
+                const cardType = interaction.fields.getTextInputValue('card_type').trim();
+                const cardVal = interaction.fields.getTextInputValue('card_val').trim();
+                const cardCode = interaction.fields.getTextInputValue('card_code').trim();
+                const cardSeri = interaction.fields.getTextInputValue('card_seri').trim();
+                
+                const cardValueVnd = Math.floor(parseCardValue(cardVal));
                 const moneyReceivedM = Math.floor(cardValueVnd * (1 - CARD_DISCOUNT) / RATE);
 
-                const orderId = `C${Date.now()}`;
                 const ticketChannel = await interaction.guild.channels.create({
                     name: `vé-the-${ign.toLowerCase()}`,
                     type: ChannelType.GuildText,
@@ -416,18 +393,24 @@ client.on(Events.InteractionCreate, async interaction => {
                     ]
                 });
 
-                const orders = getMoneyOrders();
-                orders[orderId] = { 
-                    id: orderId, type: 'card', userId: interaction.user.id, ign, 
-                    cardCode: interaction.fields.getTextInputValue('card_code'), 
-                    cardSeri: interaction.fields.getTextInputValue('card_seri'), 
-                    cardValueVnd, amountM: moneyReceivedM, status: 'dang_cho', ticketChannelId: ticketChannel.id 
-                };
-                saveMoneyOrders(orders);
+                const embed = new EmbedBuilder()
+                    .setTitle('🎟️ YÊU CẦU NẠP THẺ CÀO (CHỜ ADMIN DUYỆT)')
+                    .setColor('#f1c40f')
+                    .setDescription(`Khách hàng <@${interaction.user.id}> đã gửi thẻ cào. Admin vui lòng kiểm tra thông tin bên dưới:`)
+                    .addFields(
+                        { name: 'Tên Ingame', value: ign, inline: true },
+                        { name: 'Nhà mạng', value: cardType, inline: true },
+                        { name: 'Mệnh giá', value: `${cardValueVnd.toLocaleString()} VNĐ`, inline: true },
+                        { name: 'Sẽ nhận', value: `${moneyReceivedM.toLocaleString()} M$`, inline: true },
+                        { name: 'Mã Thẻ (PIN)', value: `\`${cardCode}\``, inline: false },
+                        { name: 'Số Seri', value: `\`${cardSeri}\``, inline: false }
+                    );
 
-                const embed = new EmbedBuilder().setTitle('🎟️ XỬ LÝ THẺ CÀO').setColor('#f1c40f').setDescription('Hệ thống đang kiểm tra thẻ. Tiền sẽ tự động cộng vào game sau vài phút nếu thẻ hợp lệ.');
-                const closeRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Vé (Xóa)').setStyle(ButtonStyle.Danger));
-                await ticketChannel.send({ content: `<@${interaction.user.id}>`, embeds: [embed], components: [closeRow] });
+                const closeRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Vé (Xóa)').setStyle(ButtonStyle.Danger)
+                );
+
+                await ticketChannel.send({ content: `<@${interaction.user.id}> | <@&ROLE_ADMIN_ID_NEU_CO>`, embeds: [embed], components: [closeRow] });
                 return interaction.editReply(`✅ Đã tạo vé thẻ cào tại: ${ticketChannel}`);
             }
         }
