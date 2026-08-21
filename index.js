@@ -4,7 +4,7 @@ const {
     ActionRowBuilder, 
     ButtonBuilder, 
     ButtonStyle, 
-    MessageFlags,
+    EmbedBuilder,
     REST,
     Routes,
     SlashCommandBuilder
@@ -18,36 +18,62 @@ const client = new Client({
     ]
 });
 
-// Cấu hình 4 loại Spawner
+// Cấu hình 4 loại Spawner (Giá tính bằng VNĐ)
 const spawnerConfig = {
-    ske: { name: "Skeleton Spawner", price: 5000, stock: 10, emoji: "💀" },
-    blaze: { name: "Blaze Spawner", price: 15000, stock: 5, emoji: "🔥" },
-    creeper: { name: "Creeper Spawner", price: 10000, stock: 8, emoji: "💥" },
-    golem: { name: "Iron Golem Spawner", price: 30000, stock: 3, emoji: "🤖" }
+    ske: { name: "Skeleton Spawner", price: 50000, stock: 10, emoji: "💀" },
+    blaze: { name: "Blaze Spawner", price: 150000, stock: 5, emoji: "🔥" },
+    creeper: { name: "Creeper Spawner", price: 100000, stock: 8, emoji: "💥" },
+    golem: { name: "Iron Golem Spawner", price: 300000, stock: 3, emoji: "🤖" }
 };
 
-// Hàm xử lý deferReply an toàn
-async function safeDeferReply(interaction, options) {
-    try {
-        if (interaction.deferred || interaction.replied) return true;
-        await interaction.deferReply(options);
-        return true;
-    } catch (error) {
-        console.error("Lỗi khi defer reply:", error);
-        return false;
-    }
+// Hàm tạo nội dung Bảng Cửa hàng (Embed)
+function createShopEmbed() {
+    const embed = new EmbedBuilder()
+        .setColor('#00FF00')
+        .setTitle('🛒 HỆ THỐNG CỬA HÀNG SPAWNER')
+        .setDescription('Chào mừng bạn đến với cửa hàng! Nhấn vào các nút bên dưới để mua loại spawner bạn muốn.')
+        .setTimestamp();
+
+    // Thêm thông tin chi tiết từng loại vào bảng
+    Object.keys(spawnerConfig).forEach(key => {
+        const item = spawnerConfig[key];
+        embed.addFields({
+            name: `${item.emoji} ${item.name}`,
+            value: `💰 Giá: **${item.price.toLocaleString('vi-VN')} VNĐ**\n📦 Còn lại: **${item.stock} cái**`,
+            inline: false
+        });
+    });
+
+    return embed;
+}
+
+// Hàm tạo các nút bấm mua hàng
+function createShopButtons() {
+    const row = new ActionRowBuilder();
+    Object.keys(spawnerConfig).forEach(key => {
+        const item = spawnerConfig[key];
+        row.addComponents(
+            new ButtonBuilder()
+                .setCustomId(`buy_${key}`)
+                .setLabel(`Mua ${item.name.split(' ')[0]}`)
+                .setEmoji(item.emoji)
+                .setStyle(ButtonStyle.Primary)
+                .setDisabled(item.stock <= 0) // Tự động khóa nút nếu hết hàng
+        );
+    });
+    return row;
 }
 
 client.once('ready', async () => {
     console.log(`Bot đã đăng nhập thành công với tên ${client.user.tag}!`);
 
-    // Sửa lỗi: Sử dụng client.token thay vì process.env.TOKEN để đăng ký lệnh
+    // Tự động đăng ký lệnh /shop lên Discord
     const rest = new REST({ version: '10' }).setToken(client.token);
     try {
         const commands = [
             new SlashCommandBuilder()
                 .setName('shop')
-                .setDescription('Mở cửa hàng mua spawner (Skeleton, Blaze, Creeper, Golem)')
+                .setDescription('Mở bảng cửa hàng spawner cố định')
                 .toJSON()
         ];
 
@@ -62,55 +88,44 @@ client.once('ready', async () => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-    // 1. Xử lý lệnh /shop
+    // 1. Xử lý lệnh /shop (Hiển thị bảng cố định công khai cho mọi người thấy)
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'shop') {
-            const deferred = await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral });
-            if (!deferred) return;
-
-            // Tạo các nút bấm trực tiếp cho 4 loại spawner
-            const row = new ActionRowBuilder();
-            
-            Object.keys(spawnerConfig).forEach(key => {
-                const item = spawnerConfig[key];
-                row.addComponents(
-                    new ButtonBuilder()
-                        .setCustomId(`buy_${key}`)
-                        .setLabel(`${item.name} ($${item.price.toLocaleString()})`)
-                        .setEmoji(item.emoji)
-                        .setStyle(ButtonStyle.Primary)
-                );
-            });
-
-            await interaction.editReply({
-                content: '🛒 **Cửa hàng Spawner Chính Thức**\nBấm trực tiếp vào các nút bên dưới để mua loại bạn muốn:',
-                components: [row]
+            await interaction.reply({
+                embeds: [createShopEmbed()],
+                components: [createShopButtons()],
+                ephemeral: false // Đặt là false để bảng hiển thị chung trong kênh cho mọi người cùng mua
             });
         }
     }
 
-    // 2. Xử lý khi người dùng bấm vào nút mua
+    // 2. Xử lý khi người dùng bấm nút mua spawner
     if (interaction.isButton() && interaction.customId.startsWith('buy_')) {
         const key = interaction.customId.replace('buy_', '');
         const spawner = spawnerConfig[key];
 
-        const deferred = await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral });
-        if (!deferred) return;
-
         if (!spawner) {
-            return interaction.editReply({ content: "❌ Loại spawner này không tồn tại!" });
+            return interaction.reply({ content: "❌ Loại spawner này không tồn tại!", ephemeral: true });
         }
 
         // Kiểm tra tồn kho
         if (spawner.stock <= 0) {
-            return interaction.editReply({ content: `❌ Rất tiếc, **${spawner.name}** hiện đã hết hàng trong kho!` });
+            return interaction.reply({ content: `❌ Rất tiếc, **${spawner.name}** hiện đã hết hàng trong kho!`, ephemeral: true });
         }
 
-        // Trừ kho
+        // Tiến hành trừ kho
         spawner.stock -= 1;
 
-        await interaction.editReply({
-            content: `✅ Bạn đã mua thành công **1x ${spawner.name}** với giá **$${spawner.price.toLocaleString()}**!\n📦 Số lượng kho còn lại: **${spawner.stock}**`
+        // Cập nhật lại giao diện bảng cửa hàng ngay lập tức (cập nhật số lượng kho mới)
+        await interaction.update({
+            embeds: [createShopEmbed()],
+            components: [createShopButtons()]
+        });
+
+        // Gửi thông báo ẩn xác nhận mua thành công cho người bấm
+        await interaction.followUp({
+            content: `✅ Bạn đã mua thành công **1x ${spawner.name}** với giá **${spawner.price.toLocaleString('vi-VN')} VNĐ**!`,
+            ephemeral: true
         });
     }
 });
