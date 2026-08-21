@@ -2695,29 +2695,34 @@ async function handleSpawnerCommand(interaction) {
             });
         }
 
-        if (!(await safeDeferReply(interaction, {
-            flags: MessageFlags.Ephemeral
-        }))) return;
-
         const type = interaction.options.getString('type');
         const newPrice = interaction.options.getInteger('amount');
         const spawner = spawnerConfig[type];
 
         if (!spawner) {
-            return safeEditReply(interaction, {
-                content: '❌ Loại spawner không tồn tại!'
+            return safeReply(interaction, {
+                content: '❌ Loại spawner không tồn tại!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        if (!Number.isInteger(newPrice) || newPrice <= 0) {
+            return safeReply(interaction, {
+                content: '❌ Giá Spawner phải là số nguyên lớn hơn 0 VNĐ!',
+                flags: MessageFlags.Ephemeral
             });
         }
 
         const oldPrice = spawner.price;
         spawner.price = newPrice;
 
-        return safeEditReply(interaction, {
+        return safeReply(interaction, {
             content:
                 `✅ Đã cập nhật giá **${spawner.name}** từ ` +
                 `**${oldPrice.toLocaleString('vi-VN')} VNĐ** ➡️ ` +
                 `**${newPrice.toLocaleString('vi-VN')} VNĐ**!\n` +
-                `*Gõ lại /shop để tạo bảng giá mới.*`
+                `*Gõ lại /shop để tạo bảng giá mới.*`,
+            flags: MessageFlags.Ephemeral
         });
     }
 }
