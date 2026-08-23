@@ -2971,6 +2971,7 @@ async function handleSpawnerCommand(interaction) {
                 `📌 Bảng Spawner cố định đã được cập nhật.`,
             flags: MessageFlags.Ephemeral
         });
+    }
 
     if (interaction.commandName === 'spawnerprice') {
         if (!isAdminUser(interaction)) {
@@ -3013,7 +3014,6 @@ async function handleSpawnerCommand(interaction) {
         });
     }
 
-    }
 }
 
 async function handleSpawnerButton(interaction) {
