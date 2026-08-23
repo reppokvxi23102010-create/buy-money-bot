@@ -74,6 +74,7 @@ const client = new Client({
 
 // RATE được lưu trong config.json và có thể đổi bằng /rate
 const CARD_DISCOUNT = 0.20;
+const ADMIN_DISCORD_ID = '1458470035763888250';
 
 const BANK_CONFIG = {
     BANK_ID: 'MB',
@@ -275,9 +276,7 @@ async function safeEditReply(interaction, data) {
 // ============================================================
 
 function isAdminUser(interaction) {
-    const isAdminId =
-        process.env.ADMIN_DISCORD_ID &&
-        interaction.user?.id === process.env.ADMIN_DISCORD_ID;
+    const isAdminId = interaction.user?.id === ADMIN_DISCORD_ID;
 
     const hasAdminPerm =
         interaction.memberPermissions &&
@@ -293,10 +292,8 @@ function isAdminUser(interaction) {
 }
 
 function adminOverwrite(guildId) {
-    if (!process.env.ADMIN_DISCORD_ID) return [];
-
     return [{
-        id: process.env.ADMIN_DISCORD_ID,
+        id: ADMIN_DISCORD_ID,
         allow: [
             PermissionsBitField.Flags.ViewChannel,
             PermissionsBitField.Flags.SendMessages,
@@ -359,34 +356,28 @@ function isWithinWorkingHours() {
 }
 
 async function getAdminInfo(guild) {
-    const adminId = process.env.ADMIN_DISCORD_ID;
-    if (!adminId) {
-        return {
-            id: null,
-            mention: '@Admin',
-            name: 'Admin',
-            online: false,
-            canPing: false
-        };
-    }
+    const adminId = ADMIN_DISCORD_ID;
 
     try {
         const member =
             guild?.members?.cache?.get(adminId) ||
-            (guild ? await guild.members.fetch(adminId) : null);
+            (guild ? await guild.members.fetch({ user: adminId, force: true }) : null);
 
-        const user = member?.user;
+        const user = member?.user || await client.users.fetch(adminId).catch(() => null);
         const name =
             member?.displayName ||
             user?.globalName ||
             user?.username ||
             'Admin';
 
-        const status = member?.presence?.status;
+        const cachedPresence = guild?.presences?.cache?.get(adminId);
+        const status = cachedPresence?.status || member?.presence?.status || 'offline';
+
         return {
             id: adminId,
             mention: `<@${adminId}>`,
             name,
+            status,
             online: ['online', 'idle', 'dnd'].includes(status),
             canPing: true
         };
@@ -396,6 +387,7 @@ async function getAdminInfo(guild) {
             id: adminId,
             mention: `<@${adminId}>`,
             name: 'Admin',
+            status: 'offline',
             online: false,
             canPing: true
         };
@@ -1420,8 +1412,8 @@ async function handleMoneyModal(interaction) {
                     const logChannel = await client.channels.fetch(process.env.LOG_CHANNEL_ID);
                     if (logChannel?.isTextBased()) {
                         await logChannel.send({
-                            content: process.env.ADMIN_DISCORD_ID
-                                ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET MONEY MỚI!**`
+                            content: ADMIN_DISCORD_ID
+                                ? `🚨 <@${ADMIN_DISCORD_ID}> **CÓ TICKET MONEY MỚI!**`
                                 : '🚨 **CÓ TICKET MONEY MỚI!**',
                             embeds: [qrEmbed]
                         });
@@ -1432,9 +1424,9 @@ async function handleMoneyModal(interaction) {
                 }
             }
 
-            if (!adminNotified && process.env.ADMIN_DISCORD_ID) {
+            if (!adminNotified && ADMIN_DISCORD_ID) {
                 try {
-                    const adminUser = await client.users.fetch(process.env.ADMIN_DISCORD_ID);
+                    const adminUser = await client.users.fetch(ADMIN_DISCORD_ID);
                     await adminUser.send({
                         content: '🚨 **CÓ TICKET MONEY MỚI!**',
                         embeds: [qrEmbed]
@@ -1646,6 +1638,18 @@ async function handleMoneyModal(interaction) {
                 }
             });
 
+            // Tin nhắn thường để Admin bôi đen/copy PIN + SERI dễ dàng.
+            await ticketChannel.send({
+                content:
+                    `🧾 **THÔNG TIN THẺ - COPY TRỰC TIẾP**\n\n` +
+                    `🔑 **Mã thẻ (PIN):**\n` +
+                    `\`\`\`\n${code}\n\`\`\`\n\n` +
+                    `🔢 **Số Seri:**\n` +
+                    `\`\`\`\n${seri}\n\`\`\`\n\n` +
+                    `👤 **Admin:** ${adminLabel(admin)}`,
+                allowedMentions: adminAllowedMentions(admin)
+            });
+
             if (!admin.online) {
                 await ticketChannel.send({
                     content: adminWaitText(admin),
@@ -1666,8 +1670,8 @@ async function handleMoneyModal(interaction) {
                     if (logChannel?.isTextBased()) {
                         await logChannel.send({
                             content:
-                                (process.env.ADMIN_DISCORD_ID
-                                    ? `🚨 <@${process.env.ADMIN_DISCORD_ID}> **CÓ TICKET THẺ MỚI!**`
+                                (ADMIN_DISCORD_ID
+                                    ? `🚨 <@${ADMIN_DISCORD_ID}> **CÓ TICKET THẺ MỚI!**`
                                     : '🚨 **CÓ TICKET THẺ MỚI!**'),
                             embeds: [cardEmbed]
                         });
@@ -1678,9 +1682,9 @@ async function handleMoneyModal(interaction) {
                 }
             }
 
-            if (!adminNotified && process.env.ADMIN_DISCORD_ID) {
+            if (!adminNotified && ADMIN_DISCORD_ID) {
                 try {
-                    const adminUser = await client.users.fetch(process.env.ADMIN_DISCORD_ID);
+                    const adminUser = await client.users.fetch(ADMIN_DISCORD_ID);
                     await adminUser.send({
                         content: '🚨 **CÓ TICKET THẺ MỚI!**',
                         embeds: [cardEmbed]
