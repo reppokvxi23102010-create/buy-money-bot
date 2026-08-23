@@ -1458,18 +1458,6 @@ async function handleMoneyModal(interaction) {
                 }
             }
 
-            if (!adminNotified && ADMIN_DISCORD_ID) {
-                try {
-                    const adminUser = await client.users.fetch(ADMIN_DISCORD_ID);
-                    await adminUser.send({
-                        content: '🚨 **CÓ TICKET MONEY MỚI!**',
-                        embeds: [qrEmbed]
-                    });
-                } catch (err) {
-                    console.error('❌ Không gửi được DM Admin:', err?.message || err);
-                }
-            }
-
             return safeEditReply(interaction, {
                 content:
                     `✅ **ĐÃ TẠO TICKET NẠP BANK!**\n` +
@@ -1627,7 +1615,7 @@ async function handleMoneyModal(interaction) {
                     },
                     {
                         name: '🔐 Thông tin thẻ',
-                        value: 'Mã thẻ và Seri được gửi ở tin nhắn riêng bên dưới để Discord hiển thị nút **Copy** thuận tiện hơn.'
+                        value: 'PIN và Seri được tách riêng bên dưới để Discord hiển thị nút **Copy** cho từng giá trị.'
                     }
                 )
                 .setFooter({
@@ -1668,15 +1656,16 @@ async function handleMoneyModal(interaction) {
                 }
             });
 
-            // Discord không cho bot tự ghi clipboard bằng Button.
-            // Gửi PIN/Seri dưới dạng code block trong message để Discord hiện nút Copy 1 lần bấm.
+            // Discord tự hiện nút Copy cho từng code block.
+            // Tách PIN và SERI thành 2 khối riêng để Admin copy từng giá trị bằng 1 click.
             const safeCardCode = String(code).replace(/```/g, '');
             const safeCardSeri = String(seri).replace(/```/g, '');
             await ticketChannel.send({
                 content:
-                    `🔑 **MÃ THẺ (PIN)**\n` +
+                    `🔐 **THÔNG TIN THẺ — COPY NHANH**\n\n` +
+                    `**PIN / MÃ THẺ**\n` +
                     `\`\`\`\n${safeCardCode}\n\`\`\`\n\n` +
-                    `🔢 **SERI**\n` +
+                    `**SERI**\n` +
                     `\`\`\`\n${safeCardSeri}\n\`\`\``
             });
 
@@ -1709,18 +1698,6 @@ async function handleMoneyModal(interaction) {
                     }
                 } catch (err) {
                     console.error('❌ Không gửi được log ticket card:', err?.message || err);
-                }
-            }
-
-            if (!adminNotified && ADMIN_DISCORD_ID) {
-                try {
-                    const adminUser = await client.users.fetch(ADMIN_DISCORD_ID);
-                    await adminUser.send({
-                        content: '🚨 **CÓ TICKET THẺ MỚI!**',
-                        embeds: [cardEmbed]
-                    });
-                } catch (err) {
-                    console.error('❌ Không gửi được DM Admin:', err?.message || err);
                 }
             }
 
