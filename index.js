@@ -1613,10 +1613,6 @@ async function handleMoneyModal(interaction) {
                         value: `\`${moneyReceivedM.toLocaleString('vi-VN')}M$\``,
                         inline: true
                     },
-                    {
-                        name: '🔐 Thông tin thẻ',
-                        value: 'PIN và Seri được tách riêng bên dưới để Discord hiển thị nút **Copy** cho từng giá trị.'
-                    }
                 )
                 .setFooter({
                     text: `Mã đơn: ${orderId}`
@@ -1645,28 +1641,27 @@ async function handleMoneyModal(interaction) {
 
             const admin = await getAdminInfo(interaction.guild);
 
+            // Giữ toàn bộ thông tin đơn, PIN và Seri trong cùng một message để nhìn gọn trên cả PC và điện thoại.
+            // Code block riêng cho từng giá trị giúp Discord hiển thị thao tác Copy thuận tiện.
+            const safeCardCode = String(code).replace(/```/g, '');
+            const safeCardSeri = String(seri).replace(/```/g, '');
+            const cardInfoContent =
+                `🔐 **THÔNG TIN THẺ**\n\n` +
+                `**🔑 PIN / MÃ THẺ**\n` +
+                `\`\`\`\n${safeCardCode}\n\`\`\`\n\n` +
+                `**🔢 SERI**\n` +
+                `\`\`\`\n${safeCardSeri}\n\`\`\``;
+
             await ticketChannel.send({
                 content:
                     `<@${interaction.user.id}>\n` +
-                    `🔔 ${adminLabel(admin)}`,
+                    `🔔 ${adminLabel(admin)}\n\n` +
+                    cardInfoContent,
                 embeds: [cardEmbed],
                 components: [adminRow],
                 allowedMentions: {
                     users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
-            });
-
-            // Discord tự hiện nút Copy cho từng code block.
-            // Tách PIN và SERI thành 2 khối riêng để Admin copy từng giá trị bằng 1 click.
-            const safeCardCode = String(code).replace(/```/g, '');
-            const safeCardSeri = String(seri).replace(/```/g, '');
-            await ticketChannel.send({
-                content:
-                    `🔐 **THÔNG TIN THẺ — COPY NHANH**\n\n` +
-                    `**PIN / MÃ THẺ**\n` +
-                    `\`\`\`\n${safeCardCode}\n\`\`\`\n\n` +
-                    `**SERI**\n` +
-                    `\`\`\`\n${safeCardSeri}\n\`\`\``
             });
 
             if (admin?.online === false) {
