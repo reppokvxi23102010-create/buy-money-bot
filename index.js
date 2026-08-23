@@ -74,7 +74,10 @@ const client = new Client({
 
 // RATE được lưu trong config.json và có thể đổi bằng /rate
 const CARD_DISCOUNT = 0.20;
-const ADMIN_DISCORD_ID = '1458470035763888250';
+
+// Discord ID của Admin dùng để ping và kiểm tra trạng thái online.
+// Có thể ghi đè bằng ADMIN_DISCORD_ID trong .env nếu cần.
+const ADMIN_DISCORD_ID = process.env.ADMIN_DISCORD_ID || '1458470035763888250';
 
 const BANK_CONFIG = {
     BANK_ID: 'MB',
@@ -276,7 +279,9 @@ async function safeEditReply(interaction, data) {
 // ============================================================
 
 function isAdminUser(interaction) {
-    const isAdminId = interaction.user?.id === ADMIN_DISCORD_ID;
+    const isAdminId =
+        ADMIN_DISCORD_ID &&
+        interaction.user?.id === ADMIN_DISCORD_ID;
 
     const hasAdminPerm =
         interaction.memberPermissions &&
@@ -292,6 +297,8 @@ function isAdminUser(interaction) {
 }
 
 function adminOverwrite(guildId) {
+    if (!ADMIN_DISCORD_ID) return [];
+
     return [{
         id: ADMIN_DISCORD_ID,
         allow: [
@@ -357,28 +364,43 @@ function isWithinWorkingHours() {
 
 async function getAdminInfo(guild) {
     const adminId = ADMIN_DISCORD_ID;
+    if (!adminId) {
+        return {
+            id: null,
+            mention: '@Admin',
+            name: 'Admin',
+            online: null,
+            status: 'unknown',
+            canPing: false
+        };
+    }
 
     try {
         const member =
             guild?.members?.cache?.get(adminId) ||
-            (guild ? await guild.members.fetch({ user: adminId, force: true }) : null);
+            (guild ? await guild.members.fetch(adminId) : null);
 
-        const user = member?.user || await client.users.fetch(adminId).catch(() => null);
+        const user = member?.user;
         const name =
             member?.displayName ||
             user?.globalName ||
             user?.username ||
             'Admin';
 
-        const cachedPresence = guild?.presences?.cache?.get(adminId);
-        const status = cachedPresence?.status || member?.presence?.status || 'offline';
+        // Ưu tiên Presence cache của Guild, sau đó mới dùng presence trên Member.
+        // Khi Discord chưa trả presence, để trạng thái là null thay vì kết luận Admin offline.
+        const presence = guild?.presences?.cache?.get(adminId);
+        const status = presence?.status ?? member?.presence?.status ?? null;
+        const online = status
+            ? ['online', 'idle', 'dnd'].includes(status)
+            : null;
 
         return {
             id: adminId,
             mention: `<@${adminId}>`,
             name,
-            status,
-            online: ['online', 'idle', 'dnd'].includes(status),
+            online,
+            status: status || 'unknown',
             canPing: true
         };
     } catch (err) {
@@ -387,8 +409,8 @@ async function getAdminInfo(guild) {
             id: adminId,
             mention: `<@${adminId}>`,
             name: 'Admin',
-            status: 'offline',
-            online: false,
+            online: null,
+            status: 'unknown',
             canPing: true
         };
     }
@@ -401,11 +423,15 @@ function adminLabel(admin) {
 }
 
 function adminWaitText(admin) {
-    if (admin?.online) {
+    if (admin?.online === true) {
         return `🔔 ${adminLabel(admin)} đã được thông báo. Bạn vui lòng chờ Admin kiểm tra và phản hồi trong ticket nhé.`;
     }
 
-    return `🕐 ${adminLabel(admin)} hiện đang không online. Đơn của bạn đã được ghi nhận, bạn vui lòng chờ Admin quay lại và xử lý giúp nhé. Cảm ơn bạn đã kiên nhẫn!`;
+    if (admin?.online === false) {
+        return `🕐 ${adminLabel(admin)} hiện đang không online. Đơn của bạn đã được ghi nhận, bạn vui lòng chờ Admin quay lại và xử lý giúp nhé. Cảm ơn bạn đã kiên nhẫn!`;
+    }
+
+    return `🔔 ${adminLabel(admin)} đã được thông báo. Trạng thái online của Admin hiện chưa xác định, nên hệ thống không báo offline để tránh thông tin sai.`;
 }
 
 function adminAllowedMentions(admin) {
@@ -1395,7 +1421,7 @@ async function handleMoneyModal(interaction) {
                 }
             });
 
-            if (!admin.online) {
+            if (admin?.online === false) {
                 await ticketChannel.send({
                     content: adminWaitText(admin),
                     allowedMentions: adminAllowedMentions(admin)
@@ -1592,12 +1618,8 @@ async function handleMoneyModal(interaction) {
                         inline: true
                     },
                     {
-                        name: '🔑 Mã thẻ',
-                        value: `\`\`\`${code}\`\`\``
-                    },
-                    {
-                        name: '🔢 Seri',
-                        value: `\`\`\`${seri}\`\`\``
+                        name: '🔐 Thông tin thẻ',
+                        value: 'Mã thẻ và Seri được gửi ở tin nhắn riêng bên dưới để Discord hiển thị nút **Copy** thuận tiện hơn.'
                     }
                 )
                 .setFooter({
@@ -1638,19 +1660,19 @@ async function handleMoneyModal(interaction) {
                 }
             });
 
-            // Tin nhắn thường để Admin bôi đen/copy PIN + SERI dễ dàng.
+            // Discord không cho bot tự ghi clipboard bằng Button.
+            // Gửi PIN/Seri dưới dạng code block trong message để Discord hiện nút Copy 1 lần bấm.
+            const safeCardCode = String(code).replace(/```/g, '');
+            const safeCardSeri = String(seri).replace(/```/g, '');
             await ticketChannel.send({
                 content:
-                    `🧾 **THÔNG TIN THẺ - COPY TRỰC TIẾP**\n\n` +
-                    `🔑 **Mã thẻ (PIN):**\n` +
-                    `\`\`\`\n${code}\n\`\`\`\n\n` +
-                    `🔢 **Số Seri:**\n` +
-                    `\`\`\`\n${seri}\n\`\`\`\n\n` +
-                    `👤 **Admin:** ${adminLabel(admin)}`,
-                allowedMentions: adminAllowedMentions(admin)
+                    `🔑 **MÃ THẺ (PIN)**\n` +
+                    `\`\`\`\n${safeCardCode}\n\`\`\`\n\n` +
+                    `🔢 **SERI**\n` +
+                    `\`\`\`\n${safeCardSeri}\n\`\`\``
             });
 
-            if (!admin.online) {
+            if (admin?.online === false) {
                 await ticketChannel.send({
                     content: adminWaitText(admin),
                     allowedMentions: adminAllowedMentions(admin)
@@ -2594,7 +2616,7 @@ async function createAccountTicket(interaction, target, paymentMethod, cardData 
             });
         }
 
-        if (!admin.online) {
+        if (admin?.online === false) {
             await ticketChannel.send({
                 content: adminWaitText(admin),
                 allowedMentions: adminAllowedMentions(admin)
