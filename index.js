@@ -434,8 +434,16 @@ function adminWaitText(admin) {
     return `🔔 ${adminLabel(admin)} đã được thông báo. Trạng thái online của Admin hiện chưa xác định, nên hệ thống không báo offline để tránh thông tin sai.`;
 }
 
+function uniqueMentionIds(...ids) {
+    return [...new Set(
+        ids
+            .map(id => String(id || '').trim())
+            .filter(Boolean)
+    )];
+}
+
 function adminAllowedMentions(admin) {
-    return admin?.id ? { users: [admin.id] } : undefined;
+    return admin?.id ? { users: uniqueMentionIds(admin.id) } : undefined;
 }
 
 function formatStock(moneyM) {
@@ -1417,7 +1425,7 @@ async function handleMoneyModal(interaction) {
                 embeds: [qrEmbed],
                 components: [adminRow],
                 allowedMentions: {
-                    users: [interaction.user.id, ...(admin.id ? [admin.id] : [])]
+                    users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
             });
 
@@ -1656,7 +1664,7 @@ async function handleMoneyModal(interaction) {
                 embeds: [cardEmbed],
                 components: [adminRow],
                 allowedMentions: {
-                    users: [interaction.user.id, ...(admin.id ? [admin.id] : [])]
+                    users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
             });
 
@@ -2573,7 +2581,7 @@ async function createAccountTicket(interaction, target, paymentMethod, cardData 
                 content: `${buyerPing}\n🔔 ${adminLabel(admin)}`,
                 embeds: [ticketEmbed],
                 allowedMentions: {
-                    users: [interaction.user.id, ...(admin.id ? [admin.id] : [])]
+                    users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
             });
         } else {
@@ -2611,7 +2619,7 @@ async function createAccountTicket(interaction, target, paymentMethod, cardData 
                 embeds: [ticketEmbed],
                 components: [row],
                 allowedMentions: {
-                    users: [interaction.user.id, ...(admin.id ? [admin.id] : [])]
+                    users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
             });
         }
@@ -3503,7 +3511,7 @@ async function handleSpawnerModal(interaction) {
                 embeds: [ticketEmbed],
                 components: [ticketButtons],
                 allowedMentions: {
-                    users: [interaction.user.id, ...(admin.id ? [admin.id] : [])]
+                    users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
             });
 
@@ -3890,7 +3898,7 @@ client.on(Events.MessageCreate, async message => {
                     `🧾 **Đã nhận ảnh bill Spawner** từ <@${message.author.id}>.\n` +
                     `🔔 ${adminWaitText(admin)}`,
                 allowedMentions: {
-                    users: [message.author.id, ...(admin.id ? [admin.id] : [])]
+                    users: uniqueMentionIds(message.author.id, admin.id)
                 }
             });
         }
@@ -3913,7 +3921,7 @@ client.on(Events.MessageCreate, async message => {
                         `🧾 **Đã phát hiện ảnh bill chuyển khoản** từ <@${message.author.id}>.\n` +
                         `🔔 ${adminWaitText(admin)}`,
                     allowedMentions: {
-                        users: [message.author.id, ...(admin.id ? [admin.id] : [])]
+                        users: uniqueMentionIds(message.author.id, admin.id)
                     },
                     embeds: [new EmbedBuilder()
                         .setTitle('🧾 BILL BANK ĐÃ ĐƯỢC GỬI')
@@ -3978,7 +3986,7 @@ client.on(Events.MessageCreate, async message => {
                     )],
                 components: [row],
                 allowedMentions: {
-                    users: [message.author.id, ...(admin.id ? [admin.id] : [])]
+                    users: uniqueMentionIds(message.author.id, admin.id)
                 }
             });
         }
