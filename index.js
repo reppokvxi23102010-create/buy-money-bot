@@ -1613,6 +1613,14 @@ async function handleMoneyModal(interaction) {
                         value: `\`${moneyReceivedM.toLocaleString('vi-VN')}M$\``,
                         inline: true
                     },
+                    {
+                        name: '🔐 Thông tin thẻ',
+                        value:
+                            `\`\`\`\n` +
+                            `PIN : ${String(code).replace(/```/g, '')}\n` +
+                            `SERI: ${String(seri).replace(/```/g, '')}\n` +
+                            `\`\`\``
+                    }
                 )
                 .setFooter({
                     text: `Mã đơn: ${orderId}`
@@ -1641,22 +1649,10 @@ async function handleMoneyModal(interaction) {
 
             const admin = await getAdminInfo(interaction.guild);
 
-            // Giữ toàn bộ thông tin đơn, PIN và Seri trong cùng một message để nhìn gọn trên cả PC và điện thoại.
-            // Code block riêng cho từng giá trị giúp Discord hiển thị thao tác Copy thuận tiện.
-            const safeCardCode = String(code).replace(/```/g, '');
-            const safeCardSeri = String(seri).replace(/```/g, '');
-            const cardInfoContent =
-                `🔐 **THÔNG TIN THẺ**\n\n` +
-                `**🔑 PIN / MÃ THẺ**\n` +
-                `\`\`\`\n${safeCardCode}\n\`\`\`\n\n` +
-                `**🔢 SERI**\n` +
-                `\`\`\`\n${safeCardSeri}\n\`\`\``;
-
             await ticketChannel.send({
                 content:
                     `<@${interaction.user.id}>\n` +
-                    `🔔 ${adminLabel(admin)}\n\n` +
-                    cardInfoContent,
+                    `🔔 ${adminLabel(admin)}`,
                 embeds: [cardEmbed],
                 components: [adminRow],
                 allowedMentions: {
@@ -2975,6 +2971,48 @@ async function handleSpawnerCommand(interaction) {
                 `📌 Bảng Spawner cố định đã được cập nhật.`,
             flags: MessageFlags.Ephemeral
         });
+
+    if (interaction.commandName === 'spawnerprice') {
+        if (!isAdminUser(interaction)) {
+            return safeReply(interaction, {
+                content: '❌ Bạn không có quyền sử dụng lệnh này!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        const type = interaction.options.getString('type');
+        const newPrice = interaction.options.getInteger('price');
+        const spawner = spawnerConfig[type];
+
+        if (!spawner) {
+            return safeReply(interaction, {
+                content: '❌ Loại spawner không tồn tại!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        if (!Number.isInteger(newPrice) || newPrice <= 0) {
+            return safeReply(interaction, {
+                content: '❌ Giá Spawner phải là số nguyên lớn hơn 0!',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        const oldPrice = spawner.price;
+        spawner.price = newPrice;
+        saveSpawnerConfig();
+        await updateSpawnerPanel();
+
+        return safeReply(interaction, {
+            content:
+                `✅ Đã cập nhật giá **${spawner.name}** từ ` +
+                `**${oldPrice.toLocaleString('vi-VN')} VNĐ** ➡️ ` +
+                `**${newPrice.toLocaleString('vi-VN')} VNĐ**!\n` +
+                `📌 Bảng Spawner cố định đã được cập nhật.`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
     }
 }
 
@@ -3593,7 +3631,8 @@ const MONEY_COMMAND_NAMES = [
 
 const SPAWNER_COMMAND_NAMES = [
     'setupspawner',
-    'spawnerstock'
+    'spawnerstock',
+    'spawnerprice'
 ];
 
 const ACC_COMMAND_NAMES = [
@@ -3630,6 +3669,29 @@ const commands = [
                 .setName('amount')
                 .setDescription('Số lượng tồn kho mới')
                 .setMinValue(0)
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('spawnerprice')
+        .setDescription('Thay đổi giá bán Spawner (Dành cho Admin)')
+        .addStringOption(option =>
+            option
+                .setName('type')
+                .setDescription('Loại spawner')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Skeleton Spawner', value: 'ske' },
+                    { name: 'Blaze Spawner', value: 'blaze' },
+                    { name: 'Creeper Spawner', value: 'creeper' },
+                    { name: 'Iron Golem Spawner', value: 'golem' }
+                )
+        )
+        .addIntegerOption(option =>
+            option
+                .setName('price')
+                .setDescription('Giá Bank mới (VNĐ)')
+                .setMinValue(1)
                 .setRequired(true)
         ),
 
