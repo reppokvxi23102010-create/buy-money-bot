@@ -63,8 +63,7 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildPresences
+        GatewayIntentBits.GuildMembers
     ]
 });
 
@@ -75,7 +74,7 @@ const client = new Client({
 // RATE được lưu trong config.json và có thể đổi bằng /rate
 const CARD_DISCOUNT = 0.20;
 
-// Discord ID của Admin dùng để ping và kiểm tra trạng thái online.
+// Discord ID của Admin chỉ dùng để ping.
 // Có thể ghi đè bằng ADMIN_DISCORD_ID trong .env nếu cần.
 const ADMIN_DISCORD_ID = process.env.ADMIN_DISCORD_ID || '1458470035763888250';
 
@@ -362,76 +361,19 @@ function isWithinWorkingHours() {
     }
 }
 
-async function getAdminInfo(guild) {
+function getAdminInfo() {
     const adminId = ADMIN_DISCORD_ID;
-    if (!adminId) {
-        return {
-            id: null,
-            mention: '@Admin',
-            name: 'Admin',
-            online: null,
-            status: 'unknown',
-            canPing: false
-        };
-    }
 
-    try {
-        const member =
-            guild?.members?.cache?.get(adminId) ||
-            (guild ? await guild.members.fetch(adminId) : null);
-
-        const user = member?.user;
-        const name =
-            member?.displayName ||
-            user?.globalName ||
-            user?.username ||
-            'Admin';
-
-        // Ưu tiên Presence cache của Guild, sau đó mới dùng presence trên Member.
-        // Khi Discord chưa trả presence, để trạng thái là null thay vì kết luận Admin offline.
-        const presence = guild?.presences?.cache?.get(adminId);
-        const status = presence?.status ?? member?.presence?.status ?? null;
-        const online = status
-            ? ['online', 'idle', 'dnd'].includes(status)
-            : null;
-
-        return {
-            id: adminId,
-            mention: `<@${adminId}>`,
-            name,
-            online,
-            status: status || 'unknown',
-            canPing: true
-        };
-    } catch (err) {
-        console.error('Không lấy được thông tin Admin:', err?.message || err);
-        return {
-            id: adminId,
-            mention: `<@${adminId}>`,
-            name: 'Admin',
-            online: null,
-            status: 'unknown',
-            canPing: true
-        };
-    }
+    return {
+        id: adminId,
+        mention: adminId ? `<@${adminId}>` : '@Admin',
+        name: 'Admin',
+        canPing: Boolean(adminId)
+    };
 }
 
 function adminLabel(admin) {
-    return admin?.id
-        ? `${admin.mention} — **${String(admin.name).replace(/[*_`]/g, '')}**`
-        : '**Admin**';
-}
-
-function adminWaitText(admin) {
-    if (admin?.online === true) {
-        return `🔔 ${adminLabel(admin)} đã được thông báo. Bạn vui lòng chờ Admin kiểm tra và phản hồi trong ticket nhé.`;
-    }
-
-    if (admin?.online === false) {
-        return `🕐 ${adminLabel(admin)} hiện đang không online. Đơn của bạn đã được ghi nhận, bạn vui lòng chờ Admin quay lại và xử lý giúp nhé. Cảm ơn bạn đã kiên nhẫn!`;
-    }
-
-    return `🔔 ${adminLabel(admin)} đã được thông báo. Trạng thái online của Admin hiện chưa xác định, nên hệ thống không báo offline để tránh thông tin sai.`;
+    return admin?.id ? admin.mention : '**Admin**';
 }
 
 function uniqueMentionIds(...ids) {
@@ -1429,13 +1371,6 @@ async function handleMoneyModal(interaction) {
                 }
             });
 
-            if (admin?.online === false) {
-                await ticketChannel.send({
-                    content: adminWaitText(admin),
-                    allowedMentions: adminAllowedMentions(admin)
-                });
-            }
-
             orders[orderId].ticketChannelId = ticketChannel.id;
             orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
             saveMoneyOrders(orders);
@@ -1659,13 +1594,6 @@ async function handleMoneyModal(interaction) {
                     users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
             });
-
-            if (admin?.online === false) {
-                await ticketChannel.send({
-                    content: adminWaitText(admin),
-                    allowedMentions: adminAllowedMentions(admin)
-                });
-            }
 
             orders[orderId].ticketChannelId = ticketChannel.id;
             orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
@@ -2559,8 +2487,7 @@ async function createAccountTicket(interaction, target, paymentMethod, cardData 
                 .setDescription(
                     `${buyerPing}, thông tin thẻ của bạn đã được ghi nhận.\n\n` +
                     `💵 Giá quy đổi: **${cardPrice.toLocaleString('vi-VN')} VNĐ**\n` +
-                    `📉 Chiết khấu: **20%**\n\n` +
-                    `${adminWaitText(admin)}`
+                    `📉 Chiết khấu: **20%**\n\n`
                 )
                 .addFields(
                     { name: '🌐 Nhà mạng', value: `\`${cardData?.network || 'Không có'}\``, inline: true },
@@ -2589,13 +2516,6 @@ async function createAccountTicket(interaction, target, paymentMethod, cardData 
                 allowedMentions: {
                     users: uniqueMentionIds(interaction.user.id, admin.id)
                 }
-            });
-        }
-
-        if (admin?.online === false) {
-            await ticketChannel.send({
-                content: adminWaitText(admin),
-                allowedMentions: adminAllowedMentions(admin)
             });
         }
 
@@ -3480,8 +3400,6 @@ async function handleSpawnerModal(interaction) {
                         `• 👤 **IGN:** \`${ign}\`\n` +
                         `• 📦 **Số lượng:** \`${quantity}\` cái\n` +
                         `• 💰 **Tổng thanh toán:** **${totalPrice.toLocaleString('vi-VN')} VNĐ**\n\n` +
-                        `⚠️ **ĐỢI ADMIN REP TRONG KÊNH NÀY RỒI MỚI CHUYỂN KHOẢN NHÉ!**\n` +
-                        `${adminWaitText(admin)}\n\n` +
                         `───────────────────────────────────\n` +
                         `🏦 **THÔNG TIN CHUYỂN KHOẢN:**\n` +
                         `• Ngân hàng: **${serverConfig.bank.shortName}**\n` +
@@ -3504,7 +3422,6 @@ async function handleSpawnerModal(interaction) {
                         `• 📉 **Thực nhận (Sau -${CARD_DISCOUNT * 100}% phí):** **${effectiveValue.toLocaleString('vi-VN')} VNĐ**\n` +
                         `• 🎯 **Số ${spawner.name} nhận được:** \`${quantity}\` **cái** ` +
                         `*(Giá: ${spawner.price.toLocaleString('vi-VN')} VNĐ/cái)*\n\n` +
-                        `${adminWaitText(admin)}\n\n` +
                         `───────────────────────────────────\n` +
                         `🧾 **THÔNG TIN THẺ NẠP:**\n` +
                         `• 🌐 **Nhà mạng:** \`${cardNet}\`\n` +
@@ -3929,8 +3846,7 @@ client.on(Events.MessageCreate, async message => {
             const admin = await getAdminInfo(message.guild);
             await message.channel.send({
                 content:
-                    `🧾 **Đã nhận ảnh bill Spawner** từ <@${message.author.id}>.\n` +
-                    `🔔 ${adminWaitText(admin)}`,
+                    `🧾 **Đã nhận ảnh bill Spawner** từ <@${message.author.id}>.\n`,
                 allowedMentions: {
                     users: uniqueMentionIds(message.author.id, admin.id)
                 }
@@ -3952,8 +3868,7 @@ client.on(Events.MessageCreate, async message => {
             if (order?.type === 'bank') {
                 await message.channel.send({
                     content:
-                        `🧾 **Đã phát hiện ảnh bill chuyển khoản** từ <@${message.author.id}>.\n` +
-                        `🔔 ${adminWaitText(admin)}`,
+                        `🧾 **Đã phát hiện ảnh bill chuyển khoản** từ <@${message.author.id}>.\n`,
                     allowedMentions: {
                         users: uniqueMentionIds(message.author.id, admin.id)
                     },
@@ -4009,8 +3924,7 @@ client.on(Events.MessageCreate, async message => {
 
             await message.channel.send({
                 content:
-                    `🧾 <@${message.author.id}> vừa gửi ảnh bill.\n` +
-                    `🔔 ${adminWaitText(admin)}`,
+                    `🧾 <@${message.author.id}> vừa gửi ảnh bill.\n`,
                 embeds: [new EmbedBuilder()
                     .setTitle('🧾 PHÁT HIỆN BILL CHUYỂN KHOẢN')
                     .setColor('#f1c40f')
