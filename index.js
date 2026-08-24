@@ -4239,77 +4239,215 @@ process.on('uncaughtException', err => {
 });
 
 // ============================================================
-// 24. LOGIN
-// ============================================================
-
-// ============================================================
-// 24. LOGIN / STARTUP DIAGNOSTICS
+// 24. LOGIN / STARTUP
 // ============================================================
 
 function getEnvValue(...names) {
     for (const name of names) {
         const value = process.env[name];
         if (typeof value === 'string' && value.trim()) {
-            return value.trim().replace(/^['\"]|['\"]$/g, '');
+            return value.trim().replace(/^['"]|['"]$/g, '');
         }
     }
     return '';
 }
 
-const botToken = getEnvValue(
-    'DISCORD_TOKEN',
-    'TOKEN',
-    'BOT_TOKEN'
-);
+const botToken = getEnvValue('DISCORD_TOKEN', 'TOKEN', 'BOT_TOKEN');
+const clientId = getEnvValue('CLIENT_ID', 'APPLICATION_ID');
 
-console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
-console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
-console.log(`🟢 Node.js: ${process.version}`);
-console.log(`📡 PORT: ${PORT}`);
-console.log(`🔐 Discord token: ${botToken ? 'FOUND' : 'MISSING'}`);
+let discordReady = false;
+let startupFinished = false;
+let startupFailed = false;
 
-client.on(Events.Error, err => {
-    console.error('❌ [Discord Client Error]:', err);
-});
+function maskedToken(token) {
+    if (!token) return 'MISSING';
+    if (token.length < 10) return 'FOUND';
+    return `${token.slice(0, 4)}...${token.slice(-4)}`;
+}
 
-client.on(Events.ShardError, err => {
-    console.error('❌ [Discord Shard Error]:', err);
+console.log('============================================================');
+console.log('🚀 KINGSMP BOT STARTUP');
+console.log('============================================================');
+console.log(`🌐 Runtime      : ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
+console.log(`🟢 Node.js      : ${process.version}`);
+console.log(`📡 PORT         : ${PORT}`);
+console.log(`🔐 Token        : ${maskedToken(botToken)}`);
+console.log(`🆔 Client ID    : ${clientId ? 'FOUND' : 'MISSING'}`);
+console.log('------------------------------------------------------------');
+
+function printLoginHelp(code, message) {
+    console.error(`❌ Discord login failed [code=${code}]: ${message}`);
+
+    if (code === 4014 || /disallowed intent/i.test(message)) {
+        console.error(
+            '🚨 DISCORD 4014: MESSAGE CONTENT INTENT chưa được bật. ' +
+            'Discord Developer Portal → Bot → Privileged Gateway Intents → bật MESSAGE CONTENT INTENT.'
+        );
+    }
+
+    if (
+        code === 4004 ||
+        /invalid token/i.test(message) ||
+        (/token/i.test(message) && /invalid|authentication|login/i.test(message))
+    ) {
+        console.error(
+            '🚨 Token không hợp lệ. DISCORD_TOKEN phải là BOT TOKEN trong Discord Developer Portal, không phải Client Secret hoặc Application ID.'
+        );
+    }
+}
+
+client.on(Events.Error, err => console.error('❌ [Discord Client Error]', err));
+client.on(Events.Warn, message => console.warn('⚠️ [Discord Warning]', message));
+
+client.on(Events.ShardError, (error, shardId) => {
+    console.error(`❌ [Discord Shard Error] shard=${shardId}`, error);
 });
 
 client.on(Events.ShardDisconnect, (event, shardId) => {
+    discordReady = false;
     console.error(
-        `⚠️ [Discord Shard Disconnect] shard=${shardId} code=${event?.code ?? 'unknown'} reason=${event?.reason ?? 'unknown'}`
+        `⚠️ [Discord Shard Disconnect] shard=${shardId} code=${event?.code ?? 'unknown'} reason=${event?.reason || 'unknown'}`
     );
 });
 
 client.on(Events.ShardReconnecting, shardId => {
-    console.warn(`🔄 [Discord] Đang kết nối lại shard ${shardId}...`);
+    console.warn(`🔄 [Discord] Reconnecting shard ${shardId}...`);
 });
 
-if (!botToken) {
-    console.error('❌ Không tìm thấy Discord token!');
-    console.error('👉 Render: tạo Environment Variable DISCORD_TOKEN = Bot Token trong Discord Developer Portal.');
-    console.error('👉 Local: tạo file .env với DISCORD_TOKEN=YOUR_BOT_TOKEN');
-    process.exitCode = 1;
-} else {
-    client.login(botToken)
-        .then(() => {
-            console.log('✅ Discord login request đã được gửi thành công.');
-        })
-        .catch(err => {
-            const code = err?.code ?? 'unknown';
-            const message = err?.message ?? String(err);
+client.on(Events.ShardReady, (shardId, unavailableGuilds) => {
+    console.log(
+        `✅ [Discord Shard Ready] shard=${shardId} unavailableGuilds=${unavailableGuilds?.size ?? 0}`
+    );
+});
 
-            console.error(`❌ Login Discord thất bại [code=${code}]: ${message}`);
+async function loginDiscordWithTimeout(token, timeoutMs = 30000) {
+    let timer;
 
-            if (code === 4014 || /disallowed intent/i.test(message)) {
-                console.error('🚨 Discord từ chối Gateway Intent. Hãy vào Developer Portal → Bot → Privileged Gateway Intents và bật MESSAGE CONTENT INTENT.');
-            }
+    try {
+        const loginPromise = client.login(token);
 
-            if (code === 0 || /token/i.test(message)) {
-                console.error('🚨 Kiểm tra lại DISCORD_TOKEN: phải là Bot Token mới, không phải Client Secret/Application ID.');
-            }
+        await Promise.race([
+            loginPromise,
+            new Promise((_, reject) => {
+                timer = setTimeout(() => {
+                    const error = new Error(
+                        `Discord Gateway không phản hồi trong ${timeoutMs / 1000}s`
+                    );
+                    error.code = 'LOGIN_TIMEOUT';
+                    reject(error);
+                }, timeoutMs);
+            })
+        ]);
 
-            process.exitCode = 1;
-        });
+        return true;
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 }
+
+async function runStartupTasks() {
+    if (!discordReady || startupFinished || startupFailed) return;
+
+    try {
+        console.log('🧱 [3/4] Đang kiểm tra dữ liệu local...');
+
+        ensureJsonFile(STOCK_FILE, { stockM: 5000 });
+        ensureJsonFile(CONFIG_FILE, {});
+        ensureJsonFile(ACC_STOCK_FILE, []);
+        ensureJsonFile(ACC_DETAIL_FILE, []);
+        ensureJsonFile(MONEY_ORDERS_FILE, {});
+
+        loadSpawnerConfigFromDisk();
+
+        console.log(`📦 [STARTUP] Money stock: ${currentStockM}M$`);
+        console.log(
+            `🧩 [STARTUP] Panel config: channel=${moneyConfig?.channelId || 'none'} message=${moneyConfig?.messageId || 'none'}`
+        );
+
+        console.log('🧩 [4/4] Đang đăng ký slash commands + cập nhật panel...');
+
+        await registerSlashCommands();
+        await updateAutoBuyPanel();
+        await updateSpawnerPanel();
+
+        startupFinished = true;
+
+        console.log('============================================================');
+        console.log(`✅ BOT ONLINE HOÀN TOÀN: ${client.user.tag}`);
+        console.log(`🆔 Discord ID: ${client.user.id}`);
+        console.log(`🌐 Servers: ${client.guilds.cache.size}`);
+        console.log(`📦 Money stock: ${formatStock(currentStockM)}`);
+        console.log('============================================================');
+    } catch (error) {
+        startupFailed = true;
+        console.error('❌ LỖI STARTUP SAU KHI LOGIN DISCORD:', error);
+    }
+}
+
+client.once(Events.ClientReady, async c => {
+    discordReady = true;
+
+    console.log('============================================================');
+    console.log(`🤖 Discord READY: ${c.user.tag}`);
+    console.log(`🆔 Bot ID: ${c.user.id}`);
+    console.log(`🏠 Guild count: ${c.guilds.cache.size}`);
+    console.log('============================================================');
+
+    await runStartupTasks();
+});
+
+const httpServer = http.createServer((req, res) => {
+    const payload = {
+        ok: true,
+        discordReady,
+        startupFinished,
+        startupFailed,
+        botTag: client.user?.tag ?? null,
+        botId: client.user?.id ?? null,
+        guilds: client.guilds.cache.size,
+        uptimeSeconds: Math.floor(process.uptime())
+    };
+
+    res.writeHead(200, {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'no-store'
+    });
+
+    res.end(JSON.stringify(payload, null, 2));
+});
+
+httpServer.on('error', error => {
+    console.error('❌ [HTTP Server Error]', error);
+});
+
+httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`🌐 [HTTP] Listening on 0.0.0.0:${PORT}`);
+});
+
+async function main() {
+    if (!botToken) {
+        startupFailed = true;
+        console.error('❌ DISCORD_TOKEN/TOKEN/BOT_TOKEN không tồn tại.');
+        process.exitCode = 1;
+        return;
+    }
+
+    try {
+        console.log('📡 [1/4] Đang kết nối Discord Gateway...');
+        await loginDiscordWithTimeout(botToken, 30000);
+        console.log('✅ [2/4] Discord login request thành công.');
+    } catch (error) {
+        startupFailed = true;
+        printLoginHelp(error?.code ?? 'unknown', error?.message ?? String(error));
+        console.error('🛑 Bot không thể kết nối Discord. Render sẽ nhận process lỗi.');
+        process.exitCode = 1;
+        setTimeout(() => process.exit(1), 1000);
+    }
+}
+
+main().catch(error => {
+    startupFailed = true;
+    console.error('💥 [FATAL STARTUP ERROR]', error);
+    process.exitCode = 1;
+    setTimeout(() => process.exit(1), 1000);
+});
