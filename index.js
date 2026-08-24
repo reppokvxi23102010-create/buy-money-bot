@@ -223,6 +223,11 @@ async function safeReply(interaction, data) {
             return null;
         }
 
+        if (err?.code === 10062 || /unknown interaction/i.test(String(err?.message || ''))) {
+            console.error(`❌ safeReply: Interaction ${interaction.id} đã hết hạn (10062).`);
+            return null;
+        }
+
         console.error('Lỗi safeReply:', err.message);
         return null;
     }
@@ -1970,7 +1975,19 @@ async function handleAccCommand(interaction) {
             interaction.options.getInteger('price_bank');
 
         const priceCard =
-            Math.ceil(priceBank / (1 - CARD_DISCOUNT));
+            interaction.options.getInteger('price_card');
+
+        if (!Number.isInteger(priceBank) || priceBank <= 0) {
+            return safeEditReply(interaction, {
+                content: '❌ Giá Bank phải lớn hơn 0 VNĐ.'
+            });
+        }
+
+        if (!Number.isInteger(priceCard) || priceCard <= 0) {
+            return safeEditReply(interaction, {
+                content: '❌ Giá Thẻ Cào phải lớn hơn 0 VNĐ.'
+            });
+        }
 
         const capeCount =
             interaction.options.getInteger('cape_count');
@@ -2022,7 +2039,9 @@ async function handleAccCommand(interaction) {
 
         return safeEditReply(interaction, {
             content:
-                `✅ Đã đăng bán Acc \`${username}\` thành công!`
+                `✅ Đã đăng bán Acc \`${username}\` thành công!\n` +
+                `💵 Giá Bank: **${priceBank.toLocaleString('vi-VN')} VNĐ**\n` +
+                `🎟️ Giá Thẻ: **${priceCard.toLocaleString('vi-VN')} VNĐ**`
         });
     }
 
@@ -3706,6 +3725,14 @@ const commands = [
             o
                 .setName('price_bank')
                 .setDescription('Giá Bank VNĐ')
+                .setMinValue(1)
+                .setRequired(true)
+        )
+        .addIntegerOption(o =>
+            o
+                .setName('price_card')
+                .setDescription('Giá Thẻ Cào VNĐ')
+                .setMinValue(1)
                 .setRequired(true)
         )
         .addIntegerOption(o =>
@@ -3947,37 +3974,100 @@ client.on(Events.MessageCreate, async message => {
 // 21. INTERACTION CREATE
 // ============================================================
 
+// Discord chỉ cho khoảng 3 giây để acknowledge một Interaction.
+// Trên Render/free instance, việc xử lý có thể chậm nên các Interaction
+// không mở Modal sẽ được acknowledge NGAY tại listener trước khi chạy logic.
+function buttonOpensModal(customId) {
+    return (
+        customId === 'buy_bank' ||
+        customId === 'buy_card' ||
+        customId === 'calc_price' ||
+        customId.startsWith('spawner_method_bank_') ||
+        customId.startsWith('spawner_method_card_')
+    );
+}
+
+function selectOpensModal(customId) {
+    return customId.startsWith('acc_payment_');
+}
+
+async function acknowledgeInteraction(interaction) {
+    try {
+        if (interaction.replied || interaction.deferred) return true;
+
+        if (interaction.isChatInputCommand()) {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            return true;
+        }
+
+        if (interaction.isButton()) {
+            // Các nút này bắt buộc dùng showModal() làm response đầu tiên.
+            if (buttonOpensModal(interaction.customId)) return true;
+            await interaction.deferUpdate();
+            return true;
+        }
+
+        if (interaction.isStringSelectMenu()) {
+            // acc_payment_card mở Modal => không được defer trước.
+            if (selectOpensModal(interaction.customId)) return true;
+            await interaction.deferUpdate();
+            return true;
+        }
+
+        if (interaction.isModalSubmit()) {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            return true;
+        }
+
+        return true;
+    } catch (err) {
+        if (err?.code === 40060) return false;
+
+        if (err?.code === 10062 || /unknown interaction/i.test(String(err?.message || ''))) {
+            console.error(`❌ Interaction hết hạn/timeout trước khi acknowledge: ${interaction.id}`);
+            return false;
+        }
+
+        console.error('❌ Lỗi acknowledge Interaction:', err?.message || err);
+        return false;
+    }
+}
+
 client.on(Events.InteractionCreate, async interaction => {
+    const startedAt = Date.now();
+    const interactionName = interaction.isButton()
+        ? `button:${interaction.customId}`
+        : interaction.isChatInputCommand()
+            ? `command:/${interaction.commandName}`
+            : interaction.isStringSelectMenu()
+                ? `select:${interaction.customId}`
+                : interaction.isModalSubmit()
+                    ? `modal:${interaction.customId}`
+                    : 'other';
+
+    console.log(`⚡ [INTERACTION] ${interactionName} id=${interaction.id}`);
+
     try {
         if (!claimInteraction(interaction)) {
-            console.log(
-                `⚠️ Bỏ qua interaction trùng: ${interaction.id}`
-            );
+            console.log(`⚠️ Bỏ qua interaction trùng: ${interaction.id}`);
             return;
         }
 
+        // Acknowledge sớm để tránh Discord trả về 10062 Unknown interaction.
+        // Ngoại lệ: những nút/select mở Modal phải để handler gọi showModal()
+        // làm response đầu tiên.
+        if (!(await acknowledgeInteraction(interaction))) return;
+
         if (interaction.isChatInputCommand()) {
-            if (
-                SPAWNER_COMMAND_NAMES.includes(
-                    interaction.commandName
-                )
-            ) {
+            if (SPAWNER_COMMAND_NAMES.includes(interaction.commandName)) {
                 return await handleSpawnerCommand(interaction);
             }
 
-            if (
-                MONEY_COMMAND_NAMES.includes(
-                    interaction.commandName
-                )
-            ) {
+            if (MONEY_COMMAND_NAMES.includes(interaction.commandName)) {
                 return await handleMoneyCommand(interaction);
             }
 
-            if (
-                ACC_COMMAND_NAMES.includes(
-                    interaction.commandName
-                )
-            ) {
+            if (ACC_COMMAND_NAMES.includes(interaction.commandName)) {
                 return await handleAccCommand(interaction);
             }
 
@@ -4003,12 +4093,7 @@ client.on(Events.InteractionCreate, async interaction => {
             if (
                 id.startsWith('money_approve_') ||
                 id.startsWith('money_reject_') ||
-                [
-                    'buy_bank',
-                    'buy_card',
-                    'calc_price',
-                    'guide'
-                ].includes(id)
+                ['buy_bank', 'buy_card', 'calc_price', 'guide'].includes(id)
             ) {
                 return await handleMoneyButton(interaction);
             }
@@ -4085,43 +4170,26 @@ client.on(Events.InteractionCreate, async interaction => {
                 return createAccountTicket(interaction, target, 'card', cardData);
             }
 
-            if (
-                [
-                    'modal_bank',
-                    'modal_card',
-                    'modal_calc'
-                ].includes(interaction.customId)
-            ) {
+            if (['modal_bank', 'modal_card', 'modal_calc'].includes(interaction.customId)) {
                 return await handleMoneyModal(interaction);
             }
 
             return;
         }
     } catch (err) {
-        console.error(
-            '❌ Lỗi Xử Lý Interaction:',
-            err
-        );
+        console.error('❌ Lỗi Xử Lý Interaction:', err);
 
         try {
-            if (
-                !interaction.replied &&
-                !interaction.deferred
-            ) {
-                await interaction.reply({
-                    content:
-                        '❌ Có lỗi xảy ra khi xử lý thao tác.',
-                    flags: MessageFlags.Ephemeral
-                });
-            }
+            await safeEditReply(interaction, {
+                content: '❌ Có lỗi xảy ra khi xử lý thao tác. Vui lòng thử lại.'
+            });
         } catch (replyErr) {
-            if (replyErr?.code !== 40060) {
-                console.error(
-                    '❌ Không thể gửi lỗi:',
-                    replyErr.message
-                );
+            if (replyErr?.code !== 40060 && replyErr?.code !== 10062) {
+                console.error('❌ Không thể gửi lỗi:', replyErr.message);
             }
         }
+    } finally {
+        console.log(`✅ [INTERACTION] ${interactionName} xử lý ${Date.now() - startedAt}ms`);
     }
 });
 
