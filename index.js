@@ -1193,14 +1193,14 @@ async function handleMoneyButton(interaction) {
     if (id === 'guide') {
         const startHour = moneyConfig.workingHours?.start ?? 10;
         const endHour = moneyConfig.workingHours?.end ?? 22;
-        return safeReply(interaction, {
+
+        return safeEditReply(interaction, {
             content:
                 `📖 **HƯỚNG DẪN MUA MONEY KINGSMP**\n\n` +
                 `• Giờ hoạt động: **${startHour}h00 - ${endHour}h00**\n` +
                 `• Rate Bank: **${RATE} VNĐ = 1M$**\n` +
                 `• Thẻ cào: trừ **20%**\n` +
-                `• Kho hiện tại: **${formatStock(currentStockM)}**`,
-            flags: MessageFlags.Ephemeral
+                `• Kho hiện tại: **${formatStock(currentStockM)}**`
         });
     }
 }
@@ -2810,6 +2810,12 @@ async function handleCloseTicket(interaction) {
         });
     }
 
+    // Phản hồi ngay, không chờ các request/API phụ.
+    await safeReply(interaction, {
+        content:
+            '🔒 **Kênh Ticket sẽ tự động xóa sau 5 giây...**'
+    });
+
     const topic =
         interaction.channel?.topic || '';
 
@@ -2830,17 +2836,18 @@ async function handleCloseTicket(interaction) {
 
             saveDetailedAccs(accs);
 
-            await updateAccListingAvailable(target);
+            // Không để request sửa listing chặn việc đóng ticket.
+            Promise.race([
+                updateAccListingAvailable(target),
+                new Promise(resolve => setTimeout(() => resolve(false), 5000))
+            ]).catch(err => {
+                console.error('❌ Cập nhật listing sau khi đóng ticket thất bại:', err?.message || err);
+            });
         }
     }
 
-    await safeReply(interaction, {
-        content:
-            '🔒 **Kênh Ticket sẽ tự động xóa sau 5 giây...**'
-    });
-
     setTimeout(() => {
-        interaction.channel.delete().catch(() => {});
+        interaction.channel?.delete().catch(() => {});
     }, 5000);
 }
 
@@ -3995,6 +4002,12 @@ function buttonOpensModal(customId) {
     );
 }
 
+// Nút chỉ trả lời riêng cho người bấm thì dùng deferReply.
+// Như vậy không cần deferUpdate rồi mới followUp, giúp luồng phản hồi gọn hơn.
+function buttonUsesDeferredReply(customId) {
+    return customId === 'guide';
+}
+
 function selectOpensModal(customId) {
     return customId.startsWith('acc_payment_');
 }
@@ -4011,6 +4024,14 @@ async function acknowledgeInteraction(interaction) {
         if (interaction.isButton()) {
             // Các nút này bắt buộc dùng showModal() làm response đầu tiên.
             if (buttonOpensModal(interaction.customId)) return true;
+
+            // guide là phản hồi riêng cho người dùng, không cần sửa message gốc.
+            if (buttonUsesDeferredReply(interaction.customId)) {
+                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+                return true;
+            }
+
+            // Các nút còn lại cần cập nhật message gốc.
             await interaction.deferUpdate();
             return true;
         }
