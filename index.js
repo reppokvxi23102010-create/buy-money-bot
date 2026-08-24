@@ -3805,47 +3805,68 @@ const commands = [
 // ============================================================
 
 async function registerSlashCommands() {
+    // Dùng đúng token mà startup đã chấp nhận, đồng thời hỗ trợ BOT_TOKEN.
     const token =
-        process.env.DISCORD_TOKEN ||
-        process.env.TOKEN;
+        getEnvValue('DISCORD_TOKEN', 'TOKEN', 'BOT_TOKEN');
 
+    // Khi ClientReady đã chạy, client.user.id chính là Application/Bot ID.
+    // CLIENT_ID vẫn được hỗ trợ để tương thích config cũ.
     const clientId =
-        process.env.CLIENT_ID ||
-        process.env.APPLICATION_ID;
+        getEnvValue('CLIENT_ID', 'APPLICATION_ID') ||
+        client.user?.id ||
+        '';
 
-    if (!token || !clientId) {
-        console.error(
-            '❌ Thiếu DISCORD_TOKEN hoặc CLIENT_ID trong .env'
-        );
-        return;
+    const guildId = getEnvValue('GUILD_ID');
+
+    if (!token) {
+        console.error('❌ Không tìm thấy Discord token để đăng ký Slash Commands.');
+        return false;
+    }
+
+    if (!clientId) {
+        console.error('❌ Không xác định được CLIENT_ID/Application ID của bot.');
+        return false;
     }
 
     const rest =
         new REST({ version: '10' })
             .setToken(token);
 
+    const body = commands.map(c => c.toJSON());
+
     try {
-        if (process.env.GUILD_ID) {
+        if (guildId) {
+            // Guild command cập nhật gần như ngay lập tức.
             await rest.put(
-                Routes.applicationGuildCommands(
-                    clientId,
-                    process.env.GUILD_ID
-                ),
-                { body: commands.map(c => c.toJSON()) }
+                Routes.applicationGuildCommands(clientId, guildId),
+                { body }
+            );
+            console.log(
+                `✅ Đã đăng ký ${body.length} Slash Commands cho Guild ${guildId}.`
             );
         } else {
+            // Không có GUILD_ID thì đăng ký global command.
+            // Global command có thể mất thời gian Discord đồng bộ.
             await rest.put(
                 Routes.applicationCommands(clientId),
-                { body: commands.map(c => c.toJSON()) }
+                { body }
+            );
+            console.log(
+                `✅ Đã đăng ký ${body.length} Slash Commands GLOBAL cho Application ${clientId}.`
             );
         }
 
-        console.log(`✅ Đã đăng ký ${commands.length} Slash Commands thành công!`);
+        console.log(
+            `🧩 [COMMANDS] Application=${clientId} Guild=${guildId || 'GLOBAL'} Count=${body.length}`
+        );
+        return true;
     } catch (error) {
         console.error(
             '❌ Lỗi đăng ký command:',
-            error
+            `code=${error?.code ?? 'unknown'}`,
+            error?.message || error
         );
+        return false;
     }
 }
 
@@ -4241,7 +4262,13 @@ client.once(Events.ClientReady, async c => {
 
     console.log(`📦 [STARTUP] Money stock: ${currentStockM}M$`);
     console.log(`🧩 [STARTUP] Panel config: channel=${moneyConfig?.channelId || 'none'} message=${moneyConfig?.messageId || 'none'}`);
-    await registerSlashCommands();
+
+    // Đăng ký command trước các tác vụ panel để command sẵn sàng sớm nhất.
+    const commandsReady = await registerSlashCommands();
+    if (!commandsReady) {
+        console.error('⚠️ [STARTUP] Slash Commands chưa đăng ký được. Bot vẫn online nhưng /lệnh sẽ không hoạt động cho tới khi đăng ký thành công.');
+    }
+
     await updateAutoBuyPanel();
     await updateSpawnerPanel();
 });
