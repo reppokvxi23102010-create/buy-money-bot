@@ -4310,12 +4310,14 @@ function getEnvValue(...names) {
 }
 
 const botToken = getEnvValue('DISCORD_TOKEN', 'TOKEN', 'BOT_TOKEN');
+const discordClientId = getEnvValue('CLIENT_ID', 'APPLICATION_ID');
 
 console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
 console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
 console.log(`🟢 Node.js: ${process.version}`);
 console.log(`📡 PORT: ${PORT}`);
 console.log(`🔐 Discord token: ${botToken ? 'FOUND' : 'MISSING'}`);
+console.log(`🆔 Client ID env: ${discordClientId ? 'FOUND' : 'MISSING (sẽ tự lấy từ bot)'}`);
 console.log('🌐 DNS mode: IPv4-first');
 
 client.on(Events.Error, err => {
@@ -4336,24 +4338,76 @@ client.on(Events.ShardReconnecting, shardId => {
     console.warn(`🔄 [Discord] Đang kết nối lại shard ${shardId}...`);
 });
 
+if (Events.Debug) {
+    client.on(Events.Debug, info => {
+        const text = String(info || '');
+        if (
+            /connecting|connected|session|identify|heartbeat|resume|gateway|ratelimit/i.test(text)
+        ) {
+            console.log(`🛰️ [Discord Debug] ${text}`);
+        }
+    });
+}
+
+client.on(Events.Warn, info => {
+    console.warn(`⚠️ [Discord Warn] ${String(info || '')}`);
+});
+
+function withTimeout(promise, ms, label) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            const timer = setTimeout(() => {
+                const err = new Error(`${label} quá thời gian ${ms}ms.`);
+                err.code = 'STARTUP_TIMEOUT';
+                reject(err);
+            }, ms);
+            if (typeof timer.unref === 'function') timer.unref();
+        })
+    ]);
+}
+
 async function startDiscord() {
     if (!botToken) {
         throw new Error('Không tìm thấy Discord token trong Environment Variables.');
     }
 
-    console.log('📡 [1/3] Đang kết nối Discord Gateway...');
-    console.log('ℹ️ Không gọi /gateway/bot trước để tránh làm tăng Discord global rate-limit.');
+    // Token Discord thường dài hơn 50 ký tự. Không log token thật.
+    if (botToken.length < 50) {
+        console.warn(`⚠️ Token có độ dài bất thường (${botToken.length} ký tự). Hãy kiểm tra lại Render Environment Variables.`);
+    }
 
-    // Để discord.js tự quản lý Gateway handshake/login timeout.
-    // Không tự tạo retry vòng lặp vì reconnect liên tục có thể làm tình trạng rate-limit nặng hơn.
-    await client.login(botToken);
+    console.log('📡 [1/3] Đang kết nối Discord Gateway...');
+    console.log('ℹ️ Chờ tối đa 30 giây cho Gateway handshake. Nếu quá thời gian sẽ thoát để Render tự restart.');
+
+    try {
+        await withTimeout(client.login(botToken), 30_000, 'Discord Gateway login');
+    } catch (err) {
+        try {
+            client.destroy();
+        } catch {}
+        throw err;
+    }
 
     console.log('✅ [2/3] Discord login request hoàn tất.');
 
+    // `login()` có thể hoàn tất trước event ClientReady trong một số phiên bản.
     if (client.isReady()) {
-        console.log(`✅ [3/3] BOT ONLINE: ${client.user.tag}`);
+        console.log(`✅ [3/3] BOT ONLINE: ${client.user.tag} (ID: ${client.user.id})`);
     } else {
         console.log('⏳ Discord login đã tạo kết nối; chờ event ClientReady...');
+
+        await withTimeout(
+            new Promise(resolve => {
+                const onReady = () => {
+                    client.off(Events.ClientReady, onReady);
+                    resolve();
+                };
+                client.once(Events.ClientReady, onReady);
+            }),
+            15_000,
+            'ClientReady'
+        );
     }
 }
 
@@ -4364,18 +4418,21 @@ startDiscord().catch(err => {
 
     if (code === 4014 || /disallowed intent/i.test(message)) {
         console.error(
-            '🚨 Bật MESSAGE CONTENT INTENT trong Discord Developer Portal → Bot → Privileged Gateway Intents.'
+            '🚨 Discord từ chối Gateway vì Privileged Intent. Vào Discord Developer Portal → Bot → Privileged Gateway Intents và bật MESSAGE CONTENT INTENT.'
         );
     }
 
     if (/401|unauthorized|invalid token|code=4004/i.test(message)) {
-        console.error('🚨 DISCORD_TOKEN không hợp lệ. Hãy tạo/copy lại Bot Token.');
+        console.error('🚨 Discord Token không hợp lệ. Hãy tạo/copy lại Bot Token và cập nhật Render Environment Variables.');
+    }
+
+    if (code === 'STARTUP_TIMEOUT' || /timeout/i.test(message)) {
+        console.error('🚨 Gateway không phản hồi trong thời gian cho phép. Kiểm tra Bot Token, Discord Gateway và network của Render.');
     }
 
     if (err?.status === 429 || /429|rate limit|temporarily due to exceeding global rate limits/i.test(message)) {
-        console.error('🚨 Discord đang rate-limit/chặn tạm thời IP của Render. KHÔNG restart liên tục; chờ cooldown rồi deploy lại 1 lần.');
+        console.error('🚨 Discord đang rate-limit/chặn tạm thời IP của Render. Không restart liên tục.');
     }
 
     process.exit(1);
 });
-
