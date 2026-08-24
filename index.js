@@ -4288,68 +4288,25 @@ client.on(Events.ShardReconnecting, shardId => {
     console.warn(`🔄 [Discord] Đang kết nối lại shard ${shardId}...`);
 });
 
-function discordRestProbe(token) {
-    return new Promise((resolve, reject) => {
-        const req = https.request({
-            hostname: 'discord.com',
-            path: '/api/v10/gateway/bot',
-            method: 'GET',
-            headers: {
-                Authorization: `Bot ${token}`,
-                'User-Agent': 'KingsMP-Bot/1.0'
-            },
-            timeout: 10000
-        }, res => {
-            let body = '';
-            res.setEncoding('utf8');
-            res.on('data', chunk => { body += chunk; });
-            res.on('end', () => {
-                if (res.statusCode !== 200) {
-                    reject(new Error(
-                        `Discord REST /gateway/bot trả HTTP ${res.statusCode}: ${body.slice(0, 300)}`
-                    ));
-                    return;
-                }
-                try {
-                    resolve(JSON.parse(body));
-                } catch {
-                    reject(new Error('Discord REST trả dữ liệu không hợp lệ.'));
-                }
-            });
-        });
-        req.on('timeout', () => req.destroy(new Error('Discord REST probe timeout 10s')));
-        req.on('error', reject);
-        req.end();
-    });
-}
-
 async function startDiscord() {
     if (!botToken) {
         throw new Error('Không tìm thấy Discord token trong Environment Variables.');
     }
 
-    console.log('🧪 [1/5] Kiểm tra HTTPS tới Discord...');
-    const gatewayInfo = await discordRestProbe(botToken);
-    console.log(
-        `✅ [2/5] Discord REST OK. Gateway=${gatewayInfo.url}, shards=${gatewayInfo.shards}, sessions còn=${gatewayInfo.session_start_limit?.remaining ?? 'unknown'}`
-    );
+    console.log('📡 [1/3] Đang kết nối Discord Gateway...');
+    console.log('ℹ️ Không gọi /gateway/bot trước để tránh làm tăng Discord global rate-limit.');
 
-    console.log('📡 [3/5] Đang kết nối Discord Gateway...');
-    const loginPromise = client.login(botToken);
+    // Để discord.js tự quản lý Gateway handshake/login timeout.
+    // Không tự tạo retry vòng lặp vì reconnect liên tục có thể làm tình trạng rate-limit nặng hơn.
+    await client.login(botToken);
 
-    await Promise.race([
-        loginPromise,
-        new Promise((_, reject) => setTimeout(() => {
-            const err = new Error(
-                'Discord Gateway không READY sau 45 giây. REST đã OK nhưng WebSocket Gateway không hoàn tất.'
-            );
-            err.code = 'GATEWAY_READY_TIMEOUT';
-            reject(err);
-        }, 45000))
-    ]);
+    console.log('✅ [2/3] Discord login request hoàn tất.');
 
-    console.log('✅ [4/5] Discord login request hoàn tất.');
-    console.log(`✅ [5/5] BOT ONLINE: ${client.user?.tag || 'đang chờ READY'}`);
+    if (client.isReady()) {
+        console.log(`✅ [3/3] BOT ONLINE: ${client.user.tag}`);
+    } else {
+        console.log('⏳ Discord login đã tạo kết nối; chờ event ClientReady...');
+    }
 }
 
 startDiscord().catch(err => {
@@ -4367,10 +4324,8 @@ startDiscord().catch(err => {
         console.error('🚨 DISCORD_TOKEN không hợp lệ. Hãy tạo/copy lại Bot Token.');
     }
 
-    if (code === 'GATEWAY_READY_TIMEOUT') {
-        console.error(
-            '🚨 REST tới Discord hoạt động nhưng Gateway WebSocket bị timeout. Bản này đã ép IPv4-first; nếu vẫn lỗi, vấn đề nằm ở kết nối outbound/WebSocket của instance Render.'
-        );
+    if (err?.status === 429 || /429|rate limit|temporarily due to exceeding global rate limits/i.test(message)) {
+        console.error('🚨 Discord đang rate-limit/chặn tạm thời IP của Render. KHÔNG restart liên tục; chờ cooldown rồi deploy lại 1 lần.');
     }
 
     process.exit(1);
