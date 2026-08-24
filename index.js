@@ -42,17 +42,13 @@ const {
 } = require('discord.js');
 
 // ============================================================
-// 1. WEB SERVER
+// 1. RENDER / HTTP HEALTH SERVER
 // ============================================================
 
-const PORT = process.env.PORT || 10000;
+const PORT = Number(process.env.PORT) || 10000;
 
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('SMP BOT AutoBuy Money + Account đang hoạt động 24/7!');
-}).listen(PORT, () => {
-    console.log(`[HTTP Server] Đã mở cổng thành công trên Port: ${PORT}`);
-});
+// Chỉ tạo 1 HTTP server duy nhất. Render yêu cầu service lắng nghe PORT.
+// Server thật được tạo ở cuối file sau khi các biến startup đã sẵn sàng.
 
 // ============================================================
 // 2. CLIENT
