@@ -72,7 +72,14 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent
     ],
-    failIfNotExists: false
+    failIfNotExists: false,
+    // Render/Discord có thể mất thêm thời gian ở bước WebSocket handshake.
+    // Các giá trị này chỉ áp dụng cho Gateway WebSocket của discord.js.
+    ws: {
+        handshakeTimeout: 60000,
+        helloTimeout: 60000,
+        readyTimeout: 30000
+    }
 });
 
 // ============================================================
@@ -4310,14 +4317,12 @@ function getEnvValue(...names) {
 }
 
 const botToken = getEnvValue('DISCORD_TOKEN', 'TOKEN', 'BOT_TOKEN');
-const discordClientId = getEnvValue('CLIENT_ID', 'APPLICATION_ID');
 
 console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
 console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
 console.log(`🟢 Node.js: ${process.version}`);
 console.log(`📡 PORT: ${PORT}`);
 console.log(`🔐 Discord token: ${botToken ? 'FOUND' : 'MISSING'}`);
-console.log(`🆔 Client ID env: ${discordClientId ? 'FOUND' : 'MISSING (sẽ tự lấy từ bot)'}`);
 console.log('🌐 DNS mode: IPv4-first');
 
 client.on(Events.Error, err => {
@@ -4338,33 +4343,71 @@ client.on(Events.ShardReconnecting, shardId => {
     console.warn(`🔄 [Discord] Đang kết nối lại shard ${shardId}...`);
 });
 
-if (Events.Debug) {
-    client.on(Events.Debug, info => {
-        const text = String(info || '');
-        if (
-            /connecting|connected|session|identify|heartbeat|resume|gateway|ratelimit/i.test(text)
-        ) {
-            console.log(`🛰️ [Discord Debug] ${text}`);
-        }
+function httpGetDiscord(pathname, timeoutMs = 10000) {
+    return new Promise((resolve, reject) => {
+        const req = https.get({
+            hostname: 'discord.com',
+            path: pathname,
+            method: 'GET',
+            family: 4,
+            headers: {
+                'User-Agent': `KingSMP-Bot/1.0 Node/${process.version}`
+            }
+        }, res => {
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', chunk => { data += chunk; });
+            res.on('end', () => {
+                resolve({
+                    statusCode: res.statusCode || 0,
+                    body: data.slice(0, 1000)
+                });
+            });
+        });
+
+        req.setTimeout(timeoutMs, () => {
+            req.destroy(new Error(`HTTPS timeout ${timeoutMs}ms`));
+        });
+
+        req.on('error', reject);
     });
 }
 
-client.on(Events.Warn, info => {
-    console.warn(`⚠️ [Discord Warn] ${String(info || '')}`);
-});
+async function discordNetworkPreflight() {
+    console.log('🧪 [Discord Preflight] Kiểm tra DNS gateway.discord.gg...');
 
-function withTimeout(promise, ms, label) {
-    return Promise.race([
-        promise,
-        new Promise((_, reject) => {
-            const timer = setTimeout(() => {
-                const err = new Error(`${label} quá thời gian ${ms}ms.`);
-                err.code = 'STARTUP_TIMEOUT';
-                reject(err);
-            }, ms);
-            if (typeof timer.unref === 'function') timer.unref();
-        })
-    ]);
+    const dnsResult = await new Promise((resolve, reject) => {
+        dns.lookup('gateway.discord.gg', { family: 4 }, (err, address, family) => {
+            if (err) return reject(err);
+            resolve({ address, family });
+        });
+    });
+
+    console.log(`✅ [Discord Preflight] gateway.discord.gg -> ${dnsResult.address} (IPv${dnsResult.family})`);
+
+    const gateway = await httpGetDiscord('/api/v10/gateway', 10000);
+    console.log(`✅ [Discord Preflight] HTTPS Discord API -> HTTP ${gateway.statusCode}`);
+
+    if (!gateway.statusCode || gateway.statusCode >= 500) {
+        throw new Error(`Discord HTTPS API không phản hồi ổn định (HTTP ${gateway.statusCode})`);
+    }
+}
+
+function isFatalDiscordAuthError(err) {
+    const code = String(err?.code ?? '');
+    const status = String(err?.status ?? '');
+    const message = String(err?.message ?? '').toLowerCase();
+
+    return (
+        code === '4004' ||
+        code === '4014' ||
+        status === '401' ||
+        /invalid token|unauthorized|disallowed intent|4014/.test(message)
+    );
+}
+
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function startDiscord() {
@@ -4372,42 +4415,44 @@ async function startDiscord() {
         throw new Error('Không tìm thấy Discord token trong Environment Variables.');
     }
 
-    // Token Discord thường dài hơn 50 ký tự. Không log token thật.
-    if (botToken.length < 50) {
-        console.warn(`⚠️ Token có độ dài bất thường (${botToken.length} ký tự). Hãy kiểm tra lại Render Environment Variables.`);
-    }
+    const maxAttempts = 5;
 
-    console.log('📡 [1/3] Đang kết nối Discord Gateway...');
-    console.log('ℹ️ Chờ tối đa 30 giây cho Gateway handshake. Nếu quá thời gian sẽ thoát để Render tự restart.');
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        console.log(`📡 [Discord] Kết nối Gateway lần ${attempt}/${maxAttempts}...`);
 
-    try {
-        await withTimeout(client.login(botToken), 30_000, 'Discord Gateway login');
-    } catch (err) {
         try {
-            client.destroy();
-        } catch {}
-        throw err;
-    }
+            await discordNetworkPreflight();
 
-    console.log('✅ [2/3] Discord login request hoàn tất.');
+            console.log('🔌 [Discord] Đang gọi client.login()...');
+            await client.login(botToken);
 
-    // `login()` có thể hoàn tất trước event ClientReady trong một số phiên bản.
-    if (client.isReady()) {
-        console.log(`✅ [3/3] BOT ONLINE: ${client.user.tag} (ID: ${client.user.id})`);
-    } else {
-        console.log('⏳ Discord login đã tạo kết nối; chờ event ClientReady...');
+            console.log('✅ [Discord] client.login() hoàn tất.');
+            return;
+        } catch (err) {
+            const code = err?.code ?? 'unknown';
+            const message = err?.message ?? String(err);
 
-        await withTimeout(
-            new Promise(resolve => {
-                const onReady = () => {
-                    client.off(Events.ClientReady, onReady);
-                    resolve();
-                };
-                client.once(Events.ClientReady, onReady);
-            }),
-            15_000,
-            'ClientReady'
-        );
+            console.error(`❌ [Discord] Kết nối thất bại [code=${code}]: ${message}`);
+
+            if (isFatalDiscordAuthError(err)) {
+                throw err;
+            }
+
+            try {
+                client.destroy();
+            } catch {}
+
+            if (attempt >= maxAttempts) {
+                throw new Error(`Discord Gateway không kết nối được sau ${maxAttempts} lần thử. Lỗi cuối: ${message}`);
+            }
+
+            const backoff = Math.min(60000, 5000 * 2 ** (attempt - 1));
+            const jitter = Math.floor(Math.random() * 2000);
+            const delay = backoff + jitter;
+
+            console.log(`⏳ [Discord] Chờ ${delay}ms rồi thử lại...`);
+            await wait(delay);
+        }
     }
 }
 
@@ -4418,20 +4463,16 @@ startDiscord().catch(err => {
 
     if (code === 4014 || /disallowed intent/i.test(message)) {
         console.error(
-            '🚨 Discord từ chối Gateway vì Privileged Intent. Vào Discord Developer Portal → Bot → Privileged Gateway Intents và bật MESSAGE CONTENT INTENT.'
+            '🚨 Bật MESSAGE CONTENT INTENT trong Discord Developer Portal → Bot → Privileged Gateway Intents.'
         );
     }
 
     if (/401|unauthorized|invalid token|code=4004/i.test(message)) {
-        console.error('🚨 Discord Token không hợp lệ. Hãy tạo/copy lại Bot Token và cập nhật Render Environment Variables.');
-    }
-
-    if (code === 'STARTUP_TIMEOUT' || /timeout/i.test(message)) {
-        console.error('🚨 Gateway không phản hồi trong thời gian cho phép. Kiểm tra Bot Token, Discord Gateway và network của Render.');
+        console.error('🚨 DISCORD_TOKEN không hợp lệ. Hãy tạo/copy lại Bot Token.');
     }
 
     if (err?.status === 429 || /429|rate limit|temporarily due to exceeding global rate limits/i.test(message)) {
-        console.error('🚨 Discord đang rate-limit/chặn tạm thời IP của Render. Không restart liên tục.');
+        console.error('🚨 Discord đang rate-limit. Giảm tần suất restart/deploy và để bot retry có backoff.');
     }
 
     process.exit(1);
