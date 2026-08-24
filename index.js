@@ -58,13 +58,16 @@ http.createServer((req, res) => {
 // 2. CLIENT
 // ============================================================
 
+// Chỉ bật các Intent mà bot thực sự sử dụng.
+// GuildMembers không được dùng trong code này nên bỏ để tránh 4014 khi
+// Server Members Intent chưa được bật trên Discord Developer Portal.
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers
-    ]
+        GatewayIntentBits.MessageContent
+    ],
+    failIfNotExists: false
 });
 
 // ============================================================
@@ -4239,22 +4242,74 @@ process.on('uncaughtException', err => {
 // 24. LOGIN
 // ============================================================
 
-const botToken =
-    process.env.DISCORD_TOKEN ||
-    process.env.TOKEN;
+// ============================================================
+// 24. LOGIN / STARTUP DIAGNOSTICS
+// ============================================================
+
+function getEnvValue(...names) {
+    for (const name of names) {
+        const value = process.env[name];
+        if (typeof value === 'string' && value.trim()) {
+            return value.trim().replace(/^['\"]|['\"]$/g, '');
+        }
+    }
+    return '';
+}
+
+const botToken = getEnvValue(
+    'DISCORD_TOKEN',
+    'TOKEN',
+    'BOT_TOKEN'
+);
 
 console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
 console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
+console.log(`🟢 Node.js: ${process.version}`);
+console.log(`📡 PORT: ${PORT}`);
+console.log(`🔐 Discord token: ${botToken ? 'FOUND' : 'MISSING'}`);
+
+client.on(Events.Error, err => {
+    console.error('❌ [Discord Client Error]:', err);
+});
+
+client.on(Events.ShardError, err => {
+    console.error('❌ [Discord Shard Error]:', err);
+});
+
+client.on(Events.ShardDisconnect, (event, shardId) => {
+    console.error(
+        `⚠️ [Discord Shard Disconnect] shard=${shardId} code=${event?.code ?? 'unknown'} reason=${event?.reason ?? 'unknown'}`
+    );
+});
+
+client.on(Events.ShardReconnecting, shardId => {
+    console.warn(`🔄 [Discord] Đang kết nối lại shard ${shardId}...`);
+});
 
 if (!botToken) {
-    console.error(
-        '❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong .env!'
-    );
+    console.error('❌ Không tìm thấy Discord token!');
+    console.error('👉 Render: tạo Environment Variable DISCORD_TOKEN = Bot Token trong Discord Developer Portal.');
+    console.error('👉 Local: tạo file .env với DISCORD_TOKEN=YOUR_BOT_TOKEN');
+    process.exitCode = 1;
 } else {
-    client.login(botToken).catch(err => {
-        console.error(
-            '❌ Login Discord thất bại:',
-            err.message
-        );
-    });
+    client.login(botToken)
+        .then(() => {
+            console.log('✅ Discord login request đã được gửi thành công.');
+        })
+        .catch(err => {
+            const code = err?.code ?? 'unknown';
+            const message = err?.message ?? String(err);
+
+            console.error(`❌ Login Discord thất bại [code=${code}]: ${message}`);
+
+            if (code === 4014 || /disallowed intent/i.test(message)) {
+                console.error('🚨 Discord từ chối Gateway Intent. Hãy vào Developer Portal → Bot → Privileged Gateway Intents và bật MESSAGE CONTENT INTENT.');
+            }
+
+            if (code === 0 || /token/i.test(message)) {
+                console.error('🚨 Kiểm tra lại DISCORD_TOKEN: phải là Bot Token mới, không phải Client Secret/Application ID.');
+            }
+
+            process.exitCode = 1;
+        });
 }
