@@ -82,6 +82,8 @@ const BANK_CONFIG = {
     ACCOUNT_NAME: 'TRAN HUU HAI SON'
 };
 
+const STOCK_FILE = path.join(__dirname, 'stock.json');
+const CONFIG_FILE = path.join(__dirname, 'config.json');
 
 const ACC_STOCK_FILE = path.join(__dirname, 'accounts.json');
 const ACC_DETAIL_FILE = path.join(__dirname, 'accounts_detail.json');
