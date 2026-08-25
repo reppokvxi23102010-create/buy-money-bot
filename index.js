@@ -85,6 +85,11 @@ const BANK_CONFIG = {
 const STOCK_FILE = path.join(__dirname, 'stock.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
+// Cấu hình quyền Admin cho Money + Account (không còn Spawner)
+const serverConfig = {
+    adminRoleId: process.env.ADMIN_ROLE_ID || "ID_ROLE_ADMIN_CUA_BAN"
+};
+
 const ACC_STOCK_FILE = path.join(__dirname, 'accounts.json');
 const ACC_DETAIL_FILE = path.join(__dirname, 'accounts_detail.json');
 
