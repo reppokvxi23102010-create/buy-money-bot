@@ -1,3 +1,19 @@
+// 1. Bắt tất cả các Promise bị reject mà không có .catch() (Lỗi API, SSL, Network)
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('⚠️ [Unhandled Rejection] Bắt được lỗi Promise chưa xử lý:');
+  console.error(reason);
+});
+
+// 2. Bắt các ngoại lệ đồng bộ chưa được bọc trong try-catch
+process.on('uncaughtException', (err, origin) => {
+  console.error('💥 [Uncaught Exception] Bắt được lỗi ngoại lệ toàn cục:');
+  console.error(err);
+});
+
+// 3. Giám sát ngoại lệ nâng cao (Tránh trình cắm khác làm đứt đoạn log)
+process.on('uncaughtExceptionMonitor', (err, origin) => {
+  console.error('🔍 [Exception Monitor]:', err);
+});
 require('dotenv').config();
 
 const http = require('http');
@@ -46,7 +62,9 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildPresences
     ]
 });
 
@@ -64,8 +82,6 @@ const BANK_CONFIG = {
     ACCOUNT_NAME: 'TRAN HUU HAI SON'
 };
 
-const STOCK_FILE = path.join(__dirname, 'stock.json');
-const CONFIG_FILE = path.join(__dirname, 'config.json');
 
 const ACC_STOCK_FILE = path.join(__dirname, 'accounts.json');
 const ACC_DETAIL_FILE = path.join(__dirname, 'accounts_detail.json');
@@ -202,7 +218,11 @@ function isAdminUser(interaction) {
             PermissionsBitField.Flags.Administrator
         );
 
-    return Boolean(isAdminId || hasAdminPerm);
+    const hasAdminRole =
+        serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN" &&
+        interaction.member?.roles?.cache?.has(serverConfig.adminRoleId);
+
+    return Boolean(isAdminId || hasAdminPerm || hasAdminRole);
 }
 
 function adminOverwrite(guildId) {
@@ -220,7 +240,7 @@ function adminOverwrite(guildId) {
 }
 
 // ============================================================
-// 7. MONEY DATA
+// 7. MONEY DATA & WORKING HOURS LOGIC
 // ============================================================
 
 function loadStock() {
@@ -254,6 +274,22 @@ function saveMoneyOrders(data) {
 let currentStockM = loadStock();
 let moneyConfig = loadMoneyConfig();
 let RATE = Number(moneyConfig.rate) > 0 ? Number(moneyConfig.rate) : 130;
+
+function isWithinWorkingHours() {
+    const config = loadMoneyConfig();
+    const start = config.workingHours?.start ?? 10;
+    const end = config.workingHours?.end ?? 22;
+
+    // Giờ GMT+7 (Việt Nam)
+    const now = new Date();
+    const currentHour = (now.getUTCHours() + 7) % 24;
+
+    if (start <= end) {
+        return currentHour >= start && currentHour < end;
+    } else {
+        return currentHour >= start || currentHour < end;
+    }
+}
 
 function formatStock(moneyM) {
     moneyM = Number(moneyM) || 0;
@@ -291,7 +327,6 @@ function parseCardValue(input) {
         str = str.slice(0, -1);
     }
 
-    // Hỗ trợ 10k, 20k, 10.000, 10,000
     str = str.replace(/,/g, '').replace(/\./g, '');
 
     const value = Number(str);
@@ -331,7 +366,6 @@ function parseMoneyToM(input) {
         return value * multiplier;
     }
 
-    // Cho phép nhập trực tiếp 1000000 = 1M
     return value >= 10000 ? value / 1000000 : value;
 }
 
@@ -342,6 +376,8 @@ function parseMoneyToM(input) {
 function buildAutoBuyEmbed() {
     const isOutOfStock = currentStockM <= 0;
     const stockText = formatStock(currentStockM);
+    const startHour = moneyConfig.workingHours?.start ?? 10;
+    const endHour = moneyConfig.workingHours?.end ?? 22;
 
     const embed = new EmbedBuilder()
         .setColor(isOutOfStock ? '#e74c3c' : '#2ecc71')
@@ -350,8 +386,9 @@ function buildAutoBuyEmbed() {
             `🟢 **Trạng thái:** ${
                 isOutOfStock
                     ? '🔴 **ĐÃ ĐÓNG BOT (HẾT KHO)**'
-                    : 'Hoạt động 24/7'
+                    : 'Hoạt động'
             }\n` +
+            `⏰ **Giờ làm việc:** \`${startHour}h00 - ${endHour}h00\`\n` +
             `💸 **Tỷ giá:** \`${RATE} VNĐ = 1M$\`\n` +
             `🎟️ **Thẻ cào:** Trừ ${CARD_DISCOUNT * 100}% mệnh giá\n` +
             `📦 **Kho:** \`${stockText}\`\n\n` +
@@ -401,7 +438,6 @@ function buildAutoBuyEmbed() {
 async function updateAutoBuyPanel() {
     console.log('🔧 [PANEL V3] Bắt đầu kiểm tra AutoBuy Panel...');
 
-    // Không có channelId thì chưa từng setup panel.
     if (!moneyConfig?.channelId) {
         console.log('ℹ️ [PANEL V3] Chưa có channelId. Dùng /setup để tạo panel.');
         return;
@@ -415,7 +451,6 @@ async function updateAutoBuyPanel() {
             return;
         }
 
-        // Có messageId thì thử sửa panel cũ.
         if (moneyConfig.messageId) {
             try {
                 const message = await channel.messages.fetch(String(moneyConfig.messageId));
@@ -449,13 +484,13 @@ async function updateAutoBuyPanel() {
             }
         }
 
-        // Xóa messageId cũ trước khi tạo panel mới.
         moneyConfig.messageId = null;
         saveMoneyConfig(moneyConfig);
 
         const newMessage = await channel.send(buildAutoBuyEmbed());
 
         moneyConfig = {
+            ...moneyConfig,
             channelId: channel.id,
             messageId: newMessage.id
         };
@@ -481,6 +516,7 @@ async function updateAutoBuyPanel() {
         );
     }
 }
+
 
 // ============================================================
 // 10. MONEY COMMANDS
@@ -576,6 +612,33 @@ async function handleMoneyCommand(interaction) {
             });
         }
     }
+
+    if (interaction.commandName === 'time') {
+        if (!(await safeDeferReply(interaction, {
+            flags: MessageFlags.Ephemeral
+        }))) return;
+
+        try {
+            const start = interaction.options.getInteger('start');
+            const end = interaction.options.getInteger('end');
+
+            moneyConfig.workingHours = {
+                start,
+                end
+            };
+            saveMoneyConfig(moneyConfig);
+
+            await updateAutoBuyPanel();
+
+            return safeEditReply(interaction, {
+                content: `✅ Đã cập nhật khung giờ làm việc thành: **${start}h00 - ${end}h00**`
+            });
+        } catch (err) {
+            return safeEditReply(interaction, {
+                content: `❌ Lỗi khi cập nhật giờ: \`${err.message}\``
+            });
+        }
+    }
 }
 
 // ============================================================
@@ -584,10 +647,6 @@ async function handleMoneyCommand(interaction) {
 
 async function handleMoneyButton(interaction) {
     const id = interaction.customId;
-
-    // ========================================================
-    // APPROVE / REJECT MONEY ORDER
-    // ========================================================
 
     if (
         id.startsWith('money_approve_') ||
@@ -600,9 +659,6 @@ async function handleMoneyButton(interaction) {
             });
         }
 
-        // QUAN TRỌNG:
-        // Nếu Discord đã acknowledge interaction ở process khác,
-        // safeDeferUpdate sẽ bắt lỗi 40060 và không làm bot crash.
         if (!(await safeDeferUpdate(interaction))) return;
 
         const isApprove = id.startsWith('money_approve_');
@@ -621,7 +677,6 @@ async function handleMoneyButton(interaction) {
             });
         }
 
-        // Không cho xử lý lại đơn đã duyệt.
         if (order.status === 'approved') {
             return safeEditReply(interaction, {
                 content: `⚠️ Đơn \`${orderId}\` đã được duyệt trước đó.`,
@@ -646,7 +701,6 @@ async function handleMoneyButton(interaction) {
                 });
             }
 
-            // Trừ stock đúng 1 lần.
             currentStockM -= order.amountM;
             saveStock(currentStockM);
 
@@ -724,10 +778,6 @@ async function handleMoneyButton(interaction) {
             return;
         }
 
-        // ====================================================
-        // REJECT
-        // ====================================================
-
         order.status = 'rejected';
         order.rejectedBy = interaction.user.id;
         order.rejectedAt = Date.now();
@@ -779,8 +829,17 @@ async function handleMoneyButton(interaction) {
     }
 
     // ========================================================
-    // NORMAL MONEY BUTTONS
+    // CHECK GIỜ LÀM VIỆC & STOCK KHI BẤM NÚT MUA
     // ========================================================
+
+    if (!isWithinWorkingHours() && id !== 'guide') {
+        const startHour = moneyConfig.workingHours?.start ?? 10;
+        const endHour = moneyConfig.workingHours?.end ?? 22;
+        return safeReply(interaction, {
+            content: `🛑 **Shop hiện đã đóng cửa!**\n⏰ Giờ hoạt động của Bot: **${startHour}h00 - ${endHour}h00**. Vui lòng quay lại sau!`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
 
     if (currentStockM <= 0 && id !== 'guide') {
         return safeReply(interaction, {
@@ -906,9 +965,12 @@ async function handleMoneyButton(interaction) {
     }
 
     if (id === 'guide') {
+        const startHour = moneyConfig.workingHours?.start ?? 10;
+        const endHour = moneyConfig.workingHours?.end ?? 22;
         return safeReply(interaction, {
             content:
                 `📖 **HƯỚNG DẪN MUA MONEY KINGSMP**\n\n` +
+                `• Giờ hoạt động: **${startHour}h00 - ${endHour}h00**\n` +
                 `• Rate Bank: **${RATE} VNĐ = 1M$**\n` +
                 `• Thẻ cào: trừ **20%**\n` +
                 `• Kho hiện tại: **${formatStock(currentStockM)}**`,
@@ -922,10 +984,6 @@ async function handleMoneyButton(interaction) {
 // ============================================================
 
 async function handleMoneyModal(interaction) {
-    // ========================================================
-    // BANK
-    // ========================================================
-
     if (interaction.customId === 'modal_bank') {
         const ign = interaction.fields
             .getTextInputValue('bank_name')
@@ -1097,7 +1155,6 @@ async function handleMoneyModal(interaction) {
             orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
             saveMoneyOrders(orders);
 
-            // 🔔 THÔNG BÁO ADMIN KHI CÓ TICKET MONEY MỚI
             let adminNotified = false;
             if (process.env.LOG_CHANNEL_ID) {
                 try {
@@ -1116,7 +1173,6 @@ async function handleMoneyModal(interaction) {
                 }
             }
 
-            // Nếu không có LOG_CHANNEL_ID hoặc log lỗi thì DM Admin.
             if (!adminNotified && process.env.ADMIN_DISCORD_ID) {
                 try {
                     const adminUser = await client.users.fetch(process.env.ADMIN_DISCORD_ID);
@@ -1147,10 +1203,6 @@ async function handleMoneyModal(interaction) {
             });
         }
     }
-
-    // ========================================================
-    // CARD
-    // ========================================================
 
     if (interaction.customId === 'modal_card') {
         const ign = interaction.fields
@@ -1227,8 +1279,6 @@ async function handleMoneyModal(interaction) {
             cardValueVnd,
             netVnd,
             amountM: moneyReceivedM,
-            // Lưu PIN/seri để Admin xử lý.
-            // Không log các dữ liệu này ra console.
             cardCode: code,
             cardSeri: seri,
             status: 'pending',
@@ -1334,7 +1384,6 @@ async function handleMoneyModal(interaction) {
             orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
             saveMoneyOrders(orders);
 
-            // 🔔 THÔNG BÁO ADMIN KHI CÓ TICKET THẺ MỚI
             let adminNotified = false;
             if (process.env.LOG_CHANNEL_ID) {
                 try {
@@ -1384,10 +1433,6 @@ async function handleMoneyModal(interaction) {
             });
         }
     }
-
-    // ========================================================
-    // CALCULATOR
-    // ========================================================
 
     if (interaction.customId === 'modal_calc') {
         const rawInput =
@@ -1495,7 +1540,6 @@ function createAccEmbed(acc) {
     return embed;
 }
 
-
 async function updateAccListingMessage(acc) {
     if (!acc?.channelId || !acc?.messageId) {
         console.log(`⚠️ Không có channelId/messageId để cập nhật listing: ${acc?.username || acc?.id}`);
@@ -1582,10 +1626,6 @@ async function handleAccCommand(interaction) {
         });
     }
 
-    // ========================================================
-    // SET STOCK ACCOUNT
-    // ========================================================
-
     if (interaction.commandName === 'setstockacc') {
         if (!(await safeDeferReply(interaction, {
             flags: MessageFlags.Ephemeral
@@ -1632,10 +1672,6 @@ async function handleAccCommand(interaction) {
         });
     }
 
-    // ========================================================
-    // ACC
-    // ========================================================
-
     if (interaction.commandName === 'acc') {
         if (!(await safeDeferReply(interaction, {
             flags: MessageFlags.Ephemeral
@@ -1678,10 +1714,6 @@ async function handleAccCommand(interaction) {
         });
     }
 
-    // ========================================================
-    // DELETE ACC
-    // ========================================================
-
     if (interaction.commandName === 'deleteacc') {
         if (!(await safeDeferReply(interaction, {
             flags: MessageFlags.Ephemeral
@@ -1722,10 +1754,6 @@ async function handleAccCommand(interaction) {
             ]
         });
     }
-
-    // ========================================================
-    // THONGTIN
-    // ========================================================
 
     if (interaction.commandName === 'thongtin') {
         if (!(await safeDeferReply(interaction, {
@@ -1795,17 +1823,18 @@ async function handleAccCommand(interaction) {
         });
     }
 
-    // ========================================================
-    // PRICE
-    // ========================================================
-
     if (interaction.commandName === 'price') {
         if (!(await safeDeferReply(interaction, {
             flags: MessageFlags.Ephemeral
         }))) return;
 
-        const username =
-            interaction.options.getString('username').trim();
+        const username = interaction.options.getString('username').trim();
+
+        if (!username) {
+            return safeEditReply(interaction, {
+                content: '❌ Username không được để trống!'
+            });
+        }
 
         const newBank =
             interaction.options.getInteger('price_bank');
@@ -1844,10 +1873,6 @@ async function handleAccCommand(interaction) {
                 `✅ Đã cập nhật giá cho Acc \`${username}\`!`
         });
     }
-
-    // ========================================================
-    // CAPE
-    // ========================================================
 
     if (interaction.commandName === 'cape') {
         if (!(await safeDeferReply(interaction, {
@@ -1902,10 +1927,6 @@ async function handleAccCommand(interaction) {
 // ============================================================
 
 async function handleAccSelectMenu(interaction) {
-    // ========================================================
-    // DELETE
-    // ========================================================
-
     if (interaction.customId === 'select_delete_acc_menu') {
         if (!isAdminUser(interaction)) {
             return safeReply(interaction, {
@@ -1952,10 +1973,6 @@ async function handleAccSelectMenu(interaction) {
             components: [confirmRow]
         });
     }
-
-    // ========================================================
-    // MANUAL TAKE ACC
-    // ========================================================
 
     if (interaction.customId === 'select_stock_acc_manual') {
         if (!isAdminUser(interaction)) {
@@ -2014,10 +2031,6 @@ async function handleAccSelectMenu(interaction) {
             components: []
         });
     }
-
-    // ========================================================
-    // DELIVER ACC
-    // ========================================================
 
     if (interaction.customId.startsWith('select_deliver_acc_')) {
         if (!isAdminUser(interaction)) {
@@ -2092,8 +2105,6 @@ async function handleAccSelectMenu(interaction) {
 
         saveDetailedAccs(accs);
 
-        // CỰC QUAN TRỌNG: cập nhật bài đăng gốc ngay sau khi giao acc.
-        // Nếu không có bước này, bài đăng vẫn hiển thị "🟢 Có Sẵn".
         await updateAccListingMessage(target);
 
         const closeRow = new ActionRowBuilder().addComponents(
@@ -2170,10 +2181,6 @@ async function handleAccSelectMenu(interaction) {
 async function handleAccButton(interaction) {
     const id = interaction.customId;
 
-    // ========================================================
-    // DELETE CONFIRM
-    // ========================================================
-
     if (id.startsWith('confirm_delete_')) {
         if (!isAdminUser(interaction)) {
             return safeReply(interaction, {
@@ -2213,10 +2220,6 @@ async function handleAccButton(interaction) {
         });
     }
 
-    // ========================================================
-    // CANCEL DELETE
-    // ========================================================
-
     if (id === 'cancel_delete') {
         if (!(await safeDeferUpdate(interaction))) return;
 
@@ -2226,11 +2229,16 @@ async function handleAccButton(interaction) {
         });
     }
 
-    // ========================================================
-    // BUY ACCOUNT
-    // ========================================================
-
     if (id.startsWith('buy_single_')) {
+        if (!isWithinWorkingHours()) {
+            const startHour = moneyConfig.workingHours?.start ?? 10;
+            const endHour = moneyConfig.workingHours?.end ?? 22;
+            return safeReply(interaction, {
+                content: `🛑 **Shop hiện đã đóng cửa!**\n⏰ Giờ hoạt động của Bot: **${startHour}h00 - ${endHour}h00**. Vui lòng quay lại sau!`,
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
         if (!(await safeDeferReply(interaction, {
             flags: MessageFlags.Ephemeral
         }))) return;
@@ -2365,7 +2373,6 @@ async function handleAccButton(interaction) {
                     `👉 ${ticketChannel}`
             });
         } catch (err) {
-            // Nếu tạo ticket thất bại thì trả acc về available.
             target.status = 'available';
             target.pendingTicketId = null;
             target.pendingBuyerId = null;
@@ -2377,10 +2384,6 @@ async function handleAccButton(interaction) {
             });
         }
     }
-
-    // ========================================================
-    // APPROVE ACCOUNT BILL
-    // ========================================================
 
     if (id === 'approve_bill') {
         if (!isAdminUser(interaction)) {
@@ -2475,10 +2478,6 @@ async function handleAccButton(interaction) {
         });
     }
 
-    // ========================================================
-    // REJECT ACCOUNT BILL
-    // ========================================================
-
     if (id === 'reject_bill') {
         if (!isAdminUser(interaction)) {
             return safeReply(interaction, {
@@ -2532,7 +2531,6 @@ async function handleCloseTicket(interaction) {
     const topic =
         interaction.channel?.topic || '';
 
-    // Nếu là ticket Account đang pending thì trả sản phẩm về kho.
     if (topic.startsWith('accOrder:')) {
         const accId =
             topic.replace('accOrder:', '');
@@ -2564,6 +2562,7 @@ async function handleCloseTicket(interaction) {
     }, 5000);
 }
 
+
 // ============================================================
 // 18. SLASH COMMANDS
 // ============================================================
@@ -2571,7 +2570,8 @@ async function handleCloseTicket(interaction) {
 const MONEY_COMMAND_NAMES = [
     'setup',
     'setstock',
-    'rate'
+    'rate',
+    'time'
 ];
 
 const ACC_COMMAND_NAMES = [
@@ -2613,6 +2613,26 @@ const commands = [
                 .setName('value')
                 .setDescription('Rate mới, ví dụ: 130')
                 .setMinValue(1)
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('time')
+        .setDescription('Cài đặt giờ hoạt động của Bot (Giờ GMT+7)')
+        .addIntegerOption(opt =>
+            opt
+                .setName('start')
+                .setDescription('Giờ bắt đầu (0-23), ví dụ: 10')
+                .setMinValue(0)
+                .setMaxValue(23)
+                .setRequired(true)
+        )
+        .addIntegerOption(opt =>
+            opt
+                .setName('end')
+                .setDescription('Giờ kết thúc (0-23), ví dụ: 22')
+                .setMinValue(0)
+                .setMaxValue(23)
                 .setRequired(true)
         ),
 
@@ -2800,7 +2820,6 @@ client.on(Events.MessageCreate, async message => {
         const contentLower =
             message.content.toLowerCase();
 
-        // Stock keyword
         if (
             contentLower.includes('sell') ||
             contentLower.includes('stock')
@@ -2832,7 +2851,6 @@ client.on(Events.MessageCreate, async message => {
             });
         }
 
-        // Bill account
         if (
             message.channel.type === ChannelType.GuildText &&
             message.channel.name?.startsWith('ticket-') &&
@@ -2897,8 +2915,6 @@ client.on(Events.MessageCreate, async message => {
 
 client.on(Events.InteractionCreate, async interaction => {
     try {
-        // Cực kỳ quan trọng:
-        // Một interaction chỉ được xử lý 1 lần trong process.
         if (!claimInteraction(interaction)) {
             console.log(
                 `⚠️ Bỏ qua interaction trùng: ${interaction.id}`
@@ -2906,7 +2922,6 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        // Slash Commands
         if (interaction.isChatInputCommand()) {
             if (
                 MONEY_COMMAND_NAMES.includes(
@@ -2927,7 +2942,6 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        // Buttons
         if (interaction.isButton()) {
             const id = interaction.customId;
 
@@ -2961,7 +2975,6 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        // Select menus
         if (interaction.isStringSelectMenu()) {
             const id = interaction.customId;
 
@@ -2976,7 +2989,6 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        // Modals
         if (interaction.isModalSubmit()) {
             if (
                 [
