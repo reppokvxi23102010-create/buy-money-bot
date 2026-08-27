@@ -16,6 +16,11 @@ process.on('uncaughtExceptionMonitor', (err, origin) => {
 });
 require('dotenv').config();
 
+// Ticket staff IDs (fallbacks so the bot works even when .env is missing them).
+process.env.SELLER_ROLE_ID = (process.env.SELLER_ROLE_ID || '1531205202265247794').trim();
+process.env.BUILDER_ROLE_ID = (process.env.BUILDER_ROLE_ID || '1531202502681301094').trim();
+process.env.ADMIN_DISCORD_ID = (process.env.ADMIN_DISCORD_ID || '1516082552530800875').trim();
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -94,6 +99,7 @@ const ACC_STOCK_FILE = path.join(__dirname, 'accounts.json');
 const ACC_DETAIL_FILE = path.join(__dirname, 'accounts_detail.json');
 
 const MONEY_ORDERS_FILE = path.join(__dirname, 'money_orders.json');
+const TICKET_CONFIG_KEY = 'ticketPanel';
 
 // ============================================================
 // 4. SAFE JSON HELPERS
@@ -245,6 +251,213 @@ function adminOverwrite(guildId) {
         ]
     }];
 }
+
+function getTicketRoleId(type) {
+    const envMap = {
+        seller: 'SELLER_ROLE_ID',
+        builder: 'BUILDER_ROLE_ID'
+    };
+
+    const envKey = envMap[type];
+    return envKey ? (process.env[envKey] || '').trim() : '';
+}
+
+function getTicketAdminMention() {
+    return process.env.ADMIN_DISCORD_ID
+        ? `<@${process.env.ADMIN_DISCORD_ID}>`
+        : 'Admin';
+}
+
+function ticketRoleOverwrite(roleId) {
+    if (!roleId) return [];
+
+    return [{
+        id: roleId,
+        allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.AttachFiles
+        ]
+    }];
+}
+
+function loadTicketPanelConfig() {
+    const config = readJson(CONFIG_FILE, {});
+    return config?.[TICKET_CONFIG_KEY] || {};
+}
+
+function saveTicketPanelConfig(data) {
+    const config = readJson(CONFIG_FILE, {});
+    config[TICKET_CONFIG_KEY] = data || {};
+    saveMoneyConfig(config);
+}
+
+function buildTicketPanel() {
+    const embed = new EmbedBuilder()
+        .setColor('#5865F2')
+        .setTitle('🎫 HỖ TRỢ & DỊCH VỤ')
+        .setDescription(
+            'Bấm nút **Mở Menu Ticket** bên dưới để chọn đúng nhu cầu của bạn.\n\n' +
+            '🛒 **Mua vật phẩm KingSMP / DonutSMP** → Ping Seller\n' +
+            '🏗️ **Builder xây Farm / Stash** → Ping Builder\n' +
+            '🛠️ **Hỗ trợ Partner / Khác** → Ping Admin\n' +
+            '💎 **Thu mua Account Minecraft Premium** → Ping Admin'
+        )
+        .setFooter({ text: 'Vui lòng chọn đúng mục để được hỗ trợ nhanh nhất.' })
+        .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('ticket_open_menu')
+            .setLabel('Mở Menu Ticket')
+            .setEmoji('🎫')
+            .setStyle(ButtonStyle.Primary)
+    );
+
+    return { embeds: [embed], components: [row] };
+}
+
+function buildTicketTypeMenu() {
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId('ticket_type_select')
+        .setPlaceholder('🎫 Chọn loại Ticket cần tạo...')
+        .addOptions(
+            new StringSelectMenuOptionBuilder()
+                .setLabel('Mua vật phẩm KingSMP / DonutSMP')
+                .setDescription('Tạo ticket và ping Seller')
+                .setEmoji('🛒')
+                .setValue('buy_items'),
+            new StringSelectMenuOptionBuilder()
+                .setLabel('Builder xây Farm / Stash')
+                .setDescription('Tạo ticket và ping Builder')
+                .setEmoji('🏗️')
+                .setValue('builder'),
+            new StringSelectMenuOptionBuilder()
+                .setLabel('Hỗ trợ Partner / Khác')
+                .setDescription('Tạo ticket và ping Admin')
+                .setEmoji('🛠️')
+                .setValue('support'),
+            new StringSelectMenuOptionBuilder()
+                .setLabel('Thu mua Account Minecraft Premium')
+                .setDescription('Tạo ticket và ping Admin')
+                .setEmoji('💎')
+                .setValue('buy_premium')
+        );
+
+    return new ActionRowBuilder().addComponents(menu);
+}
+
+function ticketTypeInfo(type) {
+    const map = {
+        buy_items: {
+            prefix: 'buy',
+            title: '🛒 MUA VẬT PHẨM KINGSM / DONUTSMP',
+            description: 'Seller sẽ tiếp nhận và hỗ trợ đơn mua vật phẩm của bạn.',
+            roleId: getTicketRoleId('seller'),
+            ping: getTicketRoleId('seller') ? `<@${getTicketRoleId('seller')}>` : 'Seller'
+        },
+        builder: {
+            prefix: 'builder',
+            title: '🏗️ BUILDER FARM / STASH',
+            description: 'Builder sẽ vào ticket để trao đổi yêu cầu xây dựng, giá và thời gian.',
+            roleId: getTicketRoleId('builder'),
+            ping: getTicketRoleId('builder') ? `<@${getTicketRoleId('builder')}>` : 'Builder'
+        },
+        support: {
+            prefix: 'support',
+            title: '🛠️ HỖ TRỢ PARTNER / KHÁC',
+            description: 'Admin sẽ tiếp nhận yêu cầu hỗ trợ của bạn.',
+            roleId: '',
+            ping: getTicketAdminMention()
+        },
+        buy_premium: {
+            prefix: 'premium',
+            title: '💎 THU MUA ACCOUNT MINECRAFT PREMIUM',
+            description: 'Admin sẽ kiểm tra và báo giá account Premium của bạn.',
+            roleId: '',
+            ping: getTicketAdminMention()
+        }
+    };
+
+    return map[type] || null;
+}
+
+async function createGeneralTicket(interaction, type) {
+    const info = ticketTypeInfo(type);
+    if (!info || !interaction.guild) {
+        return safeReply(interaction, {
+            content: '❌ Không xác định được loại Ticket.',
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    if (!(await safeDeferUpdate(interaction))) return;
+
+    const baseName = `${info.prefix}-${interaction.user.username}`
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]/g, '')
+        .slice(0, 65) || `${info.prefix}-ticket`;
+
+    try {
+        const ticketChannel = await interaction.guild.channels.create({
+            name: `ticket-${baseName}`,
+            type: ChannelType.GuildText,
+            permissionOverwrites: [
+                {
+                    id: interaction.guild.id,
+                    deny: [PermissionsBitField.Flags.ViewChannel]
+                },
+                {
+                    id: interaction.user.id,
+                    allow: [
+                        PermissionsBitField.Flags.ViewChannel,
+                        PermissionsBitField.Flags.SendMessages,
+                        PermissionsBitField.Flags.AttachFiles
+                    ]
+                },
+                ...ticketRoleOverwrite(info.roleId),
+                ...adminOverwrite(interaction.guild.id)
+            ]
+        });
+
+        await ticketChannel.setTopic(`generalTicket:${type}:${interaction.user.id}`);
+
+        const embed = new EmbedBuilder()
+            .setColor('#5865F2')
+            .setTitle(info.title)
+            .setDescription(
+                `Xin chào <@${interaction.user.id}>!\n\n` +
+                `${info.description}\n\n` +
+                `📌 **Người phụ trách:** ${info.ping}\n` +
+                '🔒 Khi hoàn tất, Admin có thể đóng ticket.'
+            )
+            .setFooter({ text: `Ticket của ${interaction.user.tag}` })
+            .setTimestamp();
+
+        const closeRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId('close_ticket')
+                .setLabel('Đóng Ticket')
+                .setEmoji('🔒')
+                .setStyle(ButtonStyle.Danger)
+        );
+
+        await ticketChannel.send({
+            content: `<@${interaction.user.id}> ${info.ping}`,
+            embeds: [embed],
+            components: [closeRow]
+        });
+
+        return safeEditReply(interaction, {
+            content: `✅ **Đã tạo Ticket!**\n👉 ${ticketChannel}`
+        });
+    } catch (err) {
+        return safeEditReply(interaction, {
+            content: `❌ Không thể tạo Ticket: \`${err.message}\``
+        });
+    }
+}
+
 
 // ============================================================
 // 7. MONEY DATA & WORKING HOURS LOGIC
@@ -1933,7 +2146,193 @@ async function handleAccCommand(interaction) {
 // 15. ACCOUNT SELECT MENUS
 // ============================================================
 
+async function createAccountPurchaseTicket(interaction, accId, paymentMethod) {
+    if (!isWithinWorkingHours()) {
+        const startHour = moneyConfig.workingHours?.start ?? 10;
+        const endHour = moneyConfig.workingHours?.end ?? 22;
+        return safeReply(interaction, {
+            content: `🛑 **Shop hiện đã đóng cửa!**\n⏰ Giờ hoạt động của Bot: **${startHour}h00 - ${endHour}h00**.`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    if (!(await safeDeferUpdate(interaction))) return;
+
+    const accs = getDetailedAccs();
+    const target = accs.find(a => a.id === accId);
+
+    if (!target || target.status !== 'available') {
+        return safeEditReply(interaction, {
+            content: '❌ Sản phẩm hiện không có sẵn hoặc đang được người khác mua.',
+            components: []
+        });
+    }
+
+    const guild = interaction.guild;
+    const channelName = `ticket-acc-${paymentMethod}-${interaction.user.username}`
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]/g, '')
+        .slice(0, 70);
+
+    try {
+        const ticketChannel = await guild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildText,
+            permissionOverwrites: [
+                {
+                    id: guild.id,
+                    deny: [PermissionsBitField.Flags.ViewChannel]
+                },
+                {
+                    id: interaction.user.id,
+                    allow: [
+                        PermissionsBitField.Flags.ViewChannel,
+                        PermissionsBitField.Flags.SendMessages,
+                        PermissionsBitField.Flags.AttachFiles
+                    ]
+                },
+                ...adminOverwrite(guild.id)
+            ]
+        });
+
+        await ticketChannel.setTopic(`accOrder:${target.id}`);
+
+        target.status = 'pending';
+        target.pendingTicketId = ticketChannel.id;
+        target.pendingBuyerId = interaction.user.id;
+        target.paymentMethod = paymentMethod;
+        saveDetailedAccs(accs);
+
+        const adminRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId('approve_bill')
+                .setLabel('Duyệt - Chọn Acc')
+                .setEmoji('✅')
+                .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+                .setCustomId('reject_bill')
+                .setLabel('Từ Chối')
+                .setEmoji('❌')
+                .setStyle(ButtonStyle.Danger),
+            new ButtonBuilder()
+                .setCustomId('close_ticket')
+                .setLabel('Đóng Ticket')
+                .setEmoji('🔒')
+                .setStyle(ButtonStyle.Secondary)
+        );
+
+        let payEmbed;
+
+        if (paymentMethod === 'bank') {
+            const memo = `THANH TOAN DON HANG ${target.username}`;
+            const qrUrl =
+                `https://img.vietqr.io/image/` +
+                `${BANK_CONFIG.BANK_ID}-${BANK_CONFIG.ACCOUNT_NO}-compact2.png` +
+                `?amount=${target.priceBank}` +
+                `&addInfo=${encodeURIComponent(memo)}` +
+                `&accountName=${encodeURIComponent(BANK_CONFIG.ACCOUNT_NAME)}`;
+
+            payEmbed = new EmbedBuilder()
+                .setTitle(`🏦 THANH TOÁN BANK: ${target.username}`)
+                .setColor('#2ecc71')
+                .setDescription(
+                    `Chào <@${interaction.user.id}>!\n` +
+                    'Vui lòng chuyển khoản đúng số tiền bên dưới và gửi ảnh bill vào ticket. '
+                )
+                .addFields(
+                    {
+                        name: '🏦 Ngân Hàng',
+                        value: `\`${BANK_CONFIG.BANK_ID}\``,
+                        inline: true
+                    },
+                    {
+                        name: '🔢 Số Tài Khoản',
+                        value: `\`${BANK_CONFIG.ACCOUNT_NO}\``,
+                        inline: true
+                    },
+                    {
+                        name: '👤 Chủ Tài Khoản',
+                        value: `\`${BANK_CONFIG.ACCOUNT_NAME}\``,
+                        inline: true
+                    },
+                    {
+                        name: '💵 Giá Bank',
+                        value: `\`${target.priceBank.toLocaleString('vi-VN')} VNĐ\``,
+                        inline: true
+                    },
+                    {
+                        name: '📌 Nội dung CK',
+                        value: `\`\`\`${memo}\`\`\``
+                    }
+                )
+                .setImage(qrUrl)
+                .setFooter({ text: 'Gửi ảnh bill sau khi chuyển khoản.' });
+        } else {
+            payEmbed = new EmbedBuilder()
+                .setTitle(`🎟️ THANH TOÁN THẺ: ${target.username}`)
+                .setColor('#f1c40f')
+                .setDescription(
+                    `Chào <@${interaction.user.id}>!\n` +
+                    'Vui lòng gửi **ảnh thẻ hoặc thông tin thẻ** vào ticket để Admin kiểm tra.'
+                )
+                .addFields(
+                    {
+                        name: '🎮 Account',
+                        value: `\`${target.username}\``,
+                        inline: true
+                    },
+                    {
+                        name: '🎟️ Giá Thẻ',
+                        value: `\`${target.priceCard.toLocaleString('vi-VN')} VNĐ\``,
+                        inline: true
+                    },
+                    {
+                        name: '📌 Cần gửi',
+                        value: 'Loại thẻ + Mã thẻ + Seri',
+                    }
+                )
+                .setFooter({ text: 'Admin sẽ kiểm tra thẻ trước khi duyệt.' });
+        }
+
+        await ticketChannel.send({
+            content: `<@${interaction.user.id}>`,
+            embeds: [payEmbed],
+            components: [adminRow]
+        });
+
+        return safeEditReply(interaction, {
+            content:
+                `✅ **Đã tạo Ticket mua Acc bằng ${paymentMethod === 'bank' ? 'Bank' : 'Card'}!**\n` +
+                `👉 ${ticketChannel}`,
+            components: []
+        });
+    } catch (err) {
+        target.status = 'available';
+        target.pendingTicketId = null;
+        target.pendingBuyerId = null;
+        target.paymentMethod = null;
+        saveDetailedAccs(accs);
+
+        return safeEditReply(interaction, {
+            content: `❌ Lỗi khi tạo Ticket: \`${err.message}\``,
+            components: []
+        });
+    }
+}
+
 async function handleAccSelectMenu(interaction) {
+    if (interaction.customId.startsWith('account_payment_')) {
+        const accId = interaction.customId.replace('account_payment_', '');
+        const paymentMethod = interaction.values[0];
+        if (!['bank', 'card'].includes(paymentMethod)) {
+            return safeReply(interaction, {
+                content: '❌ Phương thức thanh toán không hợp lệ.',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+        return createAccountPurchaseTicket(interaction, accId, paymentMethod);
+    }
+
     if (interaction.customId === 'select_delete_acc_menu') {
         if (!isAdminUser(interaction)) {
             return safeReply(interaction, {
@@ -2246,150 +2645,42 @@ async function handleAccButton(interaction) {
             });
         }
 
-        if (!(await safeDeferReply(interaction, {
-            flags: MessageFlags.Ephemeral
-        }))) return;
-
-        const accId =
-            id.replace('buy_single_', '');
-
+        const accId = id.replace('buy_single_', '');
         const accs = getDetailedAccs();
-
-        const target =
-            accs.find(a => a.id === accId);
+        const target = accs.find(a => a.id === accId);
 
         if (!target || target.status !== 'available') {
-            return safeEditReply(interaction, {
-                content:
-                    '❌ Sản phẩm hiện không có sẵn hoặc đang được người khác mua.'
+            return safeReply(interaction, {
+                content: '❌ Sản phẩm hiện không có sẵn hoặc đang được người khác mua.',
+                flags: MessageFlags.Ephemeral
             });
         }
 
-        const guild = interaction.guild;
-
-        const channelName =
-            `ticket-${interaction.user.username}`
-                .toLowerCase()
-                .replace(/[^a-z0-9-_]/g, '')
-                .slice(0, 70);
-
-        try {
-            const ticketChannel =
-                await guild.channels.create({
-                    name: channelName,
-                    type: ChannelType.GuildText,
-
-                    permissionOverwrites: [
-                        {
-                            id: guild.id,
-                            deny: [
-                                PermissionsBitField.Flags.ViewChannel
-                            ]
-                        },
-                        {
-                            id: interaction.user.id,
-                            allow: [
-                                PermissionsBitField.Flags.ViewChannel,
-                                PermissionsBitField.Flags.SendMessages,
-                                PermissionsBitField.Flags.AttachFiles
-                            ]
-                        },
-                        ...adminOverwrite(guild.id)
-                    ]
-                });
-
-            await ticketChannel.setTopic(
-                `accOrder:${target.id}`
+        const paymentMenu = new StringSelectMenuBuilder()
+            .setCustomId(`account_payment_${target.id}`)
+            .setPlaceholder('💳 Chọn phương thức thanh toán...')
+            .addOptions(
+                new StringSelectMenuOptionBuilder()
+                    .setLabel(`Ngân hàng — ${target.priceBank.toLocaleString('vi-VN')} VNĐ`)
+                    .setDescription('Thanh toán bằng chuyển khoản ngân hàng')
+                    .setEmoji('🏦')
+                    .setValue('bank'),
+                new StringSelectMenuOptionBuilder()
+                    .setLabel(`Thẻ cào — ${target.priceCard.toLocaleString('vi-VN')} VNĐ`)
+                    .setDescription('Thanh toán bằng thẻ cào')
+                    .setEmoji('🎟️')
+                    .setValue('card')
             );
 
-            target.status = 'pending';
-            target.pendingTicketId = ticketChannel.id;
-            target.pendingBuyerId = interaction.user.id;
-
-            saveDetailedAccs(accs);
-
-            const addInfoEncoded =
-                encodeURIComponent(
-                    `THANH TOAN DON HANG ${target.username}`
-                );
-
-            const accountNameEncoded =
-                encodeURIComponent(
-                    BANK_CONFIG.ACCOUNT_NAME
-                );
-
-            const qrUrl =
-                `https://img.vietqr.io/image/` +
-                `${BANK_CONFIG.BANK_ID}-${BANK_CONFIG.ACCOUNT_NO}-compact2.png` +
-                `?amount=${target.priceBank}` +
-                `&addInfo=${addInfoEncoded}` +
-                `&accountName=${accountNameEncoded}`;
-
-            const payEmbed =
-                new EmbedBuilder()
-                    .setTitle(
-                        `💳 THANH TOÁN: ${target.username}`
-                    )
-                    .setColor('#2ecc71')
-                    .setDescription(
-                        'Vui lòng chuyển khoản đúng số tiền bên dưới.'
-                    )
-                    .addFields(
-                        {
-                            name: '🏦 Ngân Hàng',
-                            value: `\`${BANK_CONFIG.BANK_ID}\``,
-                            inline: true
-                        },
-                        {
-                            name: '🔢 Số Tài Khoản',
-                            value: `\`${BANK_CONFIG.ACCOUNT_NO}\``,
-                            inline: true
-                        },
-                        {
-                            name: '👤 Chủ Tài Khoản',
-                            value: `\`${BANK_CONFIG.ACCOUNT_NAME}\``,
-                            inline: true
-                        },
-                        {
-                            name: '💵 Giá Bank',
-                            value:
-                                `\`${target.priceBank.toLocaleString('vi-VN')} VNĐ\``,
-                            inline: true
-                        },
-                        {
-                            name: '📲 Giá Thẻ Cào',
-                            value:
-                                `\`${target.priceCard.toLocaleString('vi-VN')} VNĐ\``,
-                            inline: true
-                        }
-                    )
-                    .setImage(qrUrl)
-                    .setFooter({
-                        text:
-                            'Gửi ảnh Bill chuyển khoản vào kênh này sau khi thanh toán!'
-                    });
-
-            await ticketChannel.send({
-                content: `<@${interaction.user.id}>`,
-                embeds: [payEmbed]
-            });
-
-            return safeEditReply(interaction, {
-                content:
-                    `✅ **Đã tạo Ticket mua Acc!**\n` +
-                    `👉 ${ticketChannel}`
-            });
-        } catch (err) {
-            target.status = 'available';
-            target.pendingTicketId = null;
-            target.pendingBuyerId = null;
-            saveDetailedAccs(accs);
-
-            return safeEditReply(interaction, {
-                content:
-                    `❌ Lỗi khi tạo Ticket: \`${err.message}\``
-            });
-        }
+        return safeReply(interaction, {
+            content:
+                `🛒 **MUA ACCOUNT: ${target.username}**\n` +
+                `🏦 Bank: **${target.priceBank.toLocaleString('vi-VN')} VNĐ**\n` +
+                `🎟️ Card: **${target.priceCard.toLocaleString('vi-VN')} VNĐ**\n\n` +
+                'Vui lòng chọn phương thức thanh toán bên dưới:',
+            components: [new ActionRowBuilder().addComponents(paymentMenu)],
+            flags: MessageFlags.Ephemeral
+        });
     }
 
     if (id === 'approve_bill') {
@@ -2574,6 +2865,53 @@ async function handleCloseTicket(interaction) {
 // 18. SLASH COMMANDS
 // ============================================================
 
+async function handleTicketCommand(interaction) {
+    if (!isAdminUser(interaction)) {
+        return safeReply(interaction, {
+            content: '❌ Bạn không có quyền dùng lệnh này!',
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+
+    try {
+        const panelConfig = loadTicketPanelConfig();
+        let panelMessage = null;
+
+        if (
+            panelConfig.channelId === interaction.channelId &&
+            panelConfig.messageId
+        ) {
+            try {
+                panelMessage = await interaction.channel.messages.fetch(
+                    String(panelConfig.messageId)
+                );
+                await panelMessage.edit(buildTicketPanel());
+            } catch (err) {
+                panelMessage = null;
+            }
+        }
+
+        if (!panelMessage) {
+            panelMessage = await interaction.channel.send(buildTicketPanel());
+        }
+
+        saveTicketPanelConfig({
+            channelId: interaction.channelId,
+            messageId: panelMessage.id
+        });
+
+        return safeEditReply(interaction, {
+            content: `✅ Đã thiết lập **Bảng Ticket cố định** tại <#${interaction.channelId}>.`
+        });
+    } catch (err) {
+        return safeEditReply(interaction, {
+            content: `❌ Không thể setup Ticket: \`${err.message}\``
+        });
+    }
+}
+
 const MONEY_COMMAND_NAMES = [
     'setup',
     'setstock',
@@ -2591,6 +2929,10 @@ const ACC_COMMAND_NAMES = [
 ];
 
 const commands = [
+    new SlashCommandBuilder()
+        .setName('ticket')
+        .setDescription('Thiết lập bảng Ticket cố định'),
+
     // MONEY
     new SlashCommandBuilder()
         .setName('setup')
@@ -2930,6 +3272,10 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         if (interaction.isChatInputCommand()) {
+            if (interaction.commandName === 'ticket') {
+                return await handleTicketCommand(interaction);
+            }
+
             if (
                 MONEY_COMMAND_NAMES.includes(
                     interaction.commandName
@@ -2954,6 +3300,14 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (id === 'close_ticket') {
                 return await handleCloseTicket(interaction);
+            }
+
+            if (id === 'ticket_open_menu') {
+                return safeReply(interaction, {
+                    content: '🎫 **Chọn loại Ticket bạn cần:**',
+                    components: [buildTicketTypeMenu()],
+                    flags: MessageFlags.Ephemeral
+                });
             }
 
             if (
@@ -2985,7 +3339,12 @@ client.on(Events.InteractionCreate, async interaction => {
         if (interaction.isStringSelectMenu()) {
             const id = interaction.customId;
 
+            if (id === 'ticket_type_select') {
+                return await createGeneralTicket(interaction, interaction.values[0]);
+            }
+
             if (
+                id.startsWith('account_payment_') ||
                 id === 'select_stock_acc_manual' ||
                 id === 'select_delete_acc_menu' ||
                 id.startsWith('select_deliver_acc_')
