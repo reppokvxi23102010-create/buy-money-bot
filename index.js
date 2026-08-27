@@ -21,6 +21,8 @@ process.env.SELLER_ROLE_ID = (process.env.SELLER_ROLE_ID || '1531205202265247794
 process.env.BUILDER_ROLE_ID = (process.env.BUILDER_ROLE_ID || '1531202502681301094').trim();
 // ID vai trò dùng để ping Admin trong hệ thống Ticket.
 process.env.ADMIN_ROLE_ID = (process.env.ADMIN_ROLE_ID || '1516082552530800875').trim();
+// ID Admin dùng riêng để kiểm tra trạng thái online khi khách mua Money.
+const MONEY_ADMIN_CHECK_ID = '1458470035763888250';
 
 const http = require('http');
 const fs = require('fs');
@@ -269,6 +271,21 @@ function adminOverwrite(guildId) {
             PermissionsBitField.Flags.ManageChannels
         ]
     }];
+}
+
+
+async function checkMoneyAdminOnline(guild) {
+    try {
+        if (!guild) return false;
+
+        const member = await guild.members.fetch(MONEY_ADMIN_CHECK_ID);
+        const status = member?.presence?.status;
+
+        return Boolean(status && status !== 'offline');
+    } catch (err) {
+        console.error('❌ Không thể kiểm tra trạng thái Admin Money:', err?.message || err);
+        return false;
+    }
 }
 
 function getTicketRoleId(type) {
@@ -1397,6 +1414,13 @@ async function handleMoneyModal(interaction) {
             orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
             saveMoneyOrders(orders);
 
+            const adminOnlineAfterCreate = await checkMoneyAdminOnline(interaction.guild);
+            await ticketChannel.send({
+                content: adminOnlineAfterCreate
+                    ? '✅ **Admin đang online** — giao dịch của bạn đã được mở và sẽ được hỗ trợ sớm nhất.'
+                    : '🌙 **Ticket đã được tạo thành công.** Hiện Admin phụ trách Money đang offline. Bạn cứ để lại thông tin/bill trong ticket, Admin sẽ tiếp nhận ngay khi trực tuyến. Cảm ơn bạn đã kiên nhẫn và tin tưởng shop 🤝'
+            });
+
             let adminNotified = false;
             if (process.env.LOG_CHANNEL_ID) {
                 try {
@@ -1625,6 +1649,13 @@ async function handleMoneyModal(interaction) {
             orders[orderId].ticketChannelId = ticketChannel.id;
             orders[orderId].ticketUrl = `https://discord.com/channels/${interaction.guild.id}/${ticketChannel.id}`;
             saveMoneyOrders(orders);
+
+            const adminOnlineAfterCreate = await checkMoneyAdminOnline(interaction.guild);
+            await ticketChannel.send({
+                content: adminOnlineAfterCreate
+                    ? '✅ **Admin đang online** — giao dịch của bạn đã được mở và sẽ được hỗ trợ sớm nhất.'
+                    : '🌙 **Ticket đã được tạo thành công.** Hiện Admin phụ trách Money đang offline. Bạn cứ để lại thông tin/thẻ trong ticket, Admin sẽ tiếp nhận ngay khi trực tuyến. Cảm ơn bạn đã kiên nhẫn và tin tưởng shop 🤝'
+            });
 
             let adminNotified = false;
             if (process.env.LOG_CHANNEL_ID) {
