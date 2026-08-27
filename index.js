@@ -19,7 +19,8 @@ require('dotenv').config();
 // Ticket staff IDs (fallbacks so the bot works even when .env is missing them).
 process.env.SELLER_ROLE_ID = (process.env.SELLER_ROLE_ID || '1531205202265247794').trim();
 process.env.BUILDER_ROLE_ID = (process.env.BUILDER_ROLE_ID || '1531202502681301094').trim();
-process.env.ADMIN_DISCORD_ID = (process.env.ADMIN_DISCORD_ID || '1516082552530800875').trim();
+// ID vai trò dùng để ping Admin trong hệ thống Ticket.
+process.env.ADMIN_ROLE_ID = (process.env.ADMIN_ROLE_ID || '1516082552530800875').trim();
 
 const http = require('http');
 const fs = require('fs');
@@ -235,10 +236,28 @@ function isAdminUser(interaction) {
         serverConfig.adminRoleId !== "ID_ROLE_ADMIN_CUA_BAN" &&
         interaction.member?.roles?.cache?.has(serverConfig.adminRoleId);
 
-    return Boolean(isAdminId || hasAdminPerm || hasAdminRole);
+    const hasTicketAdminRole =
+        process.env.ADMIN_ROLE_ID &&
+        interaction.member?.roles?.cache?.has(process.env.ADMIN_ROLE_ID);
+
+    return Boolean(isAdminId || hasAdminPerm || hasAdminRole || hasTicketAdminRole);
 }
 
 function adminOverwrite(guildId) {
+    const adminRoleId = (process.env.ADMIN_ROLE_ID || '').trim();
+    if (adminRoleId) {
+        return [{
+            id: adminRoleId,
+        allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.AttachFiles,
+            PermissionsBitField.Flags.ManageChannels
+        ]
+        }];
+    }
+
+    // Fallback cũ nếu server vẫn cấu hình ADMIN_DISCORD_ID là user ID.
     if (!process.env.ADMIN_DISCORD_ID) return [];
 
     return [{
@@ -262,10 +281,13 @@ function getTicketRoleId(type) {
     return envKey ? (process.env[envKey] || '').trim() : '';
 }
 
+function getTicketAdminRoleId() {
+    return (process.env.ADMIN_ROLE_ID || '').trim();
+}
+
 function getTicketAdminMention() {
-    return process.env.ADMIN_DISCORD_ID
-        ? `<@${process.env.ADMIN_DISCORD_ID}>`
-        : 'Admin';
+    const roleId = getTicketAdminRoleId();
+    return roleId ? `<@&${roleId}>` : 'Admin';
 }
 
 function ticketRoleOverwrite(roleId) {
@@ -354,27 +376,27 @@ function ticketTypeInfo(type) {
             title: '🛒 MUA VẬT PHẨM KINGSM / DONUTSMP',
             description: 'Seller sẽ tiếp nhận và hỗ trợ đơn mua vật phẩm của bạn.',
             roleId: getTicketRoleId('seller'),
-            ping: getTicketRoleId('seller') ? `<@${getTicketRoleId('seller')}>` : 'Seller'
+            ping: getTicketRoleId('seller') ? `<@&${getTicketRoleId('seller')}>` : 'Seller'
         },
         builder: {
             prefix: 'builder',
             title: '🏗️ BUILDER FARM / STASH',
             description: 'Builder sẽ vào ticket để trao đổi yêu cầu xây dựng, giá và thời gian.',
             roleId: getTicketRoleId('builder'),
-            ping: getTicketRoleId('builder') ? `<@${getTicketRoleId('builder')}>` : 'Builder'
+            ping: getTicketRoleId('builder') ? `<@&${getTicketRoleId('builder')}>` : 'Builder'
         },
         support: {
             prefix: 'support',
             title: '🛠️ HỖ TRỢ PARTNER / KHÁC',
             description: 'Admin sẽ tiếp nhận yêu cầu hỗ trợ của bạn.',
-            roleId: '',
+            roleId: getTicketAdminRoleId(),
             ping: getTicketAdminMention()
         },
         buy_premium: {
             prefix: 'premium',
             title: '💎 THU MUA ACCOUNT MINECRAFT PREMIUM',
             description: 'Admin sẽ kiểm tra và báo giá account Premium của bạn.',
-            roleId: '',
+            roleId: getTicketAdminRoleId(),
             ping: getTicketAdminMention()
         }
     };
