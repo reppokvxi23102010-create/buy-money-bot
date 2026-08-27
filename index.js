@@ -390,7 +390,7 @@ function ticketTypeInfo(type) {
     const map = {
         buy_items: {
             prefix: 'buy',
-            title: '🛒 MUA VẬT PHẨM KINGSM / DONUTSMP',
+            title: '🛒 MUA VẬT PHẨM KINGSMP / DONUTSMP',
             description: 'Seller sẽ tiếp nhận và hỗ trợ đơn mua vật phẩm của bạn.',
             roleId: getTicketRoleId('seller'),
             ping: getTicketRoleId('seller') ? `<@&${getTicketRoleId('seller')}>` : 'Seller'
@@ -423,6 +423,7 @@ function ticketTypeInfo(type) {
 
 async function createGeneralTicket(interaction, type) {
     const info = ticketTypeInfo(type);
+
     if (!info || !interaction.guild) {
         return safeReply(interaction, {
             content: '❌ Không xác định được loại Ticket.',
@@ -430,6 +431,7 @@ async function createGeneralTicket(interaction, type) {
         });
     }
 
+    // Ack interaction ngay lập tức để Discord không hiện "thinking..." quá lâu.
     if (!(await safeDeferUpdate(interaction))) return;
 
     const baseName = `${info.prefix}-${interaction.user.username}`
@@ -438,9 +440,13 @@ async function createGeneralTicket(interaction, type) {
         .slice(0, 65) || `${info.prefix}-ticket`;
 
     try {
+        // Gán topic ngay lúc create => bỏ 1 request API setTopic riêng, tạo ticket nhanh hơn.
+        const ticketTopic = `generalTicket:${type}:${interaction.user.id}`;
+
         const ticketChannel = await interaction.guild.channels.create({
             name: `ticket-${baseName}`,
             type: ChannelType.GuildText,
+            topic: ticketTopic,
             permissionOverwrites: [
                 {
                     id: interaction.guild.id,
@@ -458,8 +464,6 @@ async function createGeneralTicket(interaction, type) {
                 ...adminOverwrite(interaction.guild.id)
             ]
         });
-
-        await ticketChannel.setTopic(`generalTicket:${type}:${interaction.user.id}`);
 
         const embed = new EmbedBuilder()
             .setColor('#5865F2')
@@ -481,14 +485,67 @@ async function createGeneralTicket(interaction, type) {
                 .setStyle(ButtonStyle.Danger)
         );
 
-        await ticketChannel.send({
+        // Gửi ticket message và log gần như đồng thời để giảm thời gian chờ.
+        const ticketMessagePromise = ticketChannel.send({
             content: `<@${interaction.user.id}> ${info.ping}`,
             embeds: [embed],
-            components: [closeRow]
+            components: [closeRow],
+            allowedMentions: {
+                users: [interaction.user.id],
+                roles: info.roleId ? [info.roleId] : []
+            }
         });
 
+        const logPromise = (async () => {
+            if (!process.env.LOG_CHANNEL_ID) return false;
+
+            try {
+                const logChannel = await client.channels.fetch(
+                    String(process.env.LOG_CHANNEL_ID)
+                );
+
+                if (!logChannel?.isTextBased()) return false;
+
+                const typeLabelMap = {
+                    buy_items: '🛒 Mua vật phẩm KINGSMP / DONUTSMP',
+                    builder: '🏗️ Builder Farm / Stash',
+                    support: '🛠️ Hỗ trợ Partner / Khác',
+                    buy_premium: '💎 Thu mua Account Minecraft Premium'
+                };
+
+                await logChannel.send({
+                    content:
+                        `🚨 **TICKET MỚI**\n` +
+                        `👤 Khách: <@${interaction.user.id}>\n` +
+                        `📂 Loại: **${typeLabelMap[type] || type}**\n` +
+                        `📌 Kênh: ${ticketChannel}`,
+                    allowedMentions: {
+                        users: [interaction.user.id]
+                    }
+                });
+
+                return true;
+            } catch (err) {
+                console.error(
+                    '❌ Không gửi được log general ticket:',
+                    err?.message || err
+                );
+                return false;
+            }
+        })();
+
+        await ticketMessagePromise;
+
+        // Không để lỗi log làm chậm phản hồi ticket cho khách.
+        logPromise.catch(() => {});
+
         return safeEditReply(interaction, {
-            content: `✅ **Đã tạo Ticket!**\n👉 ${ticketChannel}`
+            content:
+                `✅ **Đã tạo Ticket!**\n` +
+                `👉 ${ticketChannel}\n` +
+                (process.env.LOG_CHANNEL_ID
+                    ? '🔔 Seller/Admin đã được thông báo.'
+                    : '')
         });
     } catch (err) {
         return safeEditReply(interaction, {
@@ -496,7 +553,6 @@ async function createGeneralTicket(interaction, type) {
         });
     }
 }
-
 
 // ============================================================
 // 7. MONEY DATA & WORKING HOURS LOGIC
