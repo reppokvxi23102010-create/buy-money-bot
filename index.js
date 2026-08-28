@@ -649,7 +649,19 @@ function isWithinThuMoneyWorkingHours() {
 }
 
 function getSellerInfo(sellerId) {
-    return ITEM_SELLERS.find(s => s.id === sellerId) || null;
+    const id = String(sellerId || '').trim();
+    const fixed = ITEM_SELLERS.find(s => s.id === id);
+    if (fixed) return fixed;
+
+    try {
+        const sellers = sbRead(SB_SELLERS_FILE, {});
+        const record = sellers[id];
+        if (record && record.userId === id && record.status === 'ACTIVE' && record.channelId) {
+            return { id, label: record.shopName || 'Seller', emoji: '👑', dynamic: true, record };
+        }
+    } catch (_) {}
+
+    return null;
 }
 
 async function getSellerMember(guild, sellerId) {
@@ -707,7 +719,32 @@ async function buildSellerSelectMenu(guild) {
         .setCustomId('ticket_seller_select')
         .setPlaceholder('🛒 Chọn Seller bạn yêu thích...');
 
-    for (const seller of ITEM_SELLERS) {
+    // Seller cố định cũ đứng trước. Seller được tuyển thành công
+    // sẽ tự động nối vào CUỐI danh sách theo thứ tự đăng ký.
+    const sellerList = ITEM_SELLERS.map(s => ({ ...s }));
+
+    try {
+        const sellers = sbRead(SB_SELLERS_FILE, {});
+        const dynamicSellers = Object.values(sellers)
+            .filter(record => record && record.userId && record.status === 'ACTIVE' && record.channelId)
+            .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0))
+            .map(record => ({
+                id: String(record.userId),
+                label: record.shopName || 'Seller',
+                emoji: '👑',
+                dynamic: true,
+                record
+            }));
+
+        for (const seller of dynamicSellers) {
+            if (!sellerList.some(s => String(s.id) === String(seller.id))) sellerList.push(seller);
+        }
+    } catch (err) {
+        console.error('❌ Không tải được Seller động vào menu ticket:', err?.message || err);
+    }
+
+    // Discord Select Menu tối đa 25 lựa chọn.
+    for (const seller of sellerList.slice(0, 25)) {
         const [name, online] = await Promise.all([
             getSellerDisplayName(guild, seller.id),
             isSellerOnline(guild, seller.id)
@@ -715,12 +752,20 @@ async function buildSellerSelectMenu(guild) {
 
         menu.addOptions(
             new StringSelectMenuOptionBuilder()
-                // Dòng trên: tên Seller
-                .setLabel(`${name}`.slice(0, 100))
-                // Dòng dưới: chỉ trạng thái, không hiện ID cho đỡ rối
+                .setLabel(`${name || seller.label || 'Seller'}`.slice(0, 100))
                 .setDescription(online ? '🟢 ONLINE' : '🔴 OFFLINE')
-                .setEmoji(seller.emoji)
-                .setValue(seller.id)
+                .setEmoji(seller.emoji || '👑')
+                .setValue(String(seller.id))
+        );
+    }
+
+    if (sellerList.length === 0) {
+        menu.addOptions(
+            new StringSelectMenuOptionBuilder()
+                .setLabel('Chưa có Seller')
+                .setDescription('Hiện chưa có Seller khả dụng')
+                .setEmoji('⚠️')
+                .setValue('none')
         );
     }
 
@@ -3330,6 +3375,1334 @@ async function handleCloseTicket(interaction) {
 
 
 // ============================================================
+// SELLER / BUILDER RECRUITMENT + SHOP SYSTEM
+// Persistent data: data/sellers.json, builders.json, applications.json,
+// penalties.json, seller_builder_orders.json, config.json
+// ============================================================
+
+const SB_DATA_DIR = path.join(__dirname, 'data');
+const SB_SELLERS_FILE = path.join(SB_DATA_DIR, 'sellers.json');
+const SB_BUILDERS_FILE = path.join(SB_DATA_DIR, 'builders.json');
+const SB_APPLICATIONS_FILE = path.join(SB_DATA_DIR, 'applications.json');
+const SB_PENALTIES_FILE = path.join(SB_DATA_DIR, 'penalties.json');
+const SB_ORDERS_FILE = path.join(SB_DATA_DIR, 'seller_builder_orders.json');
+const SB_CONFIG_FILE = path.join(SB_DATA_DIR, 'config.json');
+
+const SB_ENV = {
+    sellerRoleId: String(process.env.SELLER_ROLE_ID || '').trim(),
+    builderRoleId: String(process.env.BUILDER_ROLE_ID || '').trim(),
+    sellerCategoryId: String(process.env.SELLER_CATEGORY_ID || '').trim(),
+    builderCategoryId: String(process.env.BUILDER_CATEGORY_ID || '').trim(),
+    applicationChannelId: String(process.env.APPLICATION_CHANNEL_ID || '').trim(),
+    logChannelId: String(process.env.SELLER_BUILDER_LOG_CHANNEL_ID || process.env.LOG_CHANNEL_ID || '').trim(),
+    // Can be overridden in Render/.env. Default supplied by the server owner.
+    memberRoleId: String(process.env.MEMBER_ROLE_ID || '1507904869997219840').trim(),
+    memberUserId: String(process.env.MEMBER_USER_ID || '').trim(),
+    sellerMinDeposit: Math.max(0, Number.parseInt(process.env.SELLER_MIN_DEPOSIT || '100000', 10) || 100000),
+    sellerWeeklyPrice: Math.max(0, Number.parseInt(process.env.SELLER_WEEKLY_PRICE || '30000', 10) || 30000),
+    sellerMonthlyPrice: Math.max(0, Number.parseInt(process.env.SELLER_MONTHLY_PRICE || '100000', 10) || 100000),
+    builderWeeklyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_WEEKLY_PRICE || '0', 10) || 0),
+    builderMonthlyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_MONTHLY_PRICE || '0', 10) || 0),
+    builderMinDeposit: Math.max(0, Number.parseInt(process.env.BUILDER_MIN_DEPOSIT || '0', 10) || 0),
+    pingLimitPerDay: Math.max(1, Number.parseInt(process.env.PING_LIMIT_PER_DAY || '1', 10) || 1),
+    pingPenaltyPercent: Math.max(0, Number.parseFloat(process.env.PING_PENALTY_PERCENT || '10') || 10),
+    renameCooldownHours: Math.max(0, Number.parseInt(process.env.SHOP_RENAME_COOLDOWN_HOURS || '24', 10) || 24),
+    expiryCheckMinutes: Math.max(1, Number.parseInt(process.env.SHOP_EXPIRY_CHECK_MINUTES || '10', 10) || 10)
+};
+
+function sbEnsureFiles() {
+    try {
+        if (!fs.existsSync(SB_DATA_DIR)) fs.mkdirSync(SB_DATA_DIR, { recursive: true });
+        ensureJsonFile(SB_SELLERS_FILE, {});
+        ensureJsonFile(SB_BUILDERS_FILE, {});
+        ensureJsonFile(SB_APPLICATIONS_FILE, {});
+        ensureJsonFile(SB_PENALTIES_FILE, []);
+        ensureJsonFile(SB_ORDERS_FILE, {});
+        ensureJsonFile(SB_CONFIG_FILE, {
+            sellerWeeklyPrice: SB_ENV.sellerWeeklyPrice,
+            sellerMonthlyPrice: SB_ENV.sellerMonthlyPrice,
+            builderWeeklyPrice: SB_ENV.builderWeeklyPrice,
+            builderMonthlyPrice: SB_ENV.builderMonthlyPrice,
+            panel: {}
+        });
+    } catch (err) {
+        console.error('❌ Không thể khởi tạo dữ liệu Seller/Builder:', err?.message || err);
+    }
+}
+
+function sbRead(file, fallback) {
+    return readJson(file, fallback);
+}
+
+function sbWrite(file, value) {
+    return writeJson(file, value);
+}
+
+function sbGetConfig() {
+    const cfg = sbRead(SB_CONFIG_FILE, {});
+    return {
+        sellerWeeklyPrice: Number.isFinite(Number(cfg.sellerWeeklyPrice)) ? Number(cfg.sellerWeeklyPrice) : SB_ENV.sellerWeeklyPrice,
+        sellerMonthlyPrice: Number.isFinite(Number(cfg.sellerMonthlyPrice)) ? Number(cfg.sellerMonthlyPrice) : SB_ENV.sellerMonthlyPrice,
+        builderWeeklyPrice: Number.isFinite(Number(cfg.builderWeeklyPrice)) ? Number(cfg.builderWeeklyPrice) : SB_ENV.builderWeeklyPrice,
+        builderMonthlyPrice: Number.isFinite(Number(cfg.builderMonthlyPrice)) ? Number(cfg.builderMonthlyPrice) : SB_ENV.builderMonthlyPrice,
+        panel: cfg.panel || {}
+    };
+}
+
+function sbSetConfig(patch) {
+    const cfg = sbGetConfig();
+    const next = { ...cfg, ...patch };
+    return sbWrite(SB_CONFIG_FILE, next);
+}
+
+function sbFormatVnd(amount) {
+    return `${Math.max(0, Number(amount) || 0).toLocaleString('vi-VN')}đ`;
+}
+
+function sbDateKey(date = new Date()) {
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(date);
+}
+
+function sbSlug(input) {
+    return String(input || '')
+        .normalize('NFKD')
+        .replace(/[\\u0300-\\u036f]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 50);
+}
+
+function sbPlanPrice(type, plan) {
+    const cfg = sbGetConfig();
+    if (type === 'seller') return plan === 'weekly' ? cfg.sellerWeeklyPrice : cfg.sellerMonthlyPrice;
+    return plan === 'weekly' ? cfg.builderWeeklyPrice : cfg.builderMonthlyPrice;
+}
+
+function sbPlanDays(plan) {
+    return plan === 'weekly' ? 7 : 30;
+}
+
+function sbPlanLabel(plan) {
+    return plan === 'weekly' ? 'WEEKLY • 7 NGÀY' : 'MONTHLY • 30 NGÀY';
+}
+
+function sbRoleId(type) {
+    return type === 'seller' ? SB_ENV.sellerRoleId : SB_ENV.builderRoleId;
+}
+
+function sbCategoryId(type) {
+    return type === 'seller' ? SB_ENV.sellerCategoryId : SB_ENV.builderCategoryId;
+}
+
+function sbDataForType(type) {
+    return type === 'seller' ? sbRead(SB_SELLERS_FILE, {}) : sbRead(SB_BUILDERS_FILE, {});
+}
+
+function sbSaveDataForType(type, data) {
+    return type === 'seller' ? sbWrite(SB_SELLERS_FILE, data) : sbWrite(SB_BUILDERS_FILE, data);
+}
+
+function sbApplications() {
+    return sbRead(SB_APPLICATIONS_FILE, {});
+}
+
+function sbOrders() {
+    return sbRead(SB_ORDERS_FILE, {});
+}
+
+function sbLog(type, payload) {
+    try {
+        if (!SB_ENV.logChannelId) return;
+        client.channels.fetch(SB_ENV.logChannelId).then(async channel => {
+            if (!channel?.isTextBased()) return;
+            await channel.send({ embeds: [payload] });
+        }).catch(err => console.error(`❌ SB log ${type}:`, err?.message || err));
+    } catch (err) {
+        console.error(`❌ SB log ${type}:`, err?.message || err);
+    }
+}
+
+function sbLogEmbed(title, color, fields = []) {
+    return new EmbedBuilder()
+        .setTitle(title)
+        .setColor(color)
+        .addFields(fields)
+        .setTimestamp();
+}
+
+async function sbFetchMember(guild, userId) {
+    try {
+        if (!guild || !userId) return null;
+        return await guild.members.fetch(String(userId));
+    } catch (_) {
+        return guild?.members?.cache?.get(String(userId)) || null;
+    }
+}
+
+function sbApplicationPanel() {
+    const cfg = sbGetConfig();
+    const embed = new EmbedBuilder()
+        .setTitle('📋 TUYỂN DỤNG SELLER / BUILDER')
+        .setColor('#5865F2')
+        .setDescription(
+            '╔════════════════════════════╗\n' +
+            '        👑 **TUYỂN SELLER**\n' +
+            '╚════════════════════════════╝\n\n' +
+            'Bạn muốn mở shop và kinh doanh trong server?\n\n' +
+            `💰 **Cọc:** từ ${sbFormatVnd(SB_ENV.sellerMinDeposit)}\n` +
+            `📅 **7 ngày:** ${sbFormatVnd(cfg.sellerWeeklyPrice)}\n` +
+            `📅 **30 ngày:** ${sbFormatVnd(cfg.sellerMonthlyPrice)}\n\n` +
+            '✅ Có shop riêng\n' +
+            '✅ Tự đặt tên shop\n' +
+            '✅ Channel riêng\n' +
+            '✅ Được chat thoải mái\n' +
+            `⚠️ Ping @Member tối đa ${SB_ENV.pingLimitPerDay} lần/ngày\n` +
+            `⚠️ Vi phạm: trừ ${SB_ENV.pingPenaltyPercent}% cọc\n\n` +
+            '╔════════════════════════════╗\n' +
+            '        🛠️ **TUYỂN BUILDER**\n' +
+            '╚════════════════════════════╝\n\n' +
+            'Nhận Builder xây dựng / dịch vụ trong server.\n\n' +
+            (SB_ENV.builderMinDeposit > 0 ? `💰 **Cọc:** ${sbFormatVnd(SB_ENV.builderMinDeposit)}\n` : '') +
+            '✅ Có channel Builder riêng\n' +
+            '✅ Tự đặt tên Builder\n' +
+            '✅ Chat thoải mái\n' +
+            `⚠️ Ping @Member tối đa ${SB_ENV.pingLimitPerDay} lần/ngày\n` +
+            `⚠️ Vi phạm: trừ ${SB_ENV.pingPenaltyPercent}% cọc\n\n` +
+            '👇 **Nhấn nút bên dưới để đăng ký.**'
+        )
+        .setFooter({ text: 'Hồ sơ được Admin xét duyệt trước khi kích hoạt shop.' })
+        .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('sb_apply_seller')
+            .setLabel('Đăng ký Seller')
+            .setEmoji('👑')
+            .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+            .setCustomId('sb_apply_builder')
+            .setLabel('Đăng ký Builder')
+            .setEmoji('🛠️')
+            .setStyle(ButtonStyle.Secondary)
+    );
+
+    return { embeds: [embed], components: [row] };
+}
+
+function sbApplicationModal(type) {
+    const modal = new ModalBuilder()
+        .setCustomId(`sb_application_modal_${type}`)
+        .setTitle(type === 'seller' ? '👑 Đăng ký Seller' : '🛠️ Đăng ký Builder');
+
+    const fields = type === 'seller'
+        ? [
+            ['name', 'Tên / thông tin người đăng ký', 'Tên của bạn', true],
+            ['products', 'Sản phẩm muốn bán', 'Ví dụ: Minecraft Money, Account...', true],
+            ['experience', 'Kinh nghiệm', 'Kinh nghiệm / lịch sử giao dịch', true],
+            ['hours', 'Thời gian hoạt động', 'Ví dụ: 18h-23h mỗi ngày', true],
+            ['contact', 'Thông tin liên hệ (nếu cần)', 'Discord / phương thức liên hệ', false]
+        ]
+        : [
+            ['name', 'Tên / thông tin Builder', 'Tên của bạn', true],
+            ['services', 'Dịch vụ muốn nhận', 'Farm, Stash, Build...', true],
+            ['experience', 'Kinh nghiệm', 'Kinh nghiệm xây dựng', true],
+            ['hours', 'Thời gian hoạt động', 'Ví dụ: 18h-23h mỗi ngày', true],
+            ['contact', 'Thông tin liên hệ (nếu cần)', 'Discord / phương thức liên hệ', false]
+        ];
+
+    modal.addComponents(fields.map(([id, label, placeholder, required]) => new ActionRowBuilder().addComponents(
+        new TextInputBuilder()
+            .setCustomId(id)
+            .setLabel(label)
+            .setStyle(TextInputStyle.Paragraph)
+            .setPlaceholder(placeholder)
+            .setRequired(required)
+            .setMaxLength(1000)
+    )));
+    return modal;
+}
+
+async function sbSendApplication(type, interaction) {
+    const apps = sbApplications();
+    const existing = Object.values(apps).find(app =>
+        app.userId === interaction.user.id &&
+        app.type === type &&
+        ['PENDING', 'APPROVED', 'PAYMENT_PENDING', 'PAID', 'SETUP_PENDING'].includes(app.status)
+    );
+    if (existing) {
+        return safeReply(interaction, {
+            content: `⚠️ Bạn đã có hồ sơ **${type.toUpperCase()}** đang xử lý (ID: \`${existing.id}\`).`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    const appId = `APP_${Date.now()}_${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+    const application = {
+        id: appId,
+        type,
+        userId: interaction.user.id,
+        username: interaction.user.username,
+        fields: {},
+        status: 'PENDING',
+        createdAt: Date.now(),
+        reviewedBy: null,
+        reviewedAt: null
+    };
+
+    for (const field of ['name', 'products', 'services', 'experience', 'hours', 'contact']) {
+        try { application.fields[field] = interaction.fields.getTextInputValue(field).trim(); } catch (_) {}
+    }
+
+    apps[appId] = application;
+    sbWrite(SB_APPLICATIONS_FILE, apps);
+
+    const targetChannelId = SB_ENV.applicationChannelId || interaction.channelId;
+    const applicationChannel = await client.channels.fetch(targetChannelId).catch(() => null);
+    if (!applicationChannel?.isTextBased()) {
+        delete apps[appId];
+        sbWrite(SB_APPLICATIONS_FILE, apps);
+        return safeReply(interaction, {
+            content: '❌ APPLICATION_CHANNEL_ID chưa đúng hoặc bot không truy cập được channel tuyển dụng.',
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    const fields = [
+        { name: '👤 User', value: `<@${interaction.user.id}>`, inline: true },
+        { name: '🆔 ID', value: interaction.user.id, inline: true },
+        { name: '🏪 Vị trí', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
+        ...(type === 'seller'
+            ? [{ name: '📦 Sản phẩm', value: application.fields.products || 'Không cung cấp', inline: false }]
+            : [{ name: '🧰 Dịch vụ', value: application.fields.services || 'Không cung cấp', inline: false }]),
+        { name: '💼 Kinh nghiệm', value: application.fields.experience || 'Không cung cấp', inline: false },
+        { name: '🕐 Thời gian hoạt động', value: application.fields.hours || 'Không cung cấp', inline: false },
+        { name: '📞 Liên hệ', value: application.fields.contact || 'Không cung cấp', inline: false }
+    ];
+
+    if (type === 'seller') {
+        const cfg = sbGetConfig();
+        fields.push(
+            { name: '💰 Cọc yêu cầu', value: sbFormatVnd(SB_ENV.sellerMinDeposit), inline: true },
+            { name: '📅 Gói tuần', value: sbFormatVnd(cfg.sellerWeeklyPrice), inline: true },
+            { name: '📅 Gói tháng', value: sbFormatVnd(cfg.sellerMonthlyPrice), inline: true }
+        );
+    }
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`sb_app_approve_${appId}`).setLabel('DUYỆT').setEmoji('✅').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`sb_app_reject_${appId}`).setLabel('TỪ CHỐI').setEmoji('❌').setStyle(ButtonStyle.Danger)
+    );
+
+    const embed = new EmbedBuilder()
+        .setTitle(type === 'seller' ? '📋 SELLER APPLICATION' : '📋 BUILDER APPLICATION')
+        .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
+        .addFields(fields)
+        .setFooter({ text: `Application ID: ${appId}` })
+        .setTimestamp();
+
+    await applicationChannel.send({ embeds: [embed], components: [row] });
+    sbLog('application', sbLogEmbed('📝 APPLICATION', type === 'seller' ? '#f1c40f' : '#3498db', [
+        { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
+        { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
+        { name: 'Status', value: 'PENDING', inline: true },
+        { name: 'Application', value: `\`${appId}\`` }
+    ]));
+
+    return safeReply(interaction, {
+        content: `✅ Đã gửi hồ sơ **${type === 'seller' ? 'Seller' : 'Builder'}**. Admin sẽ xét duyệt trong thời gian sớm nhất.`,
+        flags: MessageFlags.Ephemeral
+    });
+}
+
+function sbAppButtons(appId, disabled = false) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`sb_app_approve_${appId}`).setLabel('DUYỆT').setEmoji('✅').setStyle(ButtonStyle.Success).setDisabled(disabled),
+        new ButtonBuilder().setCustomId(`sb_app_reject_${appId}`).setLabel('TỪ CHỐI').setEmoji('❌').setStyle(ButtonStyle.Danger).setDisabled(disabled)
+    );
+}
+
+async function sbNotifyApproval(guild, app) {
+    const user = await client.users.fetch(app.userId).catch(() => null);
+    if (!user) return;
+    const type = app.type;
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`sb_begin_setup_${type}`).setLabel(type === 'seller' ? '👑 Thanh toán & Setup Seller' : '🛠️ Thanh toán & Setup Builder').setStyle(ButtonStyle.Primary)
+    );
+    await user.send({
+        embeds: [new EmbedBuilder()
+            .setTitle(type === 'seller' ? '✅ SELLER ĐƯỢC DUYỆT' : '✅ BUILDER ĐƯỢC DUYỆT')
+            .setColor('#2ecc71')
+            .setDescription(
+                `Hồ sơ của bạn đã được Admin duyệt.\n\n` +
+                `🎫 Application: \`${app.id}\`\n` +
+                `🎯 Vị trí: **${type === 'seller' ? 'Seller' : 'Builder'}**\n\n` +
+                `Bấm nút bên dưới để tiếp tục ${type === 'seller' ? 'thanh toán cọc + phí và tạo shop' : 'hoàn thành điều kiện và tạo shop'}.`
+            )
+            .setTimestamp()],
+        components: [row]
+    }).catch(() => {});
+}
+
+async function sbApproveApplication(interaction, appId, approve) {
+    if (!isAdminUser(interaction)) {
+        return safeReply(interaction, { content: '❌ Chỉ Admin mới được duyệt application.', flags: MessageFlags.Ephemeral });
+    }
+    const apps = sbApplications();
+    const app = apps[appId];
+    if (!app) return safeReply(interaction, { content: '❌ Không tìm thấy application.', flags: MessageFlags.Ephemeral });
+    if (app.status !== 'PENDING') return safeReply(interaction, { content: `⚠️ Application hiện ở trạng thái **${app.status}**.`, flags: MessageFlags.Ephemeral });
+
+    app.status = approve ? 'APPROVED' : 'REJECTED';
+    app.reviewedBy = interaction.user.id;
+    app.reviewedAt = Date.now();
+    sbWrite(SB_APPLICATIONS_FILE, apps);
+
+    const updated = EmbedBuilder.from(interaction.message.embeds[0])
+        .setColor(approve ? '#2ecc71' : '#e74c3c')
+        .addFields({ name: '📌 Trạng thái', value: `${approve ? '✅ APPROVED' : '❌ REJECTED'} bởi <@${interaction.user.id}>` });
+
+    await interaction.message.edit({ embeds: [updated], components: [sbAppButtons(appId, true)] }).catch(() => {});
+
+    const roleId = sbRoleId(app.type);
+    if (approve && roleId && interaction.guild) {
+        const member = await sbFetchMember(interaction.guild, app.userId);
+        if (member) await member.roles.add(roleId, 'Seller/Builder application approved').catch(err => console.error('❌ Add SB role:', err?.message || err));
+    }
+
+    if (approve) await sbNotifyApproval(interaction.guild, app);
+    else {
+        const user = await client.users.fetch(app.userId).catch(() => null);
+        if (user) await user.send(`❌ Application **${app.id}** của bạn đã bị từ chối bởi Admin.`).catch(() => {});
+    }
+
+    sbLog('application', sbLogEmbed('📝 APPLICATION', approve ? '#2ecc71' : '#e74c3c', [
+        { name: 'User', value: `<@${app.userId}>`, inline: true },
+        { name: 'Type', value: app.type === 'seller' ? 'Seller' : 'Builder', inline: true },
+        { name: 'Status', value: approve ? 'Approved' : 'Rejected', inline: true },
+        { name: 'Reviewer', value: `<@${interaction.user.id}>`, inline: true }
+    ]));
+
+    return safeReply(interaction, {
+        content: approve ? '✅ Đã duyệt application và cấp role. User đã nhận hướng dẫn qua DM.' : '❌ Đã từ chối application.',
+        flags: MessageFlags.Ephemeral
+    });
+}
+
+async function sbBuildPlanMenu(type) {
+    const cfg = sbGetConfig();
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId(`sb_plan_select_${type}`)
+        .setPlaceholder(type === 'seller' ? '💳 Chọn gói Seller...' : '💳 Chọn gói Builder...');
+
+    const weekly = type === 'seller' ? cfg.sellerWeeklyPrice : cfg.builderWeeklyPrice;
+    const monthly = type === 'seller' ? cfg.sellerMonthlyPrice : cfg.builderMonthlyPrice;
+
+    menu.addOptions(
+        new StringSelectMenuOptionBuilder()
+            .setLabel(`7 ngày • ${sbFormatVnd(weekly)}`)
+            .setDescription('Gia hạn / kích hoạt 7 ngày')
+            .setValue('weekly')
+            .setEmoji('📅'),
+        new StringSelectMenuOptionBuilder()
+            .setLabel(`30 ngày • ${sbFormatVnd(monthly)}`)
+            .setDescription('Gia hạn / kích hoạt 30 ngày')
+            .setValue('monthly')
+            .setEmoji('📅')
+    );
+    return new ActionRowBuilder().addComponents(menu);
+}
+
+function sbSetupPaymentModal(type, plan) {
+    const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : 0;
+    const modal = new ModalBuilder()
+        .setCustomId(`sb_payment_modal_${type}_${plan}`)
+        .setTitle(type === 'seller' ? `👑 Thanh toán Seller • ${sbPlanLabel(plan)}` : `🛠️ Thanh toán Builder • ${sbPlanLabel(plan)}`);
+
+    if (type === 'seller') {
+        modal.addComponents(new ActionRowBuilder().addComponents(
+            new TextInputBuilder()
+                .setCustomId('deposit')
+                .setLabel('Tiền cọc (VNĐ)')
+                .setStyle(TextInputStyle.Short)
+                .setPlaceholder(`Tối thiểu ${minDeposit.toLocaleString('vi-VN')}`)
+                .setRequired(true)
+        ));
+    }
+    return modal;
+}
+
+function sbParseVnd(input) {
+    const raw = String(input || '').trim().toLowerCase().replace(/\s+/g, '').replace(/,/g, '');
+    let multiplier = 1;
+    let valueText = raw;
+    if (raw.endsWith('k')) { multiplier = 1000; valueText = raw.slice(0, -1); }
+    else if (raw.endsWith('m')) { multiplier = 1000000; valueText = raw.slice(0, -1); }
+    const n = Number(valueText);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n * multiplier) : 0;
+}
+
+function sbCreateOrder(type, userId, plan, deposit) {
+    const orders = sbOrders();
+    const orderId = `SB_${Date.now()}_${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+    const fee = sbPlanPrice(type, plan);
+    const total = Math.max(0, Number(deposit) || 0) + fee;
+    orders[orderId] = {
+        id: orderId,
+        type,
+        userId,
+        plan,
+        deposit: Math.max(0, Number(deposit) || 0),
+        fee,
+        total,
+        status: 'PENDING',
+        createdAt: Date.now(),
+        ticketChannelId: null,
+        approvedBy: null,
+        approvedAt: null
+    };
+    sbWrite(SB_ORDERS_FILE, orders);
+    return orders[orderId];
+}
+
+async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
+    const roleId = sbRoleId(type);
+    const categoryId = sbCategoryId(type);
+    const appMap = sbApplications();
+    const app = Object.values(appMap).find(a => a.userId === interaction.user.id && a.type === type && ['APPROVED', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status));
+    const existingRecord = sbDataForType(type)[interaction.user.id];
+    if (!app && !existingRecord) return safeReply(interaction, { content: `❌ Bạn chưa có application **${type}** được duyệt.`, flags: MessageFlags.Ephemeral });
+
+    const order = sbCreateOrder(type, interaction.user.id, plan, deposit);
+    const category = categoryId ? await interaction.guild.channels.fetch(categoryId).catch(() => null) : null;
+    if (categoryId && !category) return safeReply(interaction, { content: '❌ Category shop chưa cấu hình hoặc không tồn tại.', flags: MessageFlags.Ephemeral });
+
+    const name = `${type === 'seller' ? 'seller-pay' : 'builder-pay'}-${interaction.user.username}`
+        .toLowerCase().replace(/[^a-z0-9-_]/g, '').slice(0, 80);
+    const qrUrl = `https://img.vietqr.io/image/${BANK_CONFIG.BANK_ID}-${BANK_CONFIG.ACCOUNT_NO}-compact2.png` +
+        `?amount=${order.total}&addInfo=${encodeURIComponent(`${type === 'seller' ? 'SELLER' : 'BUILDER'} ${interaction.user.username} ${order.id}`)}` +
+        `&accountName=${encodeURIComponent(BANK_CONFIG.ACCOUNT_NAME)}`;
+
+    try {
+        const paymentChannel = await interaction.guild.channels.create({
+            name: `💳┆${name}`,
+            type: ChannelType.GuildText,
+            parent: category?.type === ChannelType.GuildCategory ? category.id : undefined,
+            topic: `sbOrder:${order.id}`,
+            permissionOverwrites: [
+                { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+                { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.AttachFiles, PermissionsBitField.Flags.EmbedLinks, PermissionsBitField.Flags.ReadMessageHistory] },
+                ...adminOverwrite(interaction.guild.id)
+            ]
+        });
+
+        order.ticketChannelId = paymentChannel.id;
+        sbWrite(SB_ORDERS_FILE, sbOrders());
+
+        const embed = new EmbedBuilder()
+            .setTitle(type === 'seller' ? '👑 THANH TOÁN SELLER' : '🛠️ THANH TOÁN BUILDER')
+            .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
+            .setDescription(
+                `Xin chào <@${interaction.user.id}>!\n\n` +
+                `📅 **Gói:** ${sbPlanLabel(plan)}\n` +
+                `💰 **Phí:** ${sbFormatVnd(order.fee)}\n` +
+                (order.deposit > 0 ? `🛡️ **Cọc:** ${sbFormatVnd(order.deposit)}\n` : '') +
+                `💵 **Tổng chuyển khoản:** ${sbFormatVnd(order.total)}\n\n` +
+                '🏦 **Ngân hàng:** MBBANK\n' +
+                `STK: \`${BANK_CONFIG.ACCOUNT_NO}\`\n` +
+                `Tên: \`${BANK_CONFIG.ACCOUNT_NAME}\`\n\n` +
+                `📌 **Nội dung:** \`SB ${order.id}\`\n\n` +
+                '📸 Gửi bill vào ticket. Admin sẽ xác nhận thanh toán.'
+            )
+            .setImage(qrUrl)
+            .setFooter({ text: `Order: ${order.id}` })
+            .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`sb_pay_approve_${order.id}`).setLabel('✅ Xác nhận đã thanh toán').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary)
+        );
+
+        await paymentChannel.send({ content: `<@${interaction.user.id}> ${getTicketAdminMention()}`, embeds: [embed], components: [row], allowedMentions: { users: [interaction.user.id], roles: getTicketAdminRoleId() ? [getTicketAdminRoleId()] : [] } });
+        await paymentChannel.send({ content: '⏳ **Đang chờ Admin xác nhận thanh toán.**' });
+
+        if (app) {
+            const appMap2 = sbApplications();
+            appMap2[app.id].status = 'PAYMENT_PENDING';
+            appMap2[app.id].orderId = order.id;
+            sbWrite(SB_APPLICATIONS_FILE, appMap2);
+        }
+
+        return safeEditReply(interaction, { content: `✅ Đã tạo ticket thanh toán: ${paymentChannel}\n💵 Tổng: **${sbFormatVnd(order.total)}**` });
+    } catch (err) {
+        const orders = sbOrders();
+        delete orders[order.id];
+        sbWrite(SB_ORDERS_FILE, orders);
+        return safeEditReply(interaction, { content: `❌ Không thể tạo ticket thanh toán: \`${err.message}\`` });
+    }
+}
+
+async function sbHandleBeginSetup(interaction, type) {
+    const data = sbDataForType(type);
+    const existing = data[interaction.user.id];
+    if (existing && ['ACTIVE', 'PAYMENT_PENDING', 'SETUP_PENDING'].includes(existing.status)) {
+        return safeReply(interaction, { content: `ℹ️ Bạn đang có hồ sơ ${type} với trạng thái **${existing.status}**.`, flags: MessageFlags.Ephemeral });
+    }
+    const apps = sbApplications();
+    const app = Object.values(apps).find(a => a.userId === interaction.user.id && a.type === type && a.status === 'APPROVED');
+    if (!app) return safeReply(interaction, { content: `❌ Chưa có application ${type} được duyệt.`, flags: MessageFlags.Ephemeral });
+    return safeReply(interaction, {
+        content: type === 'seller'
+            ? `👑 **Chọn gói Seller**\nCọc tối thiểu: **${sbFormatVnd(SB_ENV.sellerMinDeposit)}**` 
+            : '🛠️ **Chọn gói Builder**',
+        components: [await sbBuildPlanMenu(type)],
+        flags: MessageFlags.Ephemeral
+    });
+}
+
+async function sbHandlePaymentApproval(interaction, orderId) {
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin mới được xác nhận thanh toán.', flags: MessageFlags.Ephemeral });
+    const orders = sbOrders();
+    const order = orders[orderId];
+    if (!order) return safeReply(interaction, { content: '❌ Không tìm thấy order.', flags: MessageFlags.Ephemeral });
+    if (order.status !== 'PENDING') return safeReply(interaction, { content: `⚠️ Order hiện ở trạng thái **${order.status}**.`, flags: MessageFlags.Ephemeral });
+
+    order.status = 'PAID';
+    order.approvedBy = interaction.user.id;
+    order.approvedAt = Date.now();
+    orders[orderId] = order;
+    sbWrite(SB_ORDERS_FILE, orders);
+
+    const data = sbDataForType(order.type);
+    const now = new Date();
+    const existing = data[order.userId];
+    const isExistingShop = Boolean(existing?.channelId && existing?.status !== 'CLOSED');
+    const base = existing && existing.expireDate && new Date(existing.expireDate).getTime() > now.getTime()
+        ? new Date(existing.expireDate)
+        : now;
+    const expire = new Date(base.getTime() + sbPlanDays(order.plan) * 86400000);
+    data[order.userId] = {
+        ...(existing || {}),
+        userId: order.userId,
+        status: isExistingShop ? 'ACTIVE' : 'SETUP_PENDING',
+        plan: order.plan,
+        deposit: existing?.deposit != null ? existing.deposit : order.deposit,
+        startDate: existing?.startDate || now.toISOString(),
+        expireDate: expire.toISOString(),
+        applicationId: existing?.applicationId || null,
+        categoryId: sbCategoryId(order.type),
+        channelId: existing?.channelId || null,
+        shopName: existing?.shopName || '',
+        lastMemberPingDate: existing?.lastMemberPingDate || '',
+        lastRenameAt: existing?.lastRenameAt || null,
+        updatedAt: Date.now()
+    };
+    // Seller deposit is preserved separately from the new order fee.
+    if (order.type === 'seller' && (!existing || existing.deposit == null)) data[order.userId].deposit = order.deposit;
+    sbSaveDataForType(order.type, data);
+
+    const apps = sbApplications();
+    const app = Object.values(apps).find(a => a.userId === order.userId && a.type === order.type);
+    const recordAfterPayment = data[order.userId];
+    if (app) {
+        app.status = recordAfterPayment?.channelId ? 'PAID' : 'SETUP_PENDING';
+        app.paidOrderId = order.id;
+        sbWrite(SB_APPLICATIONS_FILE, apps);
+    }
+
+    const user = await client.users.fetch(order.userId).catch(() => null);
+    if (user) {
+        const embed = new EmbedBuilder()
+            .setTitle('✅ THANH TOÁN ĐÃ XÁC NHẬN')
+            .setColor('#2ecc71')
+            .setDescription(
+                `Order \`${order.id}\` đã được Admin xác nhận.\n\n` +
+                `📅 Gói: **${sbPlanLabel(order.plan)}**\n` +
+                (order.type === 'seller' ? `🛡️ Cọc: **${sbFormatVnd(recordAfterPayment.deposit)}**\n` : '') +
+                (recordAfterPayment.channelId
+                    ? `✅ Shop hiện tại được giữ nguyên.\n🏪 Channel: <#${recordAfterPayment.channelId}>`
+                    : 'Bấm nút bên dưới để nhập tên shop. Sau khi hợp lệ, bot sẽ tự tạo channel.')
+            )
+            .setTimestamp();
+        const components = recordAfterPayment.channelId ? [] : [new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`sb_setup_shop_${order.type}`).setLabel(order.type === 'seller' ? '👑 Đặt tên Shop Seller' : '🛠️ Đặt tên Builder').setStyle(ButtonStyle.Primary)
+        )];
+        await user.send({ embeds: [embed], components }).catch(() => {});
+    }
+
+    await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('sb_payment_paid').setLabel('✅ ĐÃ XÁC NHẬN').setStyle(ButtonStyle.Success).setDisabled(true),
+        new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary)
+    )] }).catch(() => {});
+    await interaction.channel?.send(`✅ **Thanh toán đã được xác nhận.** <@${order.userId}> đã nhận hướng dẫn setup.`).catch(() => {});
+
+    sbLog('payment', sbLogEmbed('💳 PAYMENT CONFIRMED', '#2ecc71', [
+        { name: 'User', value: `<@${order.userId}>`, inline: true },
+        { name: 'Type', value: order.type, inline: true },
+        { name: 'Plan', value: sbPlanLabel(order.plan), inline: true },
+        { name: 'Order', value: `\`${order.id}\`` },
+        { name: 'Amount', value: sbFormatVnd(order.total), inline: true }
+    ]));
+
+    return safeReply(interaction, { content: '✅ Đã xác nhận thanh toán.', flags: MessageFlags.Ephemeral });
+}
+
+function sbNameTaken(guild, type, slug, exceptChannelId = null) {
+    const data = sbDataForType(type);
+    return Object.values(data).some(record => {
+        if (record.channelId && record.channelId === exceptChannelId) return false;
+        return record.shopSlug === slug;
+    }) || guild.channels.cache.some(ch => {
+        if (exceptChannelId && ch.id === exceptChannelId) return false;
+        return ch.name === `${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${slug}`;
+    });
+}
+
+function sbValidateShopName(input) {
+    const trimmed = String(input || '').trim();
+    if (!trimmed) return { ok: false, error: 'Tên không được để trống.' };
+    if (trimmed.length > 50) return { ok: false, error: 'Tên tối đa 50 ký tự.' };
+    const slug = sbSlug(trimmed);
+    if (!slug) return { ok: false, error: 'Tên không tạo được định dạng Discord hợp lệ.' };
+    return { ok: true, name: trimmed, slug };
+}
+
+function sbShopPermissionOverwrites(guild, userId, roleId) {
+    // SHOP CÔNG KHAI: mọi thành viên đều nhìn thấy và đọc được,
+    // chỉ owner + Admin mới được gửi tin nhắn. Seller/Builder khác
+    // không được tự ý chat vào shop của người khác.
+    return [
+        {
+            id: guild.id,
+            allow: [
+                PermissionsBitField.Flags.ViewChannel,
+                PermissionsBitField.Flags.ReadMessageHistory
+            ],
+            deny: [
+                PermissionsBitField.Flags.SendMessages,
+                PermissionsBitField.Flags.MentionEveryone
+            ]
+        },
+        {
+            id: userId,
+            allow: [
+                PermissionsBitField.Flags.ViewChannel,
+                PermissionsBitField.Flags.SendMessages,
+                PermissionsBitField.Flags.EmbedLinks,
+                PermissionsBitField.Flags.AttachFiles,
+                PermissionsBitField.Flags.ReadMessageHistory,
+                PermissionsBitField.Flags.MentionUsers
+            ],
+            deny: [PermissionsBitField.Flags.MentionEveryone]
+        },
+        ...adminOverwrite(guild.id)
+    ];
+}
+
+async function sbResolveCategory(guild, type) {
+    const configuredId = sbCategoryId(type);
+    if (configuredId) {
+        const configured = await guild.channels.fetch(configuredId).catch(() => null);
+        if (configured?.type === ChannelType.GuildCategory) return configured;
+    }
+
+    const wanted = type === 'seller' ? ['seller', '👑 seller', 'category seller'] : ['builder', '🛠️ builder', 'category builder'];
+    const existing = guild.channels.cache.find(ch =>
+        ch.type === ChannelType.GuildCategory &&
+        wanted.some(name => String(ch.name || '').trim().toLowerCase() === name)
+    );
+    if (existing) return existing;
+
+    try {
+        return await guild.channels.create({
+            name: type === 'seller' ? '👑 SELLER' : '🛠️ BUILDER',
+            type: ChannelType.GuildCategory,
+            reason: `Tự tạo Category ${type} cho hệ thống Seller/Builder`
+        });
+    } catch (err) {
+        console.error(`❌ Không thể tạo Category ${type}:`, err?.message || err);
+        return null;
+    }
+}
+
+async function sbCreateShop(interaction, type, shopName) {
+    const data = sbDataForType(type);
+    const record = data[interaction.user.id];
+    if (!record) return safeReply(interaction, { content: `❌ Chưa có hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
+    if (!['SETUP_PENDING', 'ACTIVE', 'EXPIRED'].includes(record.status)) return safeReply(interaction, { content: `❌ Hồ sơ đang ở trạng thái **${record.status}**.`, flags: MessageFlags.Ephemeral });
+    const valid = sbValidateShopName(shopName);
+    if (!valid.ok) return safeReply(interaction, { content: `❌ ${valid.error}`, flags: MessageFlags.Ephemeral });
+
+    if (record.channelId && record.status !== 'CLOSED') return safeReply(interaction, { content: `ℹ️ Bạn đã có shop: <#${record.channelId}>`, flags: MessageFlags.Ephemeral });
+    if (sbNameTaken(interaction.guild, type, valid.slug, record.channelId)) return safeReply(interaction, { content: '❌ Tên shop này đã được sử dụng. Vui lòng chọn tên khác.', flags: MessageFlags.Ephemeral });
+
+    const category = await sbResolveCategory(interaction.guild, type);
+    if (!category) return safeReply(interaction, { content: `❌ Không thể xác định hoặc tạo Category ${type === 'seller' ? 'Seller' : 'Builder'}.`, flags: MessageFlags.Ephemeral });
+
+    try {
+        const roleId = sbRoleId(type);
+        const channel = await interaction.guild.channels.create({
+            name: `${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${valid.slug}`,
+            type: ChannelType.GuildText,
+            parent: category.id,
+            topic: `sbShop:${type}:${interaction.user.id}`,
+            permissionOverwrites: sbShopPermissionOverwrites(interaction.guild, interaction.user.id, roleId)
+        });
+
+        record.shopName = valid.name;
+        record.shopSlug = valid.slug;
+        record.channelId = channel.id;
+        record.categoryId = category.id;
+        record.status = new Date(record.expireDate).getTime() > Date.now() ? 'ACTIVE' : 'EXPIRED';
+        record.updatedAt = Date.now();
+        data[interaction.user.id] = record;
+        sbSaveDataForType(type, data);
+
+        await channel.send({ embeds: [new EmbedBuilder()
+            .setTitle(type === 'seller' ? '👑 SHOP SELLER' : '🛠️ SHOP BUILDER')
+            .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
+            .setDescription(
+                `<@${interaction.user.id}> chào mừng đến shop riêng của bạn!\n\n` +
+                `🏪 **Tên:** ${valid.name}\n` +
+                `📌 **Trạng thái:** ${record.status}\n` +
+                (type === 'seller' ? `💰 **Cọc:** ${sbFormatVnd(record.deposit)}\n` : '') +
+                `📅 **Gói:** ${sbPlanLabel(record.plan)}\n` +
+                `⏰ **Hết hạn:** <t:${Math.floor(new Date(record.expireDate).getTime() / 1000)}:F>\n\n` +
+                `⚠️ Ping @Member tối đa **${SB_ENV.pingLimitPerDay} lần/ngày**. Vi phạm sẽ bị trừ **${SB_ENV.pingPenaltyPercent}% cọc**.`
+            )
+            .setFooter({ text: 'Chat tự do trong shop; không giới hạn số tin nhắn.' })
+            .setTimestamp()] });
+
+        sbLog('shop', sbLogEmbed('🏪 SHOP CREATED', '#2ecc71', [
+            { name: 'Owner', value: `<@${interaction.user.id}>`, inline: true },
+            { name: 'Shop', value: valid.name, inline: true },
+            { name: 'Channel', value: `${channel}`, inline: true },
+            { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true }
+        ]));
+
+        return safeReply(interaction, { content: `✅ Đã tạo shop: ${channel}`, flags: MessageFlags.Ephemeral });
+    } catch (err) {
+        return safeReply(interaction, { content: `❌ Không thể tạo shop: \`${err.message}\``, flags: MessageFlags.Ephemeral });
+    }
+}
+
+function sbGetRecord(interaction, type, targetUserId = null) {
+    const data = sbDataForType(type);
+    const userId = targetUserId || interaction.user.id;
+    return { data, userId, record: data[userId] || null };
+}
+
+function sbCanManageSelfOrAdmin(interaction, recordUserId) {
+    return interaction.user.id === recordUserId || isAdminUser(interaction);
+}
+
+function sbInfoEmbed(type, record, guild) {
+    const channel = record.channelId ? `<#${record.channelId}>` : '`Chưa tạo`';
+    const status = record.expireDate && new Date(record.expireDate).getTime() <= Date.now() && record.status === 'ACTIVE' ? 'EXPIRED' : record.status;
+    const pingUsed = record.lastMemberPingDate === sbDateKey() ? 1 : 0;
+    return new EmbedBuilder()
+        .setTitle(type === 'seller' ? '🏪 SELLER INFO' : '🛠️ BUILDER INFO')
+        .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
+        .addFields(
+            { name: type === 'seller' ? 'Shop' : 'Builder', value: record.shopName || '`Chưa đặt`', inline: true },
+            { name: 'Channel', value: channel, inline: true },
+            { name: 'Status', value: status, inline: true },
+            { name: 'Plan', value: sbPlanLabel(record.plan || 'monthly'), inline: true },
+            ...(type === 'seller' ? [{ name: 'Deposit', value: sbFormatVnd(record.deposit), inline: true }] : []),
+            { name: 'Ngày bắt đầu', value: record.startDate ? new Date(record.startDate).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }) : '`-`', inline: true },
+            { name: 'Ngày hết hạn', value: record.expireDate ? new Date(record.expireDate).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }) : '`-`', inline: true },
+            { name: 'Ping @Member hôm nay', value: `**${pingUsed}/${SB_ENV.pingLimitPerDay}**`, inline: true }
+        )
+        .setFooter({ text: `User ID: ${record.userId}` })
+        .setTimestamp();
+}
+
+async function sbRename(interaction, type, newName) {
+    const { data, userId, record } = sbGetRecord(interaction, type);
+    if (!record) return safeReply(interaction, { content: `❌ Bạn chưa có hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
+    if (!sbCanManageSelfOrAdmin(interaction, userId)) return safeReply(interaction, { content: '❌ Bạn không có quyền đổi tên shop này.', flags: MessageFlags.Ephemeral });
+    if (!record.channelId) return safeReply(interaction, { content: '❌ Chưa có channel shop.', flags: MessageFlags.Ephemeral });
+    if (record.status !== 'ACTIVE' && !isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Shop hiện không ACTIVE.', flags: MessageFlags.Ephemeral });
+
+    const now = Date.now();
+    if (!isAdminUser(interaction) && record.lastRenameAt && SB_ENV.renameCooldownHours > 0 && now - record.lastRenameAt < SB_ENV.renameCooldownHours * 3600000) {
+        const remain = Math.ceil((SB_ENV.renameCooldownHours * 3600000 - (now - record.lastRenameAt)) / 3600000);
+        return safeReply(interaction, { content: `⏳ Bạn cần chờ khoảng **${remain} giờ** mới được đổi tên lại.`, flags: MessageFlags.Ephemeral });
+    }
+
+    const valid = sbValidateShopName(newName);
+    if (!valid.ok) return safeReply(interaction, { content: `❌ ${valid.error}`, flags: MessageFlags.Ephemeral });
+    if (sbNameTaken(interaction.guild, type, valid.slug, record.channelId)) return safeReply(interaction, { content: '❌ Tên shop này đã được sử dụng.', flags: MessageFlags.Ephemeral });
+
+    const channel = await interaction.guild.channels.fetch(record.channelId).catch(() => null);
+    if (!channel) return safeReply(interaction, { content: '❌ Channel shop không còn tồn tại.', flags: MessageFlags.Ephemeral });
+    await channel.setName(`${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${valid.slug}`);
+    record.shopName = valid.name;
+    record.shopSlug = valid.slug;
+    record.lastRenameAt = now;
+    record.updatedAt = now;
+    data[userId] = record;
+    sbSaveDataForType(type, data);
+
+    sbLog('rename', sbLogEmbed('✏️ SHOP RENAMED', '#3498db', [
+        { name: 'User', value: `<@${userId}>`, inline: true },
+        { name: 'Type', value: type, inline: true },
+        { name: 'New name', value: valid.name, inline: true },
+        { name: 'Channel', value: `${channel}` }
+    ]));
+
+    return safeReply(interaction, { content: `✅ Đã đổi tên shop thành **${valid.name}**.`, flags: MessageFlags.Ephemeral });
+}
+
+async function sbRenew(interaction, type, plan, targetUserId = null) {
+    const admin = isAdminUser(interaction);
+    const userId = targetUserId || interaction.user.id;
+    if (!admin && userId !== interaction.user.id) return safeReply(interaction, { content: '❌ Bạn không có quyền gia hạn hồ sơ này.', flags: MessageFlags.Ephemeral });
+
+    const data = sbDataForType(type);
+    const record = data[userId];
+    if (!record) return safeReply(interaction, { content: `❌ Không tìm thấy hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
+
+    if (admin && targetUserId && targetUserId !== interaction.user.id) {
+        const days = sbPlanDays(plan);
+        const now = new Date();
+        const base = record.expireDate && new Date(record.expireDate).getTime() > now.getTime() ? new Date(record.expireDate) : now;
+        record.expireDate = new Date(base.getTime() + days * 86400000).toISOString();
+        record.plan = plan;
+        record.status = 'ACTIVE';
+        data[userId] = record;
+        sbSaveDataForType(type, data);
+        await sbApplyActivePermissions(interaction.guild, type, record);
+        sbLog('renew', sbLogEmbed('🔄 RENEWED', '#2ecc71', [
+            { name: 'User', value: `<@${userId}>`, inline: true },
+            { name: 'Plan', value: sbPlanLabel(plan), inline: true },
+            { name: 'New Expire', value: new Date(record.expireDate).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' }), inline: true },
+            { name: 'Amount', value: sbFormatVnd(sbPlanPrice(type, plan)), inline: true }
+        ]));
+        return safeReply(interaction, { content: `✅ Đã gia hạn ${type} cho <@${userId}>.`, flags: MessageFlags.Ephemeral });
+    }
+
+    // Self-renew goes through the same payment flow.
+    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+    return sbCreatePaymentTicket(interaction, type, plan, 0);
+}
+
+async function sbApplyActivePermissions(guild, type, record) {
+    if (!guild || !record?.channelId) return;
+    const channel = await guild.channels.fetch(record.channelId).catch(() => null);
+    if (!channel) return;
+    const roleId = sbRoleId(type);
+    if (record.status === 'ACTIVE') {
+        await channel.permissionOverwrites.edit(record.userId, {
+            ViewChannel: true,
+            SendMessages: true,
+            EmbedLinks: true,
+            AttachFiles: true,
+            ReadMessageHistory: true,
+            MentionEveryone: false
+        }).catch(() => {});
+        if (roleId) await channel.permissionOverwrites.edit(roleId, { ViewChannel: true, SendMessages: true, EmbedLinks: true, AttachFiles: true, ReadMessageHistory: true }).catch(() => {});
+    } else if (record.status === 'EXPIRED') {
+        await channel.permissionOverwrites.edit(record.userId, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true, MentionEveryone: false }).catch(() => {});
+    }
+}
+
+async function sbProcessExpiries() {
+    const now = Date.now();
+    for (const type of ['seller', 'builder']) {
+        const data = sbDataForType(type);
+        let changed = false;
+        for (const record of Object.values(data)) {
+            if (!record.expireDate || !['ACTIVE', 'SETUP_PENDING'].includes(record.status)) continue;
+            if (new Date(record.expireDate).getTime() <= now) {
+                record.status = 'EXPIRED';
+                record.expiredAt = now;
+                changed = true;
+                for (const guild of client.guilds.cache.values()) {
+                    await sbApplyActivePermissions(guild, type, record);
+                }
+                const user = await client.users.fetch(record.userId).catch(() => null);
+                if (user) await user.send(`⏰ Shop ${type} của bạn đã hết hạn. Dùng \/${type} renew để gia hạn.`).catch(() => {});
+            }
+        }
+        if (changed) sbSaveDataForType(type, data);
+    }
+}
+
+async function sbRefundDeposit(interaction, userId, amount) {
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
+    const data = sbDataForType('seller');
+    const record = data[userId];
+    if (!record) return safeReply(interaction, { content: '❌ Không tìm thấy Seller.', flags: MessageFlags.Ephemeral });
+    const refund = Math.max(0, Number(amount) || 0);
+    record.deposit = Math.max(0, Number(record.deposit || 0) + refund);
+    record.updatedAt = Date.now();
+    data[userId] = record;
+    sbSaveDataForType('seller', data);
+    sbLog('deposit', sbLogEmbed('💸 REFUND / ADD DEPOSIT', '#9b59b6', [
+        { name: 'User', value: `<@${userId}>`, inline: true },
+        { name: 'Amount', value: sbFormatVnd(refund), inline: true },
+        { name: 'Remaining', value: sbFormatVnd(record.deposit), inline: true },
+        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
+    ]));
+    return safeReply(interaction, { content: `✅ Đã hoàn cọc/thêm cọc cho <@${userId}>: còn **${sbFormatVnd(record.deposit)}**.`, flags: MessageFlags.Ephemeral });
+}
+
+function sbPenalty(userId, type, shopId, record, message) {
+    const oldDeposit = Math.max(0, Number(record.deposit) || 0);
+    const penaltyAmount = Math.min(oldDeposit, Math.floor(oldDeposit * SB_ENV.pingPenaltyPercent / 100));
+    const newDeposit = Math.max(0, oldDeposit - penaltyAmount);
+    record.deposit = newDeposit;
+    const penalties = sbRead(SB_PENALTIES_FILE, []);
+    penalties.push({
+        userId,
+        shopId,
+        type: 'MEMBER_PING',
+        amount: penaltyAmount,
+        oldDeposit,
+        newDeposit,
+        timestamp: Date.now(),
+        messageId: message.id,
+        channelId: message.channel.id,
+        moderator: 'system'
+    });
+    sbWrite(SB_PENALTIES_FILE, penalties);
+    sbLog('penalty', sbLogEmbed('⚠️ PENALTY', '#e74c3c', [
+        { name: 'User', value: `<@${userId}>`, inline: true },
+        { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
+        { name: 'Reason', value: `Ping @Member quá ${SB_ENV.pingLimitPerDay} lần/ngày`, inline: false },
+        { name: 'Deposit', value: `${sbFormatVnd(oldDeposit)} → ${sbFormatVnd(newDeposit)}`, inline: true },
+        { name: 'Penalty', value: sbFormatVnd(penaltyAmount), inline: true },
+        { name: 'Message ID', value: message.id, inline: true },
+        { name: 'Channel', value: `${message.channel}`, inline: true }
+    ]));
+    return { penaltyAmount, oldDeposit, newDeposit };
+}
+
+function sbIsTargetMemberMention(message) {
+    const roleHit = SB_ENV.memberRoleId && message.mentions?.roles?.has(SB_ENV.memberRoleId);
+    const userHit = SB_ENV.memberUserId && message.mentions?.users?.has(SB_ENV.memberUserId);
+    return Boolean(roleHit || userHit);
+}
+
+async function sbHandleShopMessage(message) {
+    if (!message.guild || message.author.bot) return false;
+    const channelId = message.channel.id;
+    let match = null;
+    let matchType = null;
+    for (const type of ['seller', 'builder']) {
+        const data = sbDataForType(type);
+        const record = Object.values(data).find(r => r.channelId === channelId);
+        if (record) { match = record; matchType = type; break; }
+    }
+    if (!match) return false;
+    if (match.userId !== message.author.id) return false;
+
+    if (match.expireDate && new Date(match.expireDate).getTime() <= Date.now() && match.status === 'ACTIVE') {
+        match.status = 'EXPIRED';
+        const data = sbDataForType(matchType);
+        data[match.userId] = match;
+        sbSaveDataForType(matchType, data);
+        await sbApplyActivePermissions(message.guild, matchType, match);
+    }
+
+    if (match.status !== 'ACTIVE') return false;
+    if (!sbIsTargetMemberMention(message)) return false;
+
+    const today = sbDateKey();
+    if (match.lastMemberPingDate !== today) {
+        match.lastMemberPingDate = today;
+        match.memberPingCount = 1;
+        const data = sbDataForType(matchType);
+        data[match.userId] = match;
+        sbSaveDataForType(matchType, data);
+        return false;
+    }
+
+    const data = sbDataForType(matchType);
+    const result = sbPenalty(match.userId, matchType, channelId, match, message);
+    data[match.userId] = match;
+    sbSaveDataForType(matchType, data);
+    await message.channel.send({
+        content: `⚠️ **VI PHẠM QUY ĐỊNH PING**\n<@${match.userId}> đã sử dụng quá số lần ping @Member cho phép trong ngày.\n\n` +
+            `Giới hạn: **${SB_ENV.pingLimitPerDay} lần/ngày**\n` +
+            `Vi phạm: **lần thứ 2+**\n\n` +
+            `💰 Tiền phạt: **${sbFormatVnd(result.penaltyAmount)}** (${SB_ENV.pingPenaltyPercent}%)\n` +
+            `💰 Cọc trước: **${sbFormatVnd(result.oldDeposit)}**\n` +
+            `💰 Cọc sau: **${sbFormatVnd(result.newDeposit)}**\n\n` +
+            'Vui lòng tuân thủ quy định của Seller/Builder.'
+    });
+    return true;
+}
+
+function sbCollectPenalties(userId = null) {
+    const penalties = sbRead(SB_PENALTIES_FILE, []);
+    return userId ? penalties.filter(p => p.userId === userId) : penalties;
+}
+
+async function sbAdminAdd(interaction, type, userId, plan, deposit, shopName) {
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
+    const data = sbDataForType(type);
+    if (data[userId]) return safeReply(interaction, { content: `⚠️ User đã có hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
+    const now = new Date();
+    const record = {
+        userId,
+        shopName: '',
+        shopSlug: '',
+        channelId: null,
+        categoryId: sbCategoryId(type),
+        deposit: type === 'seller' ? Math.max(SB_ENV.sellerMinDeposit, Number(deposit) || 0) : Math.max(SB_ENV.builderMinDeposit, Number(deposit) || 0),
+        plan: plan || 'monthly',
+        startDate: now.toISOString(),
+        expireDate: new Date(now.getTime() + sbPlanDays(plan || 'monthly') * 86400000).toISOString(),
+        status: 'SETUP_PENDING',
+        lastMemberPingDate: '',
+        lastRenameAt: null,
+        createdBy: interaction.user.id,
+        createdAt: Date.now()
+    };
+    data[userId] = record;
+    sbSaveDataForType(type, data);
+    const roleId = sbRoleId(type);
+    if (roleId && interaction.guild) {
+        const member = await sbFetchMember(interaction.guild, userId);
+        if (member) await member.roles.add(roleId, `Admin add ${type}`).catch(() => {});
+    }
+    if (shopName) {
+        const fake = {
+            guild: interaction.guild,
+            user: { id: userId },
+            replied: false,
+            deferred: false,
+            reply: async () => null,
+            followUp: async () => null
+        };
+        await sbCreateShop(fake, type, shopName).catch(() => {});
+    }
+    return safeReply(interaction, { content: `✅ Đã thêm ${type} cho <@${userId}> ở trạng thái **SETUP_PENDING**.`, flags: MessageFlags.Ephemeral });
+}
+
+async function sbAdminClose(interaction, type, userId) {
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
+    const data = sbDataForType(type);
+    const record = data[userId];
+    if (!record) return safeReply(interaction, { content: `❌ Không tìm thấy hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
+    record.status = 'CLOSED';
+    record.closedAt = Date.now();
+    data[userId] = record;
+    sbSaveDataForType(type, data);
+    if (record.channelId) {
+        const ch = await interaction.guild.channels.fetch(record.channelId).catch(() => null);
+        if (ch) await ch.permissionOverwrites.edit(userId, { SendMessages: false, ViewChannel: true }).catch(() => {});
+    }
+    return safeReply(interaction, { content: `✅ Đã đóng shop ${type} của <@${userId}>. Channel không bị xóa.`, flags: MessageFlags.Ephemeral });
+}
+
+async function sbAdminSetDepositType(interaction, type, userId, amount) {
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
+    const data = sbDataForType(type);
+    const record = data[userId];
+    if (!record) return safeReply(interaction, { content: `❌ Không tìm thấy ${type}.`, flags: MessageFlags.Ephemeral });
+    const old = Number(record.deposit) || 0;
+    record.deposit = Math.max(0, Math.floor(Number(amount) || 0));
+    data[userId] = record;
+    sbSaveDataForType(type, data);
+    sbLog('deposit', sbLogEmbed('🛡️ SET DEPOSIT', '#9b59b6', [
+        { name: 'User', value: `<@${userId}>`, inline: true },
+        { name: 'Type', value: type, inline: true },
+        { name: 'Deposit', value: `${sbFormatVnd(old)} → ${sbFormatVnd(record.deposit)}`, inline: true },
+        { name: 'Moderator', value: `<@${interaction.user.id}>`, inline: true }
+    ]));
+    return safeReply(interaction, { content: `✅ Deposit ${type} đã đổi thành **${sbFormatVnd(record.deposit)}**.`, flags: MessageFlags.Ephemeral });
+}
+
+async function sbAdminSetDeposit(interaction, userId, amount) {
+    return sbAdminSetDepositType(interaction, 'seller', userId, amount);
+}
+
+async function sbAdminSetPlan(interaction, type, plan, price) {
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
+    const key = type === 'seller' ? (plan === 'weekly' ? 'sellerWeeklyPrice' : 'sellerMonthlyPrice') : (plan === 'weekly' ? 'builderWeeklyPrice' : 'builderMonthlyPrice');
+    sbSetConfig({ [key]: Math.max(0, Number(price) || 0) });
+    return safeReply(interaction, { content: `✅ Giá ${type} ${sbPlanLabel(plan)} đã đổi thành **${sbFormatVnd(price)}**.`, flags: MessageFlags.Ephemeral });
+}
+
+async function sbHandleCommand(interaction) {
+    const root = interaction.commandName;
+    const type = root === 'seller' ? 'seller' : 'builder';
+    if (root !== 'seller' && root !== 'builder') return false;
+    const sub = interaction.options.getSubcommand();
+
+    if (sub === 'info') {
+        const target = interaction.options.getUser('user');
+        if (target && target.id !== interaction.user.id && !isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin mới xem info user khác.', flags: MessageFlags.Ephemeral });
+        const userId = target?.id || interaction.user.id;
+        const { record } = sbGetRecord(interaction, type, userId);
+        if (!record) return safeReply(interaction, { content: `❌ Không có hồ sơ ${type} cho <@${userId}>.`, flags: MessageFlags.Ephemeral });
+        return safeReply(interaction, { embeds: [sbInfoEmbed(type, record, interaction.guild)], flags: MessageFlags.Ephemeral });
+    }
+
+    if (sub === 'renew') {
+        const target = interaction.options.getUser('user');
+        const plan = interaction.options.getString('plan') || 'monthly';
+        return sbRenew(interaction, type, plan, target?.id || null);
+    }
+
+    if (sub === 'rename') {
+        const target = interaction.options.getUser('user');
+        if (target && target.id !== interaction.user.id && !isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin mới đổi tên user khác.', flags: MessageFlags.Ephemeral });
+        const userId = target?.id || interaction.user.id;
+        const data = sbDataForType(type);
+        const record = data[userId];
+        if (!record) return safeReply(interaction, { content: `❌ Không có hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
+        const name = interaction.options.getString('name');
+        if (userId !== interaction.user.id) {
+            const ch = record.channelId ? await interaction.guild.channels.fetch(record.channelId).catch(() => null) : null;
+            if (!ch) return safeReply(interaction, { content: '❌ Không có channel shop.', flags: MessageFlags.Ephemeral });
+            const valid = sbValidateShopName(name);
+            if (!valid.ok) return safeReply(interaction, { content: `❌ ${valid.error}`, flags: MessageFlags.Ephemeral });
+            if (sbNameTaken(interaction.guild, type, valid.slug, record.channelId)) return safeReply(interaction, { content: '❌ Tên shop đã tồn tại.', flags: MessageFlags.Ephemeral });
+            await ch.setName(`${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${valid.slug}`);
+            record.shopName = valid.name; record.shopSlug = valid.slug; record.lastRenameAt = Date.now();
+            data[userId] = record; sbSaveDataForType(type, data);
+            return safeReply(interaction, { content: `✅ Đã đổi tên shop cho <@${userId}>.`, flags: MessageFlags.Ephemeral });
+        }
+        return sbRename(interaction, type, name);
+    }
+
+    // Admin-only commands
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Lệnh này chỉ dành cho Admin.', flags: MessageFlags.Ephemeral });
+
+    if (sub === 'add') return sbAdminAdd(interaction, type, interaction.options.getUser('user').id, interaction.options.getString('plan') || 'monthly', interaction.options.getInteger('deposit') || 0, interaction.options.getString('shop_name') || '');
+    if (sub === 'remove') {
+        const userId = interaction.options.getUser('user').id;
+        const data = sbDataForType(type); const record = data[userId];
+        if (!record) return safeReply(interaction, { content: '❌ Không tìm thấy hồ sơ.', flags: MessageFlags.Ephemeral });
+        delete data[userId]; sbSaveDataForType(type, data);
+        return safeReply(interaction, { content: `✅ Đã xóa dữ liệu ${type} của <@${userId}>. Channel không tự xóa.`, flags: MessageFlags.Ephemeral });
+    }
+    if (sub === 'list') {
+        const data = sbDataForType(type);
+        const records = Object.values(data);
+        const lines = records.length ? records.slice(0, 25).map(r => `• <@${r.userId}> — **${r.shopName || 'Chưa đặt'}** — \`${r.status}\``) : ['Không có dữ liệu.'];
+        return safeReply(interaction, { embeds: [new EmbedBuilder().setTitle(type === 'seller' ? '👑 SELLER LIST' : '🛠️ BUILDER LIST').setColor('#5865F2').setDescription(lines.join('\n')).setFooter({ text: `Tổng: ${records.length}` })], flags: MessageFlags.Ephemeral });
+    }
+    if (sub === 'setdeposit' && type === 'builder') return sbAdminSetDepositType(interaction, 'builder', interaction.options.getUser('user').id, interaction.options.getInteger('amount'));
+    if (sub === 'penalty') {
+        const target = interaction.options.getUser('user');
+        const penalties = sbCollectPenalties(target?.id || null);
+        const lines = penalties.slice(-25).reverse().map(p => `• <t:${Math.floor(p.timestamp / 1000)}:f> • <@${p.userId}> • -${sbFormatVnd(p.amount)} • ${p.type}`);
+        return safeReply(interaction, { content: lines.length ? lines.join('\n') : 'Không có penalty.', flags: MessageFlags.Ephemeral });
+    }
+    if (sub === 'refunddeposit') return sbRefundDeposit(interaction, interaction.options.getUser('user').id, interaction.options.getInteger('amount'));
+    if (sub === 'setdeposit') return sbAdminSetDeposit(interaction, interaction.options.getUser('user').id, interaction.options.getInteger('amount'));
+    if (sub === 'setplan') return sbAdminSetPlan(interaction, type, interaction.options.getString('plan'), interaction.options.getInteger('price'));
+    if (sub === 'close') return sbAdminClose(interaction, type, interaction.options.getUser('user').id);
+    return false;
+}
+
+async function sbSetupSlashCommand(interaction) {
+    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
+    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+    const targetChannelId = interaction.channelId;
+    const cfg = sbGetConfig();
+    const panel = cfg.panel || {};
+    if (panel.channelId === targetChannelId && panel.messageId) {
+        const channel = await client.channels.fetch(targetChannelId).catch(() => null);
+        const msg = channel?.isTextBased() ? await channel.messages.fetch(panel.messageId).catch(() => null) : null;
+        if (msg) {
+            await msg.edit(sbApplicationPanel()).catch(() => {});
+            return safeEditReply(interaction, { content: '✅ Đã cập nhật Panel Tuyển Dụng cố định.' });
+        }
+    }
+    const msg = await interaction.channel.send(sbApplicationPanel());
+    sbSetConfig({ panel: { channelId: targetChannelId, messageId: msg.id } });
+    return safeEditReply(interaction, { content: '✅ Đã tạo Panel Tuyển Dụng cố định trong kênh này.' });
+}
+
+async function sbHandleButton(interaction) {
+    const id = interaction.customId;
+    if (id === 'sb_apply_seller') return interaction.showModal(sbApplicationModal('seller'));
+    if (id === 'sb_apply_builder') return interaction.showModal(sbApplicationModal('builder'));
+    if (id === 'sb_begin_setup_seller') return sbHandleBeginSetup(interaction, 'seller');
+    if (id === 'sb_begin_setup_builder') return sbHandleBeginSetup(interaction, 'builder');
+    if (id === 'sb_setup_shop_seller') {
+        const modal = new ModalBuilder().setCustomId('sb_shop_name_seller').setTitle('👑 SETUP SHOP SELLER').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop_name').setLabel('Tên Shop').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Khang Store').setRequired(true).setMaxLength(50)));
+        return interaction.showModal(modal);
+    }
+    if (id === 'sb_setup_shop_builder') {
+        const modal = new ModalBuilder().setCustomId('sb_shop_name_builder').setTitle('🛠️ SETUP BUILDER').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop_name').setLabel('Tên Builder').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Khang').setRequired(true).setMaxLength(50)));
+        return interaction.showModal(modal);
+    }
+    if (id.startsWith('sb_app_approve_')) return sbApproveApplication(interaction, id.replace('sb_app_approve_', ''), true);
+    if (id.startsWith('sb_app_reject_')) return sbApproveApplication(interaction, id.replace('sb_app_reject_', ''), false);
+    if (id.startsWith('sb_pay_approve_')) return sbHandlePaymentApproval(interaction, id.replace('sb_pay_approve_', ''));
+    return false;
+}
+
+async function sbHandleSelect(interaction) {
+    const id = interaction.customId;
+    if (id.startsWith('sb_plan_select_')) {
+        const type = id.replace('sb_plan_select_', '');
+        const plan = interaction.values[0];
+        const price = sbPlanPrice(type, plan);
+        if (type === 'builder' && price <= 0 && SB_ENV.builderMinDeposit <= 0) {
+            if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+            const data = sbDataForType('builder');
+            const record = data[interaction.user.id] || {
+                userId: interaction.user.id,
+                deposit: SB_ENV.builderMinDeposit,
+                applicationId: null,
+                status: 'SETUP_PENDING'
+            };
+            const now = new Date();
+            const base = record.expireDate && new Date(record.expireDate).getTime() > now.getTime()
+                ? new Date(record.expireDate)
+                : now;
+            record.plan = plan;
+            record.startDate = record.startDate || now.toISOString();
+            record.expireDate = new Date(base.getTime() + sbPlanDays(plan) * 86400000).toISOString();
+            record.status = record.channelId ? 'ACTIVE' : 'SETUP_PENDING';
+            data[interaction.user.id] = record;
+            sbSaveDataForType('builder', data);
+            return safeEditReply(interaction, { content: '✅ Builder không có phí được cấu hình. Bạn có thể đặt tên Builder ngay.', components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sb_setup_shop_builder').setLabel('🛠️ Đặt tên Builder').setStyle(ButtonStyle.Primary))] });
+        }
+        if (type === 'seller') {
+            return interaction.showModal(sbSetupPaymentModal(type, plan));
+        }
+        return sbCreatePaymentTicket(interaction, type, plan, SB_ENV.builderMinDeposit);
+    }
+    return false;
+}
+
+async function sbHandleModal(interaction) {
+    const id = interaction.customId;
+    if (id.startsWith('sb_application_modal_')) return sbSendApplication(id.replace('sb_application_modal_', ''), interaction);
+    if (id.startsWith('sb_payment_modal_')) {
+        const parts = id.split('_');
+        const type = parts[3];
+        const plan = parts[4];
+        const deposit = type === 'seller' ? sbParseVnd(interaction.fields.getTextInputValue('deposit')) : SB_ENV.builderMinDeposit;
+        if (type === 'seller' && deposit < SB_ENV.sellerMinDeposit) return safeReply(interaction, { content: `❌ Cọc tối thiểu là **${sbFormatVnd(SB_ENV.sellerMinDeposit)}**.`, flags: MessageFlags.Ephemeral });
+        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        return sbCreatePaymentTicket(interaction, type, plan, deposit);
+    }
+    if (id === 'sb_shop_name_seller') return sbCreateShop(interaction, 'seller', interaction.fields.getTextInputValue('shop_name'));
+    if (id === 'sb_shop_name_builder') return sbCreateShop(interaction, 'builder', interaction.fields.getTextInputValue('shop_name'));
+    return false;
+}
+
+// ============================================================
+// END SELLER / BUILDER SYSTEM
+// ============================================================
+
+
+// ============================================================
 // 18. SLASH COMMANDS
 // ============================================================
 
@@ -3383,6 +4756,8 @@ async function handleTicketCommand(interaction) {
 const MONEY_COMMAND_NAMES = [
     'setup', 'setstock', 'rate', 'time'
 ];
+
+const SELLER_BUILDER_COMMAND_NAMES = ['seller', 'builder'];
 
 const THU_MONEY_COMMAND_NAMES = [
     'thumoney', 'thu-time'
@@ -3477,6 +4852,40 @@ const commands = [
                 .setMaxValue(23)
                 .setRequired(true)
         ),
+
+    // SELLER / BUILDER
+    new SlashCommandBuilder()
+        .setName('tuyendung')
+        .setDescription('Tạo panel tuyển dụng Seller / Builder cố định'),
+
+    new SlashCommandBuilder()
+        .setName('seller')
+        .setDescription('Quản lý hồ sơ Seller')
+        .addSubcommand(s => s.setName('info').setDescription('Xem thông tin Seller').addUserOption(o => o.setName('user').setDescription('User cần xem (Admin)')))
+        .addSubcommand(s => s.setName('renew').setDescription('Gia hạn Seller').addStringOption(o => o.setName('plan').setDescription('Gói gia hạn').addChoices({name:'7 ngày',value:'weekly'},{name:'30 ngày',value:'monthly'}).setRequired(true)).addUserOption(o => o.setName('user').setDescription('User cần gia hạn (Admin)')))
+        .addSubcommand(s => s.setName('rename').setDescription('Đổi tên shop Seller').addStringOption(o => o.setName('name').setDescription('Tên shop mới').setRequired(true)).addUserOption(o => o.setName('user').setDescription('User cần đổi tên (Admin)')))
+        .addSubcommand(s => s.setName('add').setDescription('Admin thêm Seller').addUserOption(o => o.setName('user').setDescription('Seller').setRequired(true)).addStringOption(o => o.setName('plan').setDescription('Gói').addChoices({name:'7 ngày',value:'weekly'},{name:'30 ngày',value:'monthly'})).addIntegerOption(o => o.setName('deposit').setDescription('Cọc').setMinValue(0)).addStringOption(o => o.setName('shop_name').setDescription('Tên shop (tùy chọn)')))
+        .addSubcommand(s => s.setName('remove').setDescription('Admin xóa hồ sơ Seller').addUserOption(o => o.setName('user').setDescription('Seller').setRequired(true)))
+        .addSubcommand(s => s.setName('list').setDescription('Danh sách Seller'))
+        .addSubcommand(s => s.setName('penalty').setDescription('Xem lịch sử phạt Seller').addUserOption(o => o.setName('user').setDescription('Seller')))
+        .addSubcommand(s => s.setName('refunddeposit').setDescription('Trừ / điều chỉnh cọc Seller').addUserOption(o => o.setName('user').setDescription('Seller').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Số tiền').setMinValue(0).setRequired(true)))
+        .addSubcommand(s => s.setName('setdeposit').setDescription('Đặt lại số dư cọc Seller').addUserOption(o => o.setName('user').setDescription('Seller').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Số dư mới').setMinValue(0).setRequired(true)))
+        .addSubcommand(s => s.setName('setplan').setDescription('Đổi giá gói Seller').addStringOption(o => o.setName('plan').setDescription('Gói').addChoices({name:'7 ngày',value:'weekly'},{name:'30 ngày',value:'monthly'}).setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Giá mới').setMinValue(0).setRequired(true)))
+        .addSubcommand(s => s.setName('close').setDescription('Đóng shop Seller').addUserOption(o => o.setName('user').setDescription('Seller').setRequired(true))),
+
+    new SlashCommandBuilder()
+        .setName('builder')
+        .setDescription('Quản lý hồ sơ Builder')
+        .addSubcommand(s => s.setName('info').setDescription('Xem thông tin Builder').addUserOption(o => o.setName('user').setDescription('User cần xem (Admin)')))
+        .addSubcommand(s => s.setName('renew').setDescription('Gia hạn Builder').addStringOption(o => o.setName('plan').setDescription('Gói gia hạn').addChoices({name:'7 ngày',value:'weekly'},{name:'30 ngày',value:'monthly'}).setRequired(true)).addUserOption(o => o.setName('user').setDescription('User cần gia hạn (Admin)')))
+        .addSubcommand(s => s.setName('rename').setDescription('Đổi tên Builder').addStringOption(o => o.setName('name').setDescription('Tên mới').setRequired(true)).addUserOption(o => o.setName('user').setDescription('User cần đổi tên (Admin)')))
+        .addSubcommand(s => s.setName('add').setDescription('Admin thêm Builder').addUserOption(o => o.setName('user').setDescription('Builder').setRequired(true)).addStringOption(o => o.setName('plan').setDescription('Gói').addChoices({name:'7 ngày',value:'weekly'},{name:'30 ngày',value:'monthly'})).addIntegerOption(o => o.setName('deposit').setDescription('Cọc Builder (tùy chọn)').setMinValue(0)).addStringOption(o => o.setName('shop_name').setDescription('Tên Builder (tùy chọn)')))
+        .addSubcommand(s => s.setName('remove').setDescription('Admin xóa hồ sơ Builder').addUserOption(o => o.setName('user').setDescription('Builder').setRequired(true)))
+        .addSubcommand(s => s.setName('list').setDescription('Danh sách Builder'))
+        .addSubcommand(s => s.setName('setdeposit').setDescription('Đặt cọc Builder').addUserOption(o => o.setName('user').setDescription('Builder').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Số dư cọc mới').setMinValue(0).setRequired(true)))
+        .addSubcommand(s => s.setName('penalty').setDescription('Xem lịch sử phạt Builder').addUserOption(o => o.setName('user').setDescription('Builder')))
+        .addSubcommand(s => s.setName('setplan').setDescription('Đổi giá gói Builder').addStringOption(o => o.setName('plan').setDescription('Gói').addChoices({name:'7 ngày',value:'weekly'},{name:'30 ngày',value:'monthly'}).setRequired(true)).addIntegerOption(o => o.setName('price').setDescription('Giá mới').setMinValue(0).setRequired(true)))
+        .addSubcommand(s => s.setName('close').setDescription('Đóng shop Builder').addUserOption(o => o.setName('user').setDescription('Builder').setRequired(true))),
 
     // ACCOUNT
     new SlashCommandBuilder()
@@ -3659,6 +5068,7 @@ client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
 
     try {
+        await sbHandleShopMessage(message);
         const contentLower =
             message.content.toLowerCase();
 
@@ -3765,6 +5175,14 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         if (interaction.isChatInputCommand()) {
+            if (interaction.commandName === 'tuyendung') {
+                return await sbSetupSlashCommand(interaction);
+            }
+
+            if (SELLER_BUILDER_COMMAND_NAMES.includes(interaction.commandName)) {
+                return await sbHandleCommand(interaction);
+            }
+
             if (interaction.commandName === 'ticket') {
                 return await handleTicketCommand(interaction);
             }
@@ -3790,6 +5208,10 @@ client.on(Events.InteractionCreate, async interaction => {
 
         if (interaction.isButton()) {
             const id = interaction.customId;
+
+            if (id.startsWith('sb_')) {
+                return await sbHandleButton(interaction);
+            }
 
             if (id === 'close_ticket') {
                 return await handleCloseTicket(interaction);
@@ -3844,6 +5266,10 @@ client.on(Events.InteractionCreate, async interaction => {
         if (interaction.isStringSelectMenu()) {
             const id = interaction.customId;
 
+            if (id.startsWith('sb_')) {
+                return await sbHandleSelect(interaction);
+            }
+
             if (id === 'ticket_type_select') {
                 const type = interaction.values[0];
                 if (type === 'buy_items') {
@@ -3858,6 +5284,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (id === 'ticket_seller_select') {
                 const sellerId = interaction.values[0];
+                if (sellerId === 'none') {
+                    return safeReply(interaction, { content: '⚠️ Hiện chưa có Seller khả dụng.', flags: MessageFlags.Ephemeral });
+                }
                 const seller = getSellerInfo(sellerId);
                 if (!seller) return safeReply(interaction, { content: '❌ Seller không hợp lệ.', flags: MessageFlags.Ephemeral });
 
@@ -3882,6 +5311,10 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         if (interaction.isModalSubmit()) {
+            if (interaction.customId.startsWith('sb_')) {
+                return await sbHandleModal(interaction);
+            }
+
             if (
                 [
                     'modal_bank',
@@ -3936,6 +5369,7 @@ client.once(Events.ClientReady, async c => {
     ensureJsonFile(ACC_STOCK_FILE, []);
     ensureJsonFile(ACC_DETAIL_FILE, []);
     ensureJsonFile(MONEY_ORDERS_FILE, {});
+    sbEnsureFiles();
 
     console.log(`📦 [STARTUP] Money stock: ${currentStockM}M$`);
     console.log(`🧩 [STARTUP] Panel config: channel=${moneyConfig?.channelId || 'none'} message=${moneyConfig?.messageId || 'none'}`);
@@ -3943,6 +5377,8 @@ client.once(Events.ClientReady, async c => {
     await updateAutoBuyPanel();
     await updateThuMoneyPanel();
     setInterval(() => updateThuMoneyPanel(), 60 * 1000);
+    setTimeout(() => sbProcessExpiries().catch(() => {}), 5000);
+    setInterval(() => sbProcessExpiries().catch(() => {}), SB_ENV.expiryCheckMinutes * 60 * 1000);
 });
 
 // ============================================================
