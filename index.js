@@ -4224,7 +4224,6 @@ function sbShopPermissionOverwrites(guild, userId, roleId) {
                 PermissionsBitField.Flags.EmbedLinks,
                 PermissionsBitField.Flags.AttachFiles,
                 PermissionsBitField.Flags.ReadMessageHistory,
-                PermissionsBitField.Flags.MentionUsers
             ],
             deny: [PermissionsBitField.Flags.MentionEveryone]
         },
