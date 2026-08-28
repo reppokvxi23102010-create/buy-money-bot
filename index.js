@@ -3297,6 +3297,53 @@ async function handleCloseTicket(interaction) {
     const topic =
         interaction.channel?.topic || '';
 
+    // Đóng hồ sơ tuyển dụng cũng phải đóng trạng thái đang xử lý,
+    // tránh user bị kẹt với thông báo 'đang có hồ sơ đang xử lý'.
+    if (topic.startsWith('sbApplication:')) {
+        const parts = topic.replace('sbApplication:', '').split(':');
+        const appId = parts[0];
+        const apps = sbApplications();
+        const app = apps[appId];
+        if (app) {
+            const orders = sbOrders();
+            if (app.orderId && orders[app.orderId]?.status === 'PENDING') {
+                orders[app.orderId].status = 'CANCELLED';
+                orders[app.orderId].cancelledAt = Date.now();
+                orders[app.orderId].cancelledBy = interaction.user.id;
+                sbWrite(SB_ORDERS_FILE, orders);
+            }
+            // Đóng ticket phải đóng luôn hồ sơ đang xử lý, kể cả chưa chọn gói.
+            if (app.status !== 'CLOSED') {
+                app.status = 'CLOSED';
+                app.closedAt = Date.now();
+                app.closedBy = interaction.user.id;
+                apps[appId] = app;
+                sbWrite(SB_APPLICATIONS_FILE, apps);
+            }
+        }
+    } else if (topic.startsWith('sbOrder:')) {
+        const orderId = topic.replace('sbOrder:', '');
+        const orders = sbOrders();
+        const order = orders[orderId];
+        if (order && order.status === 'PENDING') {
+            order.status = 'CANCELLED';
+            order.cancelledAt = Date.now();
+            order.cancelledBy = interaction.user.id;
+            orders[orderId] = order;
+            sbWrite(SB_ORDERS_FILE, orders);
+
+            const apps = sbApplications();
+            const app = Object.values(apps).find(a => a.orderId === orderId);
+            if (app) {
+                app.status = 'CLOSED';
+                app.closedAt = Date.now();
+                app.closedBy = interaction.user.id;
+                apps[app.id] = app;
+                sbWrite(SB_APPLICATIONS_FILE, apps);
+            }
+        }
+    }
+
     if (topic.startsWith('accOrder:')) {
         const accId =
             topic.replace('accOrder:', '');
@@ -3346,7 +3393,7 @@ const SB_CONFIG_FILE = path.join(SB_DATA_DIR, 'config.json');
 const SB_ENV = {
     sellerRoleId: String(process.env.SELLER_ROLE_ID || '').trim(),
     builderRoleId: String(process.env.BUILDER_ROLE_ID || '').trim(),
-    sellerCategoryId: String(process.env.SELLER_CATEGORY_ID || '').trim(),
+    sellerCategoryId: String(process.env.SELLER_CATEGORY_ID || '1531116626311905463').trim(),
     builderCategoryId: String(process.env.BUILDER_CATEGORY_ID || '').trim(),
     applicationChannelId: String(process.env.APPLICATION_CHANNEL_ID || '').trim(),
     logChannelId: String(process.env.SELLER_BUILDER_LOG_CHANNEL_ID || process.env.LOG_CHANNEL_ID || '').trim(),
@@ -3356,8 +3403,8 @@ const SB_ENV = {
     sellerMinDeposit: Math.max(0, Number.parseInt(process.env.SELLER_MIN_DEPOSIT || '100000', 10) || 100000),
     sellerWeeklyPrice: Math.max(0, Number.parseInt(process.env.SELLER_WEEKLY_PRICE || '30000', 10) || 30000),
     sellerMonthlyPrice: Math.max(0, Number.parseInt(process.env.SELLER_MONTHLY_PRICE || '100000', 10) || 100000),
-    builderWeeklyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_WEEKLY_PRICE || '0', 10) || 0),
-    builderMonthlyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_MONTHLY_PRICE || '0', 10) || 0),
+    builderWeeklyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_WEEKLY_PRICE || '30000', 10) || 30000),
+    builderMonthlyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_MONTHLY_PRICE || '100000', 10) || 100000),
     builderMinDeposit: Math.max(0, Number.parseInt(process.env.BUILDER_MIN_DEPOSIT || '0', 10) || 0),
     pingLimitPerDay: Math.max(1, Number.parseInt(process.env.PING_LIMIT_PER_DAY || '1', 10) || 1),
     pingPenaltyPercent: Math.max(0, Number.parseFloat(process.env.PING_PENALTY_PERCENT || '10') || 10),
@@ -3378,8 +3425,21 @@ function sbEnsureFiles() {
             sellerMonthlyPrice: SB_ENV.sellerMonthlyPrice,
             builderWeeklyPrice: SB_ENV.builderWeeklyPrice,
             builderMonthlyPrice: SB_ENV.builderMonthlyPrice,
+            builderPricingVersion: 2,
             panel: {}
         });
+
+        // Migration v2: chuẩn hóa giá Builder hiện tại theo yêu cầu 30k/100k.
+        // Chỉ chạy một lần khi chưa có env override, để /setplan về sau không bị ghi đè mỗi restart.
+        const cfg = readJson(SB_CONFIG_FILE, {});
+        let changed = false;
+        if (!process.env.BUILDER_WEEKLY_PRICE && !process.env.BUILDER_MONTHLY_PRICE && Number(cfg.builderPricingVersion || 0) < 2) {
+            cfg.builderWeeklyPrice = 30000;
+            cfg.builderMonthlyPrice = 100000;
+            cfg.builderPricingVersion = 2;
+            changed = true;
+        }
+        if (changed) writeJson(SB_CONFIG_FILE, cfg);
     } catch (err) {
         console.error('❌ Không thể khởi tạo dữ liệu Seller/Builder:', err?.message || err);
     }
@@ -3421,6 +3481,18 @@ function sbDateKey(date = new Date()) {
         month: '2-digit',
         day: '2-digit'
     }).format(date);
+}
+
+function sbShopChannelName(type, slug) {
+    return `${type === 'seller' ? '👑┆seller-' : '🛠️┆builder-'}${slug}`;
+}
+
+function sbShopNameFromChannelName(type, channelName) {
+    const prefix = type === 'seller' ? '👑┆seller-' : '🛠️┆builder-';
+    const altPrefix = type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-';
+    const raw = String(channelName || '');
+    const slug = raw.startsWith(prefix) ? raw.slice(prefix.length) : raw.startsWith(altPrefix) ? raw.slice(altPrefix.length) : '';
+    return slug ? slug.replace(/-/g, ' ') : '';
 }
 
 function sbSlug(input) {
@@ -3522,6 +3594,8 @@ function sbApplicationPanel() {
             '╚════════════════════════════╝\n\n' +
             'Nhận Builder xây dựng / dịch vụ trong server.\n\n' +
             (SB_ENV.builderMinDeposit > 0 ? `💰 **Cọc:** ${sbFormatVnd(SB_ENV.builderMinDeposit)}\n` : '') +
+            `📅 **7 ngày:** ${sbFormatVnd(cfg.builderWeeklyPrice)}\n` +
+            `📅 **30 ngày:** ${sbFormatVnd(cfg.builderMonthlyPrice)}\n` +
             '✅ Có channel Builder riêng\n' +
             '✅ Tự đặt tên Builder\n' +
             '✅ Chat thoải mái\n\n' +
@@ -3598,11 +3672,16 @@ async function sbSendApplication(type, interaction) {
         userId: interaction.user.id,
         username: interaction.user.username,
         fields: {},
-        status: 'SETUP_PENDING',
+        status: 'PENDING',
         createdAt: Date.now(),
         reviewedBy: null,
         reviewedAt: null,
-        ticketChannelId: null
+        ticketChannelId: null,
+        applicationMessageId: null,
+        orderId: null,
+        shopName: '',
+        shopSlug: '',
+        shopChannelId: null
     };
 
     for (const field of ['name', 'products', 'services', 'experience', 'hours']) {
@@ -3613,7 +3692,8 @@ async function sbSendApplication(type, interaction) {
 
     try {
         const safeUser = interaction.user.username.toLowerCase().replace(/[^a-z0-9-_]/g, '').slice(0, 45) || 'user';
-        const ticketName = `application-${type}-${safeUser}`;
+        // Đây chính là ticket thanh toán + hồ sơ, không cần Admin duyệt hồ sơ trước.
+        const ticketName = `${type === 'seller' ? '💳┆seller-' : '💳┆builder-'}${safeUser}`;
         const ticketChannel = await interaction.guild.channels.create({
             name: ticketName,
             type: ChannelType.GuildText,
@@ -3635,8 +3715,6 @@ async function sbSendApplication(type, interaction) {
         });
 
         application.ticketChannelId = ticketChannel.id;
-        apps[appId] = application;
-        sbWrite(SB_APPLICATIONS_FILE, apps);
 
         const fields = [
             { name: '👤 User', value: `<@${interaction.user.id}>`, inline: true },
@@ -3649,28 +3727,31 @@ async function sbSendApplication(type, interaction) {
             { name: '🕐 Thời gian hoạt động', value: application.fields.hours || 'Không cung cấp', inline: false }
         ];
 
-        if (type === 'seller') {
-            const cfg = sbGetConfig();
-            fields.push(
-                { name: '💰 Cọc yêu cầu', value: sbFormatVnd(SB_ENV.sellerMinDeposit), inline: true },
-                { name: '📅 Gói tuần', value: sbFormatVnd(cfg.sellerWeeklyPrice), inline: true },
-                { name: '📅 Gói tháng', value: sbFormatVnd(cfg.sellerMonthlyPrice), inline: true }
-            );
-        }
+        const cfg = sbGetConfig();
+        fields.push(
+            { name: '📅 Gói tuần', value: sbFormatVnd(type === 'seller' ? cfg.sellerWeeklyPrice : cfg.builderWeeklyPrice), inline: true },
+            { name: '📅 Gói tháng', value: sbFormatVnd(type === 'seller' ? cfg.sellerMonthlyPrice : cfg.builderMonthlyPrice), inline: true },
+            ...(type === 'seller'
+                ? [{ name: '🛡️ Cọc tối thiểu', value: sbFormatVnd(SB_ENV.sellerMinDeposit), inline: true }]
+                : [])
+        );
 
         const embed = new EmbedBuilder()
-            .setTitle(type === 'seller' ? '📋 SELLER APPLICATION' : '📋 BUILDER APPLICATION')
+            .setTitle(type === 'seller' ? '💳 TICKET THANH TOÁN SELLER' : '💳 TICKET THANH TOÁN BUILDER')
             .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
             .setDescription(
-                `🎫 **Application Ticket**\n\n` +
-                `Chỉ **người ứng tuyển + Admin** có thể xem ticket này.\n` +
-                `Hồ sơ đã được tiếp nhận. Chọn gói bên dưới để chuyển sang bước thanh toán/setup.`
+                `🎫 **Hồ sơ ứng tuyển đã tạo Ticket thanh toán.**\n\n` +
+                `📌 **Không cần Admin duyệt hồ sơ trước.**\n` +
+                `💳 Chọn gói ngay bên dưới để mở bảng thanh toán.\n` +
+                `📸 Sau khi chuyển khoản, gửi bill trực tiếp vào Ticket.\n` +
+                `✅ Admin chỉ cần kiểm tra tiền và bấm **Xác nhận đã thanh toán**.\n\n` +
+                `🔒 Mọi bước ứng tuyển → thanh toán → setup đều nằm trong Ticket này.`
             )
             .addFields(fields)
             .setFooter({ text: `Application ID: ${appId}` })
             .setTimestamp();
 
-        await ticketChannel.send({
+        const ticketMessage = await ticketChannel.send({
             content: `<@${interaction.user.id}> ${getTicketAdminMention()}`,
             embeds: [embed],
             components: [await sbBuildPlanMenu(type)],
@@ -3679,24 +3760,26 @@ async function sbSendApplication(type, interaction) {
                 roles: getTicketAdminRoleId() ? [getTicketAdminRoleId()] : []
             }
         });
+        application.applicationMessageId = ticketMessage.id;
+        apps[appId] = application;
+        sbWrite(SB_APPLICATIONS_FILE, apps);
 
-        // Admin log chỉ nhận thông báo/link, dữ liệu ứng tuyển được xử lý trong ticket riêng.
-        sbLog('application', sbLogEmbed('📝 APPLICATION', type === 'seller' ? '#f1c40f' : '#3498db', [
+        sbLog('application', sbLogEmbed('📝 APPLICATION / PAYMENT TICKET', type === 'seller' ? '#f1c40f' : '#3498db', [
             { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
             { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
-            { name: 'Status', value: 'SETUP_PENDING', inline: true },
+            { name: 'Status', value: 'WAITING_FOR_PLAN', inline: true },
             { name: 'Application', value: `\`${appId}\``, inline: true },
             { name: 'Ticket', value: `${ticketChannel}`, inline: false }
         ]));
 
         return safeEditReply(interaction, {
-            content: `✅ Đã tạo **Ticket đăng ký ${type === 'seller' ? 'Seller' : 'Builder'}**: ${ticketChannel}\nAdmin sẽ vào ticket để xử lý các bước tiếp theo.`
+            content: `✅ Đã tạo **Ticket thanh toán ${type === 'seller' ? 'Seller' : 'Builder'}**: ${ticketChannel}\n💳 Chọn gói ngay trong Ticket.`
         });
     } catch (err) {
         delete apps[appId];
         sbWrite(SB_APPLICATIONS_FILE, apps);
         return safeEditReply(interaction, {
-            content: `❌ Không thể tạo Ticket đăng ký: \`${err.message}\`\nKiểm tra quyền **Manage Channels** của Bot.`
+            content: `❌ Không thể tạo Ticket thanh toán: \`${err.message}\`\nKiểm tra quyền **Manage Channels** của Bot.`
         });
     }
 }
@@ -3748,15 +3831,26 @@ async function sbApproveApplication(interaction, appId, approve) {
         .setColor(approve ? '#2ecc71' : '#e74c3c')
         .addFields({ name: '📌 Trạng thái', value: `${approve ? '✅ APPROVED' : '❌ REJECTED'} bởi <@${interaction.user.id}>` });
 
-    const nextRow = approve
-        ? new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`sb_begin_setup_${app.type}`)
-                .setLabel(app.type === 'seller' ? '👑 Thanh toán & Setup Seller' : '🛠️ Thanh toán & Setup Builder')
-                .setStyle(ButtonStyle.Primary)
-        )
-        : null;
-    await interaction.message.edit({ embeds: [updated], components: approve ? [nextRow] : [sbAppButtons(appId, true)] }).catch(() => {});
+    const nextComponents = approve
+        ? [await sbBuildPlanMenu(app.type)]
+        : [sbAppButtons(appId, true)];
+    await interaction.message.edit({ embeds: [updated], components: nextComponents }).catch(() => {});
+
+    if (approve && interaction.channel?.isTextBased()) {
+        await interaction.channel.send({
+            content: `<@${app.userId}>`,
+            embeds: [new EmbedBuilder()
+                .setTitle(app.type === 'seller' ? '👑 HỒ SƠ SELLER ĐÃ ĐƯỢC DUYỆT' : '🛠️ HỒ SƠ BUILDER ĐÃ ĐƯỢC DUYỆT')
+                .setColor('#2ecc71')
+                .setDescription(
+                    `✅ Admin đã duyệt hồ sơ của bạn.\n\n` +
+                    `💳 **Chọn gói ngay trong menu bên dưới** để tiếp tục thanh toán.\n` +
+                    `📌 Sau khi thanh toán được xác nhận, bot sẽ mở nút **Đặt tên Shop** ngay trong Ticket này.`
+                )
+                .setTimestamp()],
+            allowedMentions: { users: [app.userId] }
+        }).catch(() => {});
+    }
 
     const roleId = sbRoleId(app.type);
     if (approve && roleId && interaction.guild) {
@@ -3865,18 +3959,29 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
         a =>
             a.userId === interaction.user.id &&
             a.type === type &&
-            ['PENDING', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status)
+            ['PENDING', 'APPROVED', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status)
     );
     const existingRecord = sbDataForType(type)[interaction.user.id];
 
     if (!app && !existingRecord) {
         return safeReply(interaction, {
-            content: `❌ Bạn chưa có application **${type}** được duyệt.`,
+            content: `❌ Bạn chưa có application **${type}** đang hoạt động.`,
             flags: MessageFlags.Ephemeral
         });
     }
 
-    // Dùng CHÍNH ticket application hiện tại, không tạo ticket thanh toán mới.
+    // Không tạo thêm order nếu ticket hiện tại đã có một order đang chờ.
+    if (app?.orderId) {
+        const oldOrder = sbOrders()[app.orderId];
+        if (oldOrder?.status === 'PENDING') {
+            return safeReply(interaction, {
+                content: `⚠️ Ticket này đã có thanh toán đang chờ xác nhận: \`${oldOrder.id}\`.`,
+                flags: MessageFlags.Ephemeral
+            });
+        }
+    }
+
+    // Dùng CHÍNH ticket application hiện tại.
     const ticketChannelId = app?.ticketChannelId || interaction.channelId;
     const paymentChannel =
         interaction.channel?.id === ticketChannelId
@@ -3891,6 +3996,7 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
     }
 
     const order = sbCreateOrder(type, interaction.user.id, plan, deposit);
+    order.ticketChannelId = paymentChannel.id;
 
     const qrUrl =
         `https://img.vietqr.io/image/${BANK_CONFIG.BANK_ID}-${BANK_CONFIG.ACCOUNT_NO}-compact2.png` +
@@ -3900,16 +4006,15 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
         `&accountName=${encodeURIComponent(BANK_CONFIG.ACCOUNT_NAME)}`;
 
     try {
-        // Đánh dấu order nằm trong ticket hiện tại.
-        order.ticketChannelId = paymentChannel.id;
-        sbWrite(SB_ORDERS_FILE, sbOrders());
+        const orders = sbOrders();
+        orders[order.id] = order;
+        sbWrite(SB_ORDERS_FILE, orders);
 
-        // Nếu là application ticket, giữ toàn bộ flow trong đúng ticket đó.
         if (app) {
-            const appMap2 = sbApplications();
-            appMap2[app.id].status = 'PAYMENT_PENDING';
-            appMap2[app.id].orderId = order.id;
-            sbWrite(SB_APPLICATIONS_FILE, appMap2);
+            app.status = 'PAYMENT_PENDING';
+            app.orderId = order.id;
+            appMap[app.id] = app;
+            sbWrite(SB_APPLICATIONS_FILE, appMap);
         }
 
         const embed = new EmbedBuilder()
@@ -3926,7 +4031,7 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
                 `👤 **Tên tài khoản:** \`${BANK_CONFIG.ACCOUNT_NAME}\`\n\n` +
                 `📝 **Nội dung chuyển khoản:** \`SB ${order.id}\`\n\n` +
                 `📸 **Gửi bill trực tiếp trong ticket này.**\n` +
-                `✅ Admin sẽ kiểm tra và xác nhận thanh toán ngay tại đây.`
+                `✅ **Admin chỉ kiểm tra tiền và xác nhận tại đây.**`
             )
             .setImage(qrUrl)
             .setFooter({ text: `Order: ${order.id} • Thanh toán ngay trong Ticket` })
@@ -3960,6 +4065,24 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
                 '👉 Chuyển khoản đúng số tiền và đúng nội dung ở trên, sau đó gửi ảnh bill vào **chính Ticket này**.'
         });
 
+        // Khóa menu chọn gói cũ để tránh khách tạo nhiều order trong cùng Ticket.
+        if (app?.applicationMessageId) {
+            const applicationMessage = await paymentChannel.messages.fetch(app.applicationMessageId).catch(() => null);
+            if (applicationMessage) {
+                await applicationMessage.edit({
+                    components: [
+                        new ActionRowBuilder().addComponents(
+                            new ButtonBuilder()
+                                .setCustomId('sb_plan_selected')
+                                .setLabel(`✅ Đã chọn ${sbPlanLabel(plan)}`)
+                                .setStyle(ButtonStyle.Secondary)
+                                .setDisabled(true)
+                        )
+                    ]
+                }).catch(() => {});
+            }
+        }
+
         return safeEditReply(interaction, {
             content:
                 `✅ **Đã tạo bảng thanh toán ngay trong Ticket này!**\n` +
@@ -3974,7 +4097,7 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
         if (app) {
             const appMap2 = sbApplications();
             if (appMap2[app.id]) {
-                appMap2[app.id].status = 'SETUP_PENDING';
+                appMap2[app.id].status = 'PENDING';
                 delete appMap2[app.id].orderId;
                 sbWrite(SB_APPLICATIONS_FILE, appMap2);
             }
@@ -4055,7 +4178,7 @@ async function sbHandlePaymentApproval(interaction, orderId) {
         deposit: existing?.deposit != null ? existing.deposit : order.deposit,
         startDate: existing?.startDate || now.toISOString(),
         expireDate: expire.toISOString(),
-        applicationId: existing?.applicationId || null,
+        applicationId: existing?.applicationId || app?.id || null,
         categoryId: sbCategoryId(order.type),
         channelId: existing?.channelId || null,
         shopName: existing?.shopName || '',
@@ -4069,6 +4192,24 @@ async function sbHandlePaymentApproval(interaction, orderId) {
         data[order.userId].deposit = order.deposit;
     }
 
+    // Đồng bộ tên/kênh shop khi gia hạn hoặc thanh toán lại.
+    if (data[order.userId]?.channelId) {
+        const shopChannel = await interaction.guild.channels.fetch(data[order.userId].channelId).catch(() => null);
+        if (shopChannel) {
+            const rec = data[order.userId];
+            if (!rec.shopName) {
+                const derivedName = sbShopNameFromChannelName(order.type, shopChannel.name);
+                if (derivedName) {
+                    rec.shopName = derivedName;
+                    rec.shopSlug = sbSlug(derivedName);
+                }
+            }
+            if (rec.shopSlug) {
+                await shopChannel.setName(sbShopChannelName(order.type, rec.shopSlug)).catch(() => {});
+            }
+            data[order.userId] = rec;
+        }
+    }
     sbSaveDataForType(order.type, data);
 
     const apps = sbApplications();
@@ -4080,7 +4221,21 @@ async function sbHandlePaymentApproval(interaction, orderId) {
     if (app) {
         app.status = recordAfterPayment?.channelId ? 'PAID' : 'SETUP_PENDING';
         app.paidOrderId = order.id;
+        app.shopName = recordAfterPayment?.shopName || app.shopName || '';
+        app.shopSlug = recordAfterPayment?.shopSlug || app.shopSlug || '';
+        app.shopChannelId = recordAfterPayment?.channelId || app.shopChannelId || null;
         sbWrite(SB_APPLICATIONS_FILE, apps);
+    }
+
+    // Chỉ sau khi Admin xác nhận đã nhận tiền mới cấp role Seller/Builder.
+    const paidRoleId = sbRoleId(order.type);
+    if (paidRoleId && interaction.guild) {
+        const member = await sbFetchMember(interaction.guild, order.userId);
+        if (member) {
+            await member.roles.add(paidRoleId, `${order.type} payment confirmed`).catch(err =>
+                console.error('❌ Add paid Seller/Builder role:', err?.message || err)
+            );
+        }
     }
 
     // TẤT CẢ hướng dẫn sau thanh toán đều nằm ngay trong Ticket hiện tại.
@@ -4187,7 +4342,7 @@ function sbNameTaken(guild, type, slug, exceptChannelId = null) {
         return record.shopSlug === slug;
     }) || guild.channels.cache.some(ch => {
         if (exceptChannelId && ch.id === exceptChannelId) return false;
-        return ch.name === `${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${slug}`;
+        return ch.name === sbShopChannelName(type, slug) || ch.name === `${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${slug}`;
     });
 }
 
@@ -4223,7 +4378,7 @@ function sbShopPermissionOverwrites(guild, userId, roleId) {
                 PermissionsBitField.Flags.SendMessages,
                 PermissionsBitField.Flags.EmbedLinks,
                 PermissionsBitField.Flags.AttachFiles,
-                PermissionsBitField.Flags.ReadMessageHistory,
+                PermissionsBitField.Flags.ReadMessageHistory
             ],
             deny: [PermissionsBitField.Flags.MentionEveryone]
         },
@@ -4232,7 +4387,10 @@ function sbShopPermissionOverwrites(guild, userId, roleId) {
 }
 
 async function sbResolveCategory(guild, type) {
-    const configuredId = sbCategoryId(type);
+    // Seller luôn ưu tiên Category ID được server owner chỉ định.
+    const configuredId = type === 'seller'
+        ? String(SB_ENV.sellerCategoryId || '1531116626311905463').trim()
+        : sbCategoryId(type);
     if (configuredId) {
         const configured = await guild.channels.fetch(configuredId).catch(() => null);
         if (configured?.type === ChannelType.GuildCategory) return configured;
@@ -4262,24 +4420,56 @@ async function sbCreateShop(interaction, type, shopName) {
     const record = data[interaction.user.id];
     if (!record) return safeReply(interaction, { content: `❌ Chưa có hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
     if (!['SETUP_PENDING', 'ACTIVE', 'EXPIRED'].includes(record.status)) return safeReply(interaction, { content: `❌ Hồ sơ đang ở trạng thái **${record.status}**.`, flags: MessageFlags.Ephemeral });
+
     const valid = sbValidateShopName(shopName);
     if (!valid.ok) return safeReply(interaction, { content: `❌ ${valid.error}`, flags: MessageFlags.Ephemeral });
 
-    if (record.channelId && record.status !== 'CLOSED') return safeReply(interaction, { content: `ℹ️ Bạn đã có shop: <#${record.channelId}>`, flags: MessageFlags.Ephemeral });
-    if (sbNameTaken(interaction.guild, type, valid.slug, record.channelId)) return safeReply(interaction, { content: '❌ Tên shop này đã được sử dụng. Vui lòng chọn tên khác.', flags: MessageFlags.Ephemeral });
+    if (record.channelId && record.status !== 'CLOSED') {
+        // Đồng bộ lại tên shop cũ theo format chuẩn.
+        const existingChannel = await interaction.guild.channels.fetch(record.channelId).catch(() => null);
+        if (existingChannel) {
+            const fallbackSlug = record.shopSlug || sbSlug(record.shopName || sbShopNameFromChannelName(type, existingChannel.name) || shopName);
+            if (fallbackSlug) await existingChannel.setName(sbShopChannelName(type, fallbackSlug)).catch(() => {});
+            if (!record.shopName && fallbackSlug) {
+                record.shopName = fallbackSlug.replace(/-/g, ' ');
+                record.shopSlug = fallbackSlug;
+            }
+            data[interaction.user.id] = record;
+            sbSaveDataForType(type, data);
+        }
+        return safeReply(interaction, { content: `ℹ️ Bạn đã có shop: <#${record.channelId}>`, flags: MessageFlags.Ephemeral });
+    }
+
+    if (sbNameTaken(interaction.guild, type, valid.slug, record.channelId)) {
+        return safeReply(interaction, { content: '❌ Tên shop này đã được sử dụng. Vui lòng chọn tên khác.', flags: MessageFlags.Ephemeral });
+    }
 
     const category = await sbResolveCategory(interaction.guild, type);
-    if (!category) return safeReply(interaction, { content: `❌ Không thể xác định hoặc tạo Category ${type === 'seller' ? 'Seller' : 'Builder'}.`, flags: MessageFlags.Ephemeral });
+    if (!category) {
+        return safeReply(interaction, { content: `❌ Không thể xác định hoặc tạo Category ${type === 'seller' ? 'Seller' : 'Builder'}.`, flags: MessageFlags.Ephemeral });
+    }
 
     try {
         const roleId = sbRoleId(type);
         const channel = await interaction.guild.channels.create({
-            name: `${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${valid.slug}`,
+            name: sbShopChannelName(type, valid.slug),
             type: ChannelType.GuildText,
             parent: category.id,
             topic: `sbShop:${type}:${interaction.user.id}`,
             permissionOverwrites: sbShopPermissionOverwrites(interaction.guild, interaction.user.id, roleId)
         });
+
+        // Đảm bảo Shop mới nằm ở CUỐI Category Seller/Builder.
+        await category.fetch().catch(() => {});
+        const childPositions = category.children.cache
+            .filter(ch => ch.id !== channel.id)
+            .map(ch => ch.position);
+        const lastChildPosition = childPositions.length
+            ? Math.max(...childPositions)
+            : category.position;
+        await channel.setPosition(lastChildPosition + 1).catch(err =>
+            console.error('⚠️ Không thể đưa Shop xuống cuối Category:', err?.message || err)
+        );
 
         record.shopName = valid.name;
         record.shopSlug = valid.slug;
@@ -4289,6 +4479,28 @@ async function sbCreateShop(interaction, type, shopName) {
         record.updatedAt = Date.now();
         data[interaction.user.id] = record;
         sbSaveDataForType(type, data);
+
+        // Đồng bộ tên Shop vào application/ticket list để không còn hiện "Chưa đặt".
+        const apps = sbApplications();
+        const app = Object.values(apps).find(a =>
+            a.id === record.applicationId ||
+            (a.userId === interaction.user.id && a.type === type && ['PENDING', 'PAYMENT_PENDING', 'PAID', 'SETUP_PENDING'].includes(a.status))
+        );
+        if (app) {
+            app.shopName = valid.name;
+            app.shopSlug = valid.slug;
+            app.shopChannelId = channel.id;
+            app.status = 'COMPLETED';
+            app.completedAt = Date.now();
+            apps[app.id] = app;
+            sbWrite(SB_APPLICATIONS_FILE, apps);
+        }
+
+        // Nếu role chưa được cấp (ví dụ dữ liệu cũ), cấp role khi Shop đã tạo.
+        if (roleId && interaction.guild) {
+            const member = await sbFetchMember(interaction.guild, interaction.user.id);
+            if (member) await member.roles.add(roleId, `${type} shop created`).catch(() => {});
+        }
 
         await channel.send({ embeds: [new EmbedBuilder()
             .setTitle(type === 'seller' ? '👑 SHOP SELLER' : '🛠️ SHOP BUILDER')
@@ -4309,10 +4521,11 @@ async function sbCreateShop(interaction, type, shopName) {
             { name: 'Owner', value: `<@${interaction.user.id}>`, inline: true },
             { name: 'Shop', value: valid.name, inline: true },
             { name: 'Channel', value: `${channel}`, inline: true },
-            { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true }
+            { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
+            { name: 'Category', value: `${category}`, inline: true }
         ]));
 
-        return safeReply(interaction, { content: `✅ Đã tạo shop: ${channel}`, flags: MessageFlags.Ephemeral });
+        return safeReply(interaction, { content: `✅ Đã tạo shop: ${channel}\n📁 Đã đưa shop xuống cuối Category ${type === 'seller' ? 'Seller' : 'Builder'}.`, flags: MessageFlags.Ephemeral });
     } catch (err) {
         return safeReply(interaction, { content: `❌ Không thể tạo shop: \`${err.message}\``, flags: MessageFlags.Ephemeral });
     }
@@ -4368,7 +4581,7 @@ async function sbRename(interaction, type, newName) {
 
     const channel = await interaction.guild.channels.fetch(record.channelId).catch(() => null);
     if (!channel) return safeReply(interaction, { content: '❌ Channel shop không còn tồn tại.', flags: MessageFlags.Ephemeral });
-    await channel.setName(`${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${valid.slug}`);
+    await channel.setName(sbShopChannelName(type, valid.slug));
     record.shopName = valid.name;
     record.shopSlug = valid.slug;
     record.lastRenameAt = now;
@@ -4402,8 +4615,34 @@ async function sbRenew(interaction, type, plan, targetUserId = null) {
         record.expireDate = new Date(base.getTime() + days * 86400000).toISOString();
         record.plan = plan;
         record.status = 'ACTIVE';
+
+        const renewalChannel = record.channelId
+            ? await interaction.guild.channels.fetch(record.channelId).catch(() => null)
+            : null;
+        if (renewalChannel) {
+            const derivedName = sbShopNameFromChannelName(type, renewalChannel.name);
+            if (!record.shopName && derivedName) {
+                record.shopName = derivedName;
+                record.shopSlug = sbSlug(derivedName);
+            }
+            if (!record.shopSlug && record.shopName) record.shopSlug = sbSlug(record.shopName);
+            if (record.shopSlug) {
+                await renewalChannel.setName(sbShopChannelName(type, record.shopSlug)).catch(() => {});
+            }
+        }
         data[userId] = record;
         sbSaveDataForType(type, data);
+
+        // Đồng bộ tên vào application đang lưu (nếu có) để danh sách không mất tên sau khi gia hạn.
+        const apps = sbApplications();
+        const renewalApp = Object.values(apps).find(a => a.userId === userId && a.type === type && ['PAID', 'COMPLETED', 'SETUP_PENDING'].includes(a.status));
+        if (renewalApp) {
+            renewalApp.shopName = record.shopName || renewalApp.shopName || '';
+            renewalApp.shopSlug = record.shopSlug || renewalApp.shopSlug || '';
+            renewalApp.shopChannelId = record.channelId || renewalApp.shopChannelId || null;
+            apps[renewalApp.id] = renewalApp;
+            sbWrite(SB_APPLICATIONS_FILE, apps);
+        }
         await sbApplyActivePermissions(interaction.guild, type, record);
         sbLog('renew', sbLogEmbed('🔄 RENEWED', '#2ecc71', [
             { name: 'User', value: `<@${userId}>`, inline: true },
@@ -4694,7 +4933,7 @@ async function sbHandleCommand(interaction) {
             const valid = sbValidateShopName(name);
             if (!valid.ok) return safeReply(interaction, { content: `❌ ${valid.error}`, flags: MessageFlags.Ephemeral });
             if (sbNameTaken(interaction.guild, type, valid.slug, record.channelId)) return safeReply(interaction, { content: '❌ Tên shop đã tồn tại.', flags: MessageFlags.Ephemeral });
-            await ch.setName(`${type === 'seller' ? '👑 ┆ seller-' : '🛠️ ┆ builder-'}${valid.slug}`);
+            await ch.setName(sbShopChannelName(type, valid.slug));
             record.shopName = valid.name; record.shopSlug = valid.slug; record.lastRenameAt = Date.now();
             data[userId] = record; sbSaveDataForType(type, data);
             return safeReply(interaction, { content: `✅ Đã đổi tên shop cho <@${userId}>.`, flags: MessageFlags.Ephemeral });
@@ -4716,7 +4955,7 @@ async function sbHandleCommand(interaction) {
     if (sub === 'list') {
         const data = sbDataForType(type);
         const records = Object.values(data);
-        const lines = records.length ? records.slice(0, 25).map(r => `• <@${r.userId}> — **${r.shopName || 'Chưa đặt'}** — \`${r.status}\``) : ['Không có dữ liệu.'];
+        const lines = records.length ? records.slice(0, 25).map(r => `• <@${r.userId}> — **${r.shopName || (r.shopSlug ? r.shopSlug.replace(/-/g, ' ') : 'Chưa đặt')}** — \`${r.status}\``) : ['Không có dữ liệu.'];
         return safeReply(interaction, { embeds: [new EmbedBuilder().setTitle(type === 'seller' ? '👑 SELLER LIST' : '🛠️ BUILDER LIST').setColor('#5865F2').setDescription(lines.join('\n')).setFooter({ text: `Tổng: ${records.length}` })], flags: MessageFlags.Ephemeral });
     }
     if (sub === 'setdeposit' && type === 'builder') return sbAdminSetDepositType(interaction, 'builder', interaction.options.getUser('user').id, interaction.options.getInteger('amount'));
@@ -4754,6 +4993,14 @@ async function sbSetupSlashCommand(interaction) {
 
 async function sbHandleButton(interaction) {
     const id = interaction.customId;
+    // Flow mới không còn duyệt application Seller/Builder.
+    // Nếu message cũ vẫn còn nút DUYỆT/TỪ CHỐI thì vô hiệu hóa chức năng cũ.
+    if (id.startsWith('sb_app_approve_') || id.startsWith('sb_app_reject_')) {
+        return safeReply(interaction, {
+            content: 'ℹ️ Flow tuyển dụng đã đổi: không cần duyệt hồ sơ. Khách chọn gói và thanh toán ngay trong Ticket; Admin chỉ xác nhận đã nhận tiền.',
+            flags: MessageFlags.Ephemeral
+        });
+    }
     if (id === 'sb_apply_seller') return interaction.showModal(sbApplicationModal('seller'));
     if (id === 'sb_apply_builder') return interaction.showModal(sbApplicationModal('builder'));
     if (id === 'sb_begin_setup_seller') return sbHandleBeginSetup(interaction, 'seller');
