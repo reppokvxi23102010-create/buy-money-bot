@@ -3860,66 +3860,51 @@ function sbCreateOrder(type, userId, plan, deposit) {
 }
 
 async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
-    const roleId = sbRoleId(type);
-    const categoryId = sbCategoryId(type);
     const appMap = sbApplications();
-    const app = Object.values(appMap).find(a => a.userId === interaction.user.id && a.type === type && ['PENDING', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status));
+    const app = Object.values(appMap).find(
+        a =>
+            a.userId === interaction.user.id &&
+            a.type === type &&
+            ['PENDING', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status)
+    );
     const existingRecord = sbDataForType(type)[interaction.user.id];
-    if (!app && !existingRecord) return safeReply(interaction, { content: `❌ Bạn chưa có application **${type}** được duyệt.`, flags: MessageFlags.Ephemeral });
+
+    if (!app && !existingRecord) {
+        return safeReply(interaction, {
+            content: `❌ Bạn chưa có application **${type}** được duyệt.`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    // Dùng CHÍNH ticket application hiện tại, không tạo ticket thanh toán mới.
+    const ticketChannelId = app?.ticketChannelId || interaction.channelId;
+    const paymentChannel =
+        interaction.channel?.id === ticketChannelId
+            ? interaction.channel
+            : await interaction.guild?.channels.fetch(ticketChannelId).catch(() => null);
+
+    if (!paymentChannel?.isTextBased()) {
+        return safeReply(interaction, {
+            content: '❌ Không tìm thấy Ticket hiện tại để tạo bảng thanh toán.',
+            flags: MessageFlags.Ephemeral
+        });
+    }
 
     const order = sbCreateOrder(type, interaction.user.id, plan, deposit);
-    const category = categoryId ? await interaction.guild.channels.fetch(categoryId).catch(() => null) : null;
-    if (categoryId && !category) return safeReply(interaction, { content: '❌ Category shop chưa cấu hình hoặc không tồn tại.', flags: MessageFlags.Ephemeral });
 
-    const name = `${type === 'seller' ? 'seller-pay' : 'builder-pay'}-${interaction.user.username}`
-        .toLowerCase().replace(/[^a-z0-9-_]/g, '').slice(0, 80);
-    const qrUrl = `https://img.vietqr.io/image/${BANK_CONFIG.BANK_ID}-${BANK_CONFIG.ACCOUNT_NO}-compact2.png` +
-        `?amount=${order.total}&addInfo=${encodeURIComponent(`${type === 'seller' ? 'SELLER' : 'BUILDER'} ${interaction.user.username} ${order.id}`)}` +
+    const qrUrl =
+        `https://img.vietqr.io/image/${BANK_CONFIG.BANK_ID}-${BANK_CONFIG.ACCOUNT_NO}-compact2.png` +
+        `?amount=${order.total}&addInfo=${encodeURIComponent(
+            `${type === 'seller' ? 'SELLER' : 'BUILDER'} ${interaction.user.username} ${order.id}`
+        )}` +
         `&accountName=${encodeURIComponent(BANK_CONFIG.ACCOUNT_NAME)}`;
 
     try {
-        const paymentChannel = await interaction.guild.channels.create({
-            name: `💳┆${name}`,
-            type: ChannelType.GuildText,
-            parent: category?.type === ChannelType.GuildCategory ? category.id : undefined,
-            topic: `sbOrder:${order.id}`,
-            permissionOverwrites: [
-                { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
-                { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.AttachFiles, PermissionsBitField.Flags.EmbedLinks, PermissionsBitField.Flags.ReadMessageHistory] },
-                ...adminOverwrite(interaction.guild.id)
-            ]
-        });
-
+        // Đánh dấu order nằm trong ticket hiện tại.
         order.ticketChannelId = paymentChannel.id;
         sbWrite(SB_ORDERS_FILE, sbOrders());
 
-        const embed = new EmbedBuilder()
-            .setTitle(type === 'seller' ? '👑 THANH TOÁN SELLER' : '🛠️ THANH TOÁN BUILDER')
-            .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
-            .setDescription(
-                `Xin chào <@${interaction.user.id}>!\n\n` +
-                `📅 **Gói:** ${sbPlanLabel(plan)}\n` +
-                `💰 **Phí:** ${sbFormatVnd(order.fee)}\n` +
-                (order.deposit > 0 ? `🛡️ **Cọc:** ${sbFormatVnd(order.deposit)}\n` : '') +
-                `💵 **Tổng chuyển khoản:** ${sbFormatVnd(order.total)}\n\n` +
-                '🏦 **Ngân hàng:** MBBANK\n' +
-                `STK: \`${BANK_CONFIG.ACCOUNT_NO}\`\n` +
-                `Tên: \`${BANK_CONFIG.ACCOUNT_NAME}\`\n\n` +
-                `📌 **Nội dung:** \`SB ${order.id}\`\n\n` +
-                '📸 Gửi bill vào ticket. Admin sẽ xác nhận thanh toán.'
-            )
-            .setImage(qrUrl)
-            .setFooter({ text: `Order: ${order.id}` })
-            .setTimestamp();
-
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`sb_pay_approve_${order.id}`).setLabel('✅ Xác nhận đã thanh toán').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary)
-        );
-
-        await paymentChannel.send({ content: `<@${interaction.user.id}> ${getTicketAdminMention()}`, embeds: [embed], components: [row], allowedMentions: { users: [interaction.user.id], roles: getTicketAdminRoleId() ? [getTicketAdminRoleId()] : [] } });
-        await paymentChannel.send({ content: '⏳ **Đang chờ Admin xác nhận thanh toán.**' });
-
+        // Nếu là application ticket, giữ toàn bộ flow trong đúng ticket đó.
         if (app) {
             const appMap2 = sbApplications();
             appMap2[app.id].status = 'PAYMENT_PENDING';
@@ -3927,12 +3912,77 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
             sbWrite(SB_APPLICATIONS_FILE, appMap2);
         }
 
-        return safeEditReply(interaction, { content: `✅ Đã tạo ticket thanh toán: ${paymentChannel}\n💵 Tổng: **${sbFormatVnd(order.total)}**` });
+        const embed = new EmbedBuilder()
+            .setTitle(type === 'seller' ? '👑 BẢNG THANH TOÁN SELLER' : '🛠️ BẢNG THANH TOÁN BUILDER')
+            .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
+            .setDescription(
+                `Xin chào <@${interaction.user.id}>! 💳\n\n` +
+                `📦 **Gói:** ${sbPlanLabel(plan)}\n` +
+                `💰 **Phí gói:** ${sbFormatVnd(order.fee)}\n` +
+                (order.deposit > 0 ? `🛡️ **Tiền cọc:** ${sbFormatVnd(order.deposit)}\n` : '') +
+                `💵 **Tổng thanh toán:** ${sbFormatVnd(order.total)}\n\n` +
+                `🏦 **Ngân hàng:** MBBANK\n` +
+                `💳 **STK:** \`${BANK_CONFIG.ACCOUNT_NO}\`\n` +
+                `👤 **Tên tài khoản:** \`${BANK_CONFIG.ACCOUNT_NAME}\`\n\n` +
+                `📝 **Nội dung chuyển khoản:** \`SB ${order.id}\`\n\n` +
+                `📸 **Gửi bill trực tiếp trong ticket này.**\n` +
+                `✅ Admin sẽ kiểm tra và xác nhận thanh toán ngay tại đây.`
+            )
+            .setImage(qrUrl)
+            .setFooter({ text: `Order: ${order.id} • Thanh toán ngay trong Ticket` })
+            .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`sb_pay_approve_${order.id}`)
+                .setLabel('✅ Xác nhận đã thanh toán')
+                .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+                .setCustomId('close_ticket')
+                .setLabel('Đóng Ticket')
+                .setEmoji('🔒')
+                .setStyle(ButtonStyle.Secondary)
+        );
+
+        await paymentChannel.send({
+            content: `<@${interaction.user.id}> ${getTicketAdminMention()}`,
+            embeds: [embed],
+            components: [row],
+            allowedMentions: {
+                users: [interaction.user.id],
+                roles: getTicketAdminRoleId() ? [getTicketAdminRoleId()] : []
+            }
+        });
+
+        await paymentChannel.send({
+            content:
+                '⏳ **ĐANG CHỜ THANH TOÁN**\n' +
+                '👉 Chuyển khoản đúng số tiền và đúng nội dung ở trên, sau đó gửi ảnh bill vào **chính Ticket này**.'
+        });
+
+        return safeEditReply(interaction, {
+            content:
+                `✅ **Đã tạo bảng thanh toán ngay trong Ticket này!**\n` +
+                `💳 Gói: **${sbPlanLabel(plan)}**\n` +
+                `💵 Tổng: **${sbFormatVnd(order.total)}**`
+        });
     } catch (err) {
         const orders = sbOrders();
         delete orders[order.id];
         sbWrite(SB_ORDERS_FILE, orders);
-        return safeEditReply(interaction, { content: `❌ Không thể tạo ticket thanh toán: \`${err.message}\`` });
+
+        if (app) {
+            const appMap2 = sbApplications();
+            if (appMap2[app.id]) {
+                appMap2[app.id].status = 'SETUP_PENDING';
+                delete appMap2[app.id].orderId;
+                sbWrite(SB_APPLICATIONS_FILE, appMap2);
+            }
+        }
+
+        return safeEditReply(interaction, {
+            content: `❌ Không thể tạo bảng thanh toán trong Ticket: \`${err.message}\``
+        });
     }
 }
 
@@ -3955,11 +4005,29 @@ async function sbHandleBeginSetup(interaction, type) {
 }
 
 async function sbHandlePaymentApproval(interaction, orderId) {
-    if (!isAdminUser(interaction)) return safeReply(interaction, { content: '❌ Chỉ Admin mới được xác nhận thanh toán.', flags: MessageFlags.Ephemeral });
+    if (!isAdminUser(interaction)) {
+        return safeReply(interaction, {
+            content: '❌ Chỉ Admin mới được xác nhận thanh toán.',
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
     const orders = sbOrders();
     const order = orders[orderId];
-    if (!order) return safeReply(interaction, { content: '❌ Không tìm thấy order.', flags: MessageFlags.Ephemeral });
-    if (order.status !== 'PENDING') return safeReply(interaction, { content: `⚠️ Order hiện ở trạng thái **${order.status}**.`, flags: MessageFlags.Ephemeral });
+
+    if (!order) {
+        return safeReply(interaction, {
+            content: '❌ Không tìm thấy order.',
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
+    if (order.status !== 'PENDING') {
+        return safeReply(interaction, {
+            content: `⚠️ Order hiện ở trạng thái **${order.status}**.`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
 
     order.status = 'PAID';
     order.approvedBy = interaction.user.id;
@@ -3971,10 +4039,14 @@ async function sbHandlePaymentApproval(interaction, orderId) {
     const now = new Date();
     const existing = data[order.userId];
     const isExistingShop = Boolean(existing?.channelId && existing?.status !== 'CLOSED');
-    const base = existing && existing.expireDate && new Date(existing.expireDate).getTime() > now.getTime()
-        ? new Date(existing.expireDate)
-        : now;
+    const base =
+        existing &&
+        existing.expireDate &&
+        new Date(existing.expireDate).getTime() > now.getTime()
+            ? new Date(existing.expireDate)
+            : now;
     const expire = new Date(base.getTime() + sbPlanDays(order.plan) * 86400000);
+
     data[order.userId] = {
         ...(existing || {}),
         userId: order.userId,
@@ -3991,54 +4063,121 @@ async function sbHandlePaymentApproval(interaction, orderId) {
         lastRenameAt: existing?.lastRenameAt || null,
         updatedAt: Date.now()
     };
+
     // Seller deposit is preserved separately from the new order fee.
-    if (order.type === 'seller' && (!existing || existing.deposit == null)) data[order.userId].deposit = order.deposit;
+    if (order.type === 'seller' && (!existing || existing.deposit == null)) {
+        data[order.userId].deposit = order.deposit;
+    }
+
     sbSaveDataForType(order.type, data);
 
     const apps = sbApplications();
-    const app = Object.values(apps).find(a => a.userId === order.userId && a.type === order.type);
+    const app = Object.values(apps).find(
+        a => a.userId === order.userId && a.type === order.type
+    );
     const recordAfterPayment = data[order.userId];
+
     if (app) {
         app.status = recordAfterPayment?.channelId ? 'PAID' : 'SETUP_PENDING';
         app.paidOrderId = order.id;
         sbWrite(SB_APPLICATIONS_FILE, apps);
     }
 
-    const user = await client.users.fetch(order.userId).catch(() => null);
-    if (user) {
-        const embed = new EmbedBuilder()
-            .setTitle('✅ THANH TOÁN ĐÃ XÁC NHẬN')
-            .setColor('#2ecc71')
-            .setDescription(
-                `Order \`${order.id}\` đã được Admin xác nhận.\n\n` +
-                `📅 Gói: **${sbPlanLabel(order.plan)}**\n` +
-                (order.type === 'seller' ? `🛡️ Cọc: **${sbFormatVnd(recordAfterPayment.deposit)}**\n` : '') +
-                (recordAfterPayment.channelId
-                    ? `✅ Shop hiện tại được giữ nguyên.\n🏪 Channel: <#${recordAfterPayment.channelId}>`
-                    : 'Bấm nút bên dưới để nhập tên shop. Sau khi hợp lệ, bot sẽ tự tạo channel.')
-            )
-            .setTimestamp();
-        const components = recordAfterPayment.channelId ? [] : [new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`sb_setup_shop_${order.type}`).setLabel(order.type === 'seller' ? '👑 Đặt tên Shop Seller' : '🛠️ Đặt tên Builder').setStyle(ButtonStyle.Primary)
-        )];
-        await user.send({ embeds: [embed], components }).catch(() => {});
-    }
+    // TẤT CẢ hướng dẫn sau thanh toán đều nằm ngay trong Ticket hiện tại.
+    const setupEmbed = new EmbedBuilder()
+        .setTitle('✅ THANH TOÁN ĐÃ XÁC NHẬN')
+        .setColor('#2ecc71')
+        .setDescription(
+            `🎉 <@${order.userId}> **đã được xác nhận thanh toán!**\n\n` +
+            `📦 **Gói:** ${sbPlanLabel(order.plan)}\n` +
+            (order.type === 'seller'
+                ? `🛡️ **Cọc:** ${sbFormatVnd(recordAfterPayment.deposit)}\n`
+                : '') +
+            (recordAfterPayment.channelId
+                ? `🏪 **Shop hiện tại:** <#${recordAfterPayment.channelId}>\n\n` +
+                  `✅ Shop cũ được giữ nguyên. Bạn có thể tiếp tục sử dụng shop.`
+                : `📝 **Bước tiếp theo:** Đặt tên shop ngay bên dưới.\n` +
+                  `Bot sẽ tạo shop sau khi bạn nhập tên hợp lệ.`)
+        )
+        .setFooter({ text: `Order: ${order.id}` })
+        .setTimestamp();
 
-    await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId('sb_payment_paid').setLabel('✅ ĐÃ XÁC NHẬN').setStyle(ButtonStyle.Success).setDisabled(true),
-        new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Ticket').setEmoji('🔒').setStyle(ButtonStyle.Secondary)
-    )] }).catch(() => {});
-    await interaction.channel?.send(`✅ **Thanh toán đã được xác nhận.** <@${order.userId}> đã nhận hướng dẫn setup.`).catch(() => {});
+    const components = recordAfterPayment.channelId
+        ? [
+              new ActionRowBuilder().addComponents(
+                  new ButtonBuilder()
+                      .setCustomId('sb_payment_paid')
+                      .setLabel('✅ ĐÃ XÁC NHẬN')
+                      .setStyle(ButtonStyle.Success)
+                      .setDisabled(true),
+                  new ButtonBuilder()
+                      .setCustomId('close_ticket')
+                      .setLabel('Đóng Ticket')
+                      .setEmoji('🔒')
+                      .setStyle(ButtonStyle.Secondary)
+              )
+          ]
+        : [
+              new ActionRowBuilder().addComponents(
+                  new ButtonBuilder()
+                      .setCustomId(`sb_setup_shop_${order.type}`)
+                      .setLabel(
+                          order.type === 'seller'
+                              ? '👑 Đặt tên Shop Seller'
+                              : '🛠️ Đặt tên Builder'
+                      )
+                      .setStyle(ButtonStyle.Primary),
+                  new ButtonBuilder()
+                      .setCustomId('close_ticket')
+                      .setLabel('Đóng Ticket')
+                      .setEmoji('🔒')
+                      .setStyle(ButtonStyle.Secondary)
+              )
+          ];
 
-    sbLog('payment', sbLogEmbed('💳 PAYMENT CONFIRMED', '#2ecc71', [
-        { name: 'User', value: `<@${order.userId}>`, inline: true },
-        { name: 'Type', value: order.type, inline: true },
-        { name: 'Plan', value: sbPlanLabel(order.plan), inline: true },
-        { name: 'Order', value: `\`${order.id}\`` },
-        { name: 'Amount', value: sbFormatVnd(order.total), inline: true }
-    ]));
+    await interaction.channel?.send({
+        content: `<@${order.userId}>`,
+        embeds: [setupEmbed],
+        components,
+        allowedMentions: { users: [order.userId] }
+    }).catch(() => {});
 
-    return safeReply(interaction, { content: '✅ Đã xác nhận thanh toán.', flags: MessageFlags.Ephemeral });
+    // Vô hiệu hóa nút xác nhận cũ, giữ nút đóng Ticket.
+    await interaction.message
+        .edit({
+            components: [
+                new ActionRowBuilder().addComponents(
+                    new ButtonBuilder()
+                        .setCustomId('sb_payment_paid')
+                        .setLabel('✅ ĐÃ XÁC NHẬN')
+                        .setStyle(ButtonStyle.Success)
+                        .setDisabled(true),
+                    new ButtonBuilder()
+                        .setCustomId('close_ticket')
+                        .setLabel('Đóng Ticket')
+                        .setEmoji('🔒')
+                        .setStyle(ButtonStyle.Secondary)
+                )
+            ]
+        })
+        .catch(() => {});
+
+    sbLog(
+        'payment',
+        sbLogEmbed('💳 PAYMENT CONFIRMED', '#2ecc71', [
+            { name: 'User', value: `<@${order.userId}>`, inline: true },
+            { name: 'Type', value: order.type, inline: true },
+            { name: 'Plan', value: sbPlanLabel(order.plan), inline: true },
+            { name: 'Order', value: `\`${order.id}\`` },
+            { name: 'Amount', value: sbFormatVnd(order.total), inline: true },
+            { name: 'Ticket', value: `${interaction.channel}`, inline: true }
+        ])
+    );
+
+    return safeReply(interaction, {
+        content: '✅ Đã xác nhận thanh toán và chuyển bước setup ngay trong Ticket.',
+        flags: MessageFlags.Ephemeral
+    });
 }
 
 function sbNameTaken(guild, type, slug, exceptChannelId = null) {
