@@ -649,19 +649,7 @@ function isWithinThuMoneyWorkingHours() {
 }
 
 function getSellerInfo(sellerId) {
-    const id = String(sellerId || '').trim();
-    const fixed = ITEM_SELLERS.find(s => s.id === id);
-    if (fixed) return fixed;
-
-    try {
-        const sellers = sbRead(SB_SELLERS_FILE, {});
-        const record = sellers[id];
-        if (record && record.userId === id && record.status === 'ACTIVE' && record.channelId) {
-            return { id, label: record.shopName || 'Seller', emoji: '👑', dynamic: true, record };
-        }
-    } catch (_) {}
-
-    return null;
+    return ITEM_SELLERS.find(s => s.id === sellerId) || null;
 }
 
 async function getSellerMember(guild, sellerId) {
@@ -719,32 +707,7 @@ async function buildSellerSelectMenu(guild) {
         .setCustomId('ticket_seller_select')
         .setPlaceholder('🛒 Chọn Seller bạn yêu thích...');
 
-    // Seller cố định cũ đứng trước. Seller được tuyển thành công
-    // sẽ tự động nối vào CUỐI danh sách theo thứ tự đăng ký.
-    const sellerList = ITEM_SELLERS.map(s => ({ ...s }));
-
-    try {
-        const sellers = sbRead(SB_SELLERS_FILE, {});
-        const dynamicSellers = Object.values(sellers)
-            .filter(record => record && record.userId && record.status === 'ACTIVE' && record.channelId)
-            .sort((a, b) => (Number(a.createdAt) || 0) - (Number(b.createdAt) || 0))
-            .map(record => ({
-                id: String(record.userId),
-                label: record.shopName || 'Seller',
-                emoji: '👑',
-                dynamic: true,
-                record
-            }));
-
-        for (const seller of dynamicSellers) {
-            if (!sellerList.some(s => String(s.id) === String(seller.id))) sellerList.push(seller);
-        }
-    } catch (err) {
-        console.error('❌ Không tải được Seller động vào menu ticket:', err?.message || err);
-    }
-
-    // Discord Select Menu tối đa 25 lựa chọn.
-    for (const seller of sellerList.slice(0, 25)) {
+    for (const seller of ITEM_SELLERS) {
         const [name, online] = await Promise.all([
             getSellerDisplayName(guild, seller.id),
             isSellerOnline(guild, seller.id)
@@ -752,20 +715,12 @@ async function buildSellerSelectMenu(guild) {
 
         menu.addOptions(
             new StringSelectMenuOptionBuilder()
-                .setLabel(`${name || seller.label || 'Seller'}`.slice(0, 100))
+                // Dòng trên: tên Seller
+                .setLabel(`${name}`.slice(0, 100))
+                // Dòng dưới: chỉ trạng thái, không hiện ID cho đỡ rối
                 .setDescription(online ? '🟢 ONLINE' : '🔴 OFFLINE')
-                .setEmoji(seller.emoji || '👑')
-                .setValue(String(seller.id))
-        );
-    }
-
-    if (sellerList.length === 0) {
-        menu.addOptions(
-            new StringSelectMenuOptionBuilder()
-                .setLabel('Chưa có Seller')
-                .setDescription('Hiện chưa có Seller khả dụng')
-                .setEmoji('⚠️')
-                .setValue('none')
+                .setEmoji(seller.emoji)
+                .setValue(seller.id)
         );
     }
 
@@ -3561,9 +3516,7 @@ function sbApplicationPanel() {
             '✅ Có shop riêng\n' +
             '✅ Tự đặt tên shop\n' +
             '✅ Channel riêng\n' +
-            '✅ Được chat thoải mái\n' +
-            `⚠️ Ping @Member tối đa ${SB_ENV.pingLimitPerDay} lần/ngày\n` +
-            `⚠️ Vi phạm: trừ ${SB_ENV.pingPenaltyPercent}% cọc\n\n` +
+            '✅ Được chat thoải mái\n\n' +
             '╔════════════════════════════╗\n' +
             '        🛠️ **TUYỂN BUILDER**\n' +
             '╚════════════════════════════╝\n\n' +
@@ -3571,12 +3524,10 @@ function sbApplicationPanel() {
             (SB_ENV.builderMinDeposit > 0 ? `💰 **Cọc:** ${sbFormatVnd(SB_ENV.builderMinDeposit)}\n` : '') +
             '✅ Có channel Builder riêng\n' +
             '✅ Tự đặt tên Builder\n' +
-            '✅ Chat thoải mái\n' +
-            `⚠️ Ping @Member tối đa ${SB_ENV.pingLimitPerDay} lần/ngày\n` +
-            `⚠️ Vi phạm: trừ ${SB_ENV.pingPenaltyPercent}% cọc\n\n` +
+            '✅ Chat thoải mái\n\n' +
             '👇 **Nhấn nút bên dưới để đăng ký.**'
         )
-        .setFooter({ text: 'Hồ sơ được Admin xét duyệt trước khi kích hoạt shop.' })
+        .setFooter({ text: 'Đăng ký xong → chọn gói → thanh toán → setup shop.' })
         .setTimestamp();
 
     const row = new ActionRowBuilder().addComponents(
@@ -3603,17 +3554,15 @@ function sbApplicationModal(type) {
     const fields = type === 'seller'
         ? [
             ['name', 'Tên / thông tin người đăng ký', 'Tên của bạn', true],
-            ['products', 'Sản phẩm muốn bán', 'Ví dụ: Minecraft Money, Account...', true],
+            ['products', 'Sản phẩm muốn bán', 'Ví dụ: KingSMP hoặc DonutSMP', true],
             ['experience', 'Kinh nghiệm', 'Kinh nghiệm / lịch sử giao dịch', true],
-            ['hours', 'Thời gian hoạt động', 'Ví dụ: 18h-23h mỗi ngày', true],
-            ['contact', 'Thông tin liên hệ (nếu cần)', 'Discord / phương thức liên hệ', false]
+            ['hours', 'Thời gian hoạt động', 'Ví dụ: 18h-23h mỗi ngày', true]
         ]
         : [
             ['name', 'Tên / thông tin Builder', 'Tên của bạn', true],
             ['services', 'Dịch vụ muốn nhận', 'Farm, Stash, Build...', true],
             ['experience', 'Kinh nghiệm', 'Kinh nghiệm xây dựng', true],
-            ['hours', 'Thời gian hoạt động', 'Ví dụ: 18h-23h mỗi ngày', true],
-            ['contact', 'Thông tin liên hệ (nếu cần)', 'Discord / phương thức liên hệ', false]
+            ['hours', 'Thời gian hoạt động', 'Ví dụ: 18h-23h mỗi ngày', true]
         ];
 
     modal.addComponents(fields.map(([id, label, placeholder, required]) => new ActionRowBuilder().addComponents(
@@ -3649,75 +3598,107 @@ async function sbSendApplication(type, interaction) {
         userId: interaction.user.id,
         username: interaction.user.username,
         fields: {},
-        status: 'PENDING',
+        status: 'SETUP_PENDING',
         createdAt: Date.now(),
         reviewedBy: null,
-        reviewedAt: null
+        reviewedAt: null,
+        ticketChannelId: null
     };
 
-    for (const field of ['name', 'products', 'services', 'experience', 'hours', 'contact']) {
+    for (const field of ['name', 'products', 'services', 'experience', 'hours']) {
         try { application.fields[field] = interaction.fields.getTextInputValue(field).trim(); } catch (_) {}
     }
 
-    apps[appId] = application;
-    sbWrite(SB_APPLICATIONS_FILE, apps);
+    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
 
-    const targetChannelId = SB_ENV.applicationChannelId || interaction.channelId;
-    const applicationChannel = await client.channels.fetch(targetChannelId).catch(() => null);
-    if (!applicationChannel?.isTextBased()) {
+    try {
+        const safeUser = interaction.user.username.toLowerCase().replace(/[^a-z0-9-_]/g, '').slice(0, 45) || 'user';
+        const ticketName = `application-${type}-${safeUser}`;
+        const ticketChannel = await interaction.guild.channels.create({
+            name: ticketName,
+            type: ChannelType.GuildText,
+            topic: `sbApplication:${appId}:${interaction.user.id}:${type}`,
+            permissionOverwrites: [
+                { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+                {
+                    id: interaction.user.id,
+                    allow: [
+                        PermissionsBitField.Flags.ViewChannel,
+                        PermissionsBitField.Flags.SendMessages,
+                        PermissionsBitField.Flags.AttachFiles,
+                        PermissionsBitField.Flags.EmbedLinks,
+                        PermissionsBitField.Flags.ReadMessageHistory
+                    ]
+                },
+                ...adminOverwrite(interaction.guild.id)
+            ]
+        });
+
+        application.ticketChannelId = ticketChannel.id;
+        apps[appId] = application;
+        sbWrite(SB_APPLICATIONS_FILE, apps);
+
+        const fields = [
+            { name: '👤 User', value: `<@${interaction.user.id}>`, inline: true },
+            { name: '🆔 ID', value: interaction.user.id, inline: true },
+            { name: '🏪 Vị trí', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
+            ...(type === 'seller'
+                ? [{ name: '📦 Sản phẩm', value: application.fields.products || 'Không cung cấp', inline: false }]
+                : [{ name: '🧰 Dịch vụ', value: application.fields.services || 'Không cung cấp', inline: false }]),
+            { name: '💼 Kinh nghiệm', value: application.fields.experience || 'Không cung cấp', inline: false },
+            { name: '🕐 Thời gian hoạt động', value: application.fields.hours || 'Không cung cấp', inline: false }
+        ];
+
+        if (type === 'seller') {
+            const cfg = sbGetConfig();
+            fields.push(
+                { name: '💰 Cọc yêu cầu', value: sbFormatVnd(SB_ENV.sellerMinDeposit), inline: true },
+                { name: '📅 Gói tuần', value: sbFormatVnd(cfg.sellerWeeklyPrice), inline: true },
+                { name: '📅 Gói tháng', value: sbFormatVnd(cfg.sellerMonthlyPrice), inline: true }
+            );
+        }
+
+        const embed = new EmbedBuilder()
+            .setTitle(type === 'seller' ? '📋 SELLER APPLICATION' : '📋 BUILDER APPLICATION')
+            .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
+            .setDescription(
+                `🎫 **Application Ticket**\n\n` +
+                `Chỉ **người ứng tuyển + Admin** có thể xem ticket này.\n` +
+                `Hồ sơ đã được tiếp nhận. Chọn gói bên dưới để chuyển sang bước thanh toán/setup.`
+            )
+            .addFields(fields)
+            .setFooter({ text: `Application ID: ${appId}` })
+            .setTimestamp();
+
+        await ticketChannel.send({
+            content: `<@${interaction.user.id}> ${getTicketAdminMention()}`,
+            embeds: [embed],
+            components: [await sbBuildPlanMenu(type)],
+            allowedMentions: {
+                users: [interaction.user.id],
+                roles: getTicketAdminRoleId() ? [getTicketAdminRoleId()] : []
+            }
+        });
+
+        // Admin log chỉ nhận thông báo/link, dữ liệu ứng tuyển được xử lý trong ticket riêng.
+        sbLog('application', sbLogEmbed('📝 APPLICATION', type === 'seller' ? '#f1c40f' : '#3498db', [
+            { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
+            { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
+            { name: 'Status', value: 'SETUP_PENDING', inline: true },
+            { name: 'Application', value: `\`${appId}\``, inline: true },
+            { name: 'Ticket', value: `${ticketChannel}`, inline: false }
+        ]));
+
+        return safeEditReply(interaction, {
+            content: `✅ Đã tạo **Ticket đăng ký ${type === 'seller' ? 'Seller' : 'Builder'}**: ${ticketChannel}\nAdmin sẽ vào ticket để xử lý các bước tiếp theo.`
+        });
+    } catch (err) {
         delete apps[appId];
         sbWrite(SB_APPLICATIONS_FILE, apps);
-        return safeReply(interaction, {
-            content: '❌ APPLICATION_CHANNEL_ID chưa đúng hoặc bot không truy cập được channel tuyển dụng.',
-            flags: MessageFlags.Ephemeral
+        return safeEditReply(interaction, {
+            content: `❌ Không thể tạo Ticket đăng ký: \`${err.message}\`\nKiểm tra quyền **Manage Channels** của Bot.`
         });
     }
-
-    const fields = [
-        { name: '👤 User', value: `<@${interaction.user.id}>`, inline: true },
-        { name: '🆔 ID', value: interaction.user.id, inline: true },
-        { name: '🏪 Vị trí', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
-        ...(type === 'seller'
-            ? [{ name: '📦 Sản phẩm', value: application.fields.products || 'Không cung cấp', inline: false }]
-            : [{ name: '🧰 Dịch vụ', value: application.fields.services || 'Không cung cấp', inline: false }]),
-        { name: '💼 Kinh nghiệm', value: application.fields.experience || 'Không cung cấp', inline: false },
-        { name: '🕐 Thời gian hoạt động', value: application.fields.hours || 'Không cung cấp', inline: false },
-        { name: '📞 Liên hệ', value: application.fields.contact || 'Không cung cấp', inline: false }
-    ];
-
-    if (type === 'seller') {
-        const cfg = sbGetConfig();
-        fields.push(
-            { name: '💰 Cọc yêu cầu', value: sbFormatVnd(SB_ENV.sellerMinDeposit), inline: true },
-            { name: '📅 Gói tuần', value: sbFormatVnd(cfg.sellerWeeklyPrice), inline: true },
-            { name: '📅 Gói tháng', value: sbFormatVnd(cfg.sellerMonthlyPrice), inline: true }
-        );
-    }
-
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`sb_app_approve_${appId}`).setLabel('DUYỆT').setEmoji('✅').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`sb_app_reject_${appId}`).setLabel('TỪ CHỐI').setEmoji('❌').setStyle(ButtonStyle.Danger)
-    );
-
-    const embed = new EmbedBuilder()
-        .setTitle(type === 'seller' ? '📋 SELLER APPLICATION' : '📋 BUILDER APPLICATION')
-        .setColor(type === 'seller' ? '#f1c40f' : '#3498db')
-        .addFields(fields)
-        .setFooter({ text: `Application ID: ${appId}` })
-        .setTimestamp();
-
-    await applicationChannel.send({ embeds: [embed], components: [row] });
-    sbLog('application', sbLogEmbed('📝 APPLICATION', type === 'seller' ? '#f1c40f' : '#3498db', [
-        { name: 'User', value: `<@${interaction.user.id}>`, inline: true },
-        { name: 'Type', value: type === 'seller' ? 'Seller' : 'Builder', inline: true },
-        { name: 'Status', value: 'PENDING', inline: true },
-        { name: 'Application', value: `\`${appId}\`` }
-    ]));
-
-    return safeReply(interaction, {
-        content: `✅ Đã gửi hồ sơ **${type === 'seller' ? 'Seller' : 'Builder'}**. Admin sẽ xét duyệt trong thời gian sớm nhất.`,
-        flags: MessageFlags.Ephemeral
-    });
 }
 
 function sbAppButtons(appId, disabled = false) {
@@ -3767,7 +3748,15 @@ async function sbApproveApplication(interaction, appId, approve) {
         .setColor(approve ? '#2ecc71' : '#e74c3c')
         .addFields({ name: '📌 Trạng thái', value: `${approve ? '✅ APPROVED' : '❌ REJECTED'} bởi <@${interaction.user.id}>` });
 
-    await interaction.message.edit({ embeds: [updated], components: [sbAppButtons(appId, true)] }).catch(() => {});
+    const nextRow = approve
+        ? new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`sb_begin_setup_${app.type}`)
+                .setLabel(app.type === 'seller' ? '👑 Thanh toán & Setup Seller' : '🛠️ Thanh toán & Setup Builder')
+                .setStyle(ButtonStyle.Primary)
+        )
+        : null;
+    await interaction.message.edit({ embeds: [updated], components: approve ? [nextRow] : [sbAppButtons(appId, true)] }).catch(() => {});
 
     const roleId = sbRoleId(app.type);
     if (approve && roleId && interaction.guild) {
@@ -3789,7 +3778,7 @@ async function sbApproveApplication(interaction, appId, approve) {
     ]));
 
     return safeReply(interaction, {
-        content: approve ? '✅ Đã duyệt application và cấp role. User đã nhận hướng dẫn qua DM.' : '❌ Đã từ chối application.',
+        content: approve ? '✅ Đã duyệt application, cấp role và mở bước thanh toán/setup ngay trong ticket.' : '❌ Đã từ chối application.',
         flags: MessageFlags.Ephemeral
     });
 }
@@ -3874,7 +3863,7 @@ async function sbCreatePaymentTicket(interaction, type, plan, deposit) {
     const roleId = sbRoleId(type);
     const categoryId = sbCategoryId(type);
     const appMap = sbApplications();
-    const app = Object.values(appMap).find(a => a.userId === interaction.user.id && a.type === type && ['APPROVED', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status));
+    const app = Object.values(appMap).find(a => a.userId === interaction.user.id && a.type === type && ['PENDING', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status));
     const existingRecord = sbDataForType(type)[interaction.user.id];
     if (!app && !existingRecord) return safeReply(interaction, { content: `❌ Bạn chưa có application **${type}** được duyệt.`, flags: MessageFlags.Ephemeral });
 
@@ -3954,8 +3943,8 @@ async function sbHandleBeginSetup(interaction, type) {
         return safeReply(interaction, { content: `ℹ️ Bạn đang có hồ sơ ${type} với trạng thái **${existing.status}**.`, flags: MessageFlags.Ephemeral });
     }
     const apps = sbApplications();
-    const app = Object.values(apps).find(a => a.userId === interaction.user.id && a.type === type && a.status === 'APPROVED');
-    if (!app) return safeReply(interaction, { content: `❌ Chưa có application ${type} được duyệt.`, flags: MessageFlags.Ephemeral });
+    const app = Object.values(apps).find(a => a.userId === interaction.user.id && a.type === type && ['PENDING', 'SETUP_PENDING', 'PAYMENT_PENDING'].includes(a.status));
+    if (!app) return safeReply(interaction, { content: `❌ Chưa có application ${type} đang được tiếp nhận.`, flags: MessageFlags.Ephemeral });
     return safeReply(interaction, {
         content: type === 'seller'
             ? `👑 **Chọn gói Seller**\nCọc tối thiểu: **${sbFormatVnd(SB_ENV.sellerMinDeposit)}**` 
@@ -4639,8 +4628,6 @@ async function sbHandleButton(interaction) {
         const modal = new ModalBuilder().setCustomId('sb_shop_name_builder').setTitle('🛠️ SETUP BUILDER').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop_name').setLabel('Tên Builder').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Khang').setRequired(true).setMaxLength(50)));
         return interaction.showModal(modal);
     }
-    if (id.startsWith('sb_app_approve_')) return sbApproveApplication(interaction, id.replace('sb_app_approve_', ''), true);
-    if (id.startsWith('sb_app_reject_')) return sbApproveApplication(interaction, id.replace('sb_app_reject_', ''), false);
     if (id.startsWith('sb_pay_approve_')) return sbHandlePaymentApproval(interaction, id.replace('sb_pay_approve_', ''));
     return false;
 }
@@ -5284,9 +5271,6 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (id === 'ticket_seller_select') {
                 const sellerId = interaction.values[0];
-                if (sellerId === 'none') {
-                    return safeReply(interaction, { content: '⚠️ Hiện chưa có Seller khả dụng.', flags: MessageFlags.Ephemeral });
-                }
                 const seller = getSellerInfo(sellerId);
                 if (!seller) return safeReply(interaction, { content: '❌ Seller không hợp lệ.', flags: MessageFlags.Ephemeral });
 
