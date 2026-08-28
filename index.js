@@ -3405,7 +3405,7 @@ const SB_ENV = {
     sellerMonthlyPrice: Math.max(0, Number.parseInt(process.env.SELLER_MONTHLY_PRICE || '100000', 10) || 100000),
     builderWeeklyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_WEEKLY_PRICE || '30000', 10) || 30000),
     builderMonthlyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_MONTHLY_PRICE || '100000', 10) || 100000),
-    builderMinDeposit: Math.max(0, Number.parseInt(process.env.BUILDER_MIN_DEPOSIT || '0', 10) || 0),
+    builderMinDeposit: Math.max(0, Number.parseInt(process.env.BUILDER_MIN_DEPOSIT || '100000', 10) || 100000),
     pingLimitPerDay: Math.max(1, Number.parseInt(process.env.PING_LIMIT_PER_DAY || '1', 10) || 1),
     pingPenaltyPercent: Math.max(0, Number.parseFloat(process.env.PING_PENALTY_PERCENT || '10') || 10),
     renameCooldownHours: Math.max(0, Number.parseInt(process.env.SHOP_RENAME_COOLDOWN_HOURS || '24', 10) || 24),
@@ -3731,9 +3731,7 @@ async function sbSendApplication(type, interaction) {
         fields.push(
             { name: '📅 Gói tuần', value: sbFormatVnd(type === 'seller' ? cfg.sellerWeeklyPrice : cfg.builderWeeklyPrice), inline: true },
             { name: '📅 Gói tháng', value: sbFormatVnd(type === 'seller' ? cfg.sellerMonthlyPrice : cfg.builderMonthlyPrice), inline: true },
-            ...(type === 'seller'
-                ? [{ name: '🛡️ Cọc tối thiểu', value: sbFormatVnd(SB_ENV.sellerMinDeposit), inline: true }]
-                : [])
+            { name: '🛡️ Cọc tối thiểu', value: sbFormatVnd(type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit), inline: true }
         );
 
         const embed = new EmbedBuilder()
@@ -3902,12 +3900,12 @@ async function sbBuildPlanMenu(type) {
 }
 
 function sbSetupPaymentModal(type, plan) {
-    const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : 0;
+    const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit;
     const modal = new ModalBuilder()
         .setCustomId(`sb_payment_modal_${type}_${plan}`)
         .setTitle(type === 'seller' ? `👑 Thanh toán Seller • ${sbPlanLabel(plan)}` : `🛠️ Thanh toán Builder • ${sbPlanLabel(plan)}`);
 
-    if (type === 'seller') {
+    if (type === 'seller' || type === 'builder') {
         modal.addComponents(new ActionRowBuilder().addComponents(
             new TextInputBuilder()
                 .setCustomId('deposit')
@@ -4178,7 +4176,7 @@ async function sbHandlePaymentApproval(interaction, orderId) {
         deposit: existing?.deposit != null ? existing.deposit : order.deposit,
         startDate: existing?.startDate || now.toISOString(),
         expireDate: expire.toISOString(),
-        applicationId: existing?.applicationId || app?.id || null,
+        applicationId: existing?.applicationId || null,
         categoryId: sbCategoryId(order.type),
         channelId: existing?.channelId || null,
         shopName: existing?.shopName || '',
@@ -4245,9 +4243,7 @@ async function sbHandlePaymentApproval(interaction, orderId) {
         .setDescription(
             `🎉 <@${order.userId}> **đã được xác nhận thanh toán!**\n\n` +
             `📦 **Gói:** ${sbPlanLabel(order.plan)}\n` +
-            (order.type === 'seller'
-                ? `🛡️ **Cọc:** ${sbFormatVnd(recordAfterPayment.deposit)}\n`
-                : '') +
+            `🛡️ **Cọc:** ${sbFormatVnd(order.deposit)}\n` +
             (recordAfterPayment.channelId
                 ? `🏪 **Shop hiện tại:** <#${recordAfterPayment.channelId}>\n\n` +
                   `✅ Shop cũ được giữ nguyên. Bạn có thể tiếp tục sử dụng shop.`
@@ -5044,10 +5040,7 @@ async function sbHandleSelect(interaction) {
             sbSaveDataForType('builder', data);
             return safeEditReply(interaction, { content: '✅ Builder không có phí được cấu hình. Bạn có thể đặt tên Builder ngay.', components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sb_setup_shop_builder').setLabel('🛠️ Đặt tên Builder').setStyle(ButtonStyle.Primary))] });
         }
-        if (type === 'seller') {
-            return interaction.showModal(sbSetupPaymentModal(type, plan));
-        }
-        return sbCreatePaymentTicket(interaction, type, plan, SB_ENV.builderMinDeposit);
+        return interaction.showModal(sbSetupPaymentModal(type, plan));
     }
     return false;
 }
@@ -5059,8 +5052,9 @@ async function sbHandleModal(interaction) {
         const parts = id.split('_');
         const type = parts[3];
         const plan = parts[4];
-        const deposit = type === 'seller' ? sbParseVnd(interaction.fields.getTextInputValue('deposit')) : SB_ENV.builderMinDeposit;
-        if (type === 'seller' && deposit < SB_ENV.sellerMinDeposit) return safeReply(interaction, { content: `❌ Cọc tối thiểu là **${sbFormatVnd(SB_ENV.sellerMinDeposit)}**.`, flags: MessageFlags.Ephemeral });
+        const deposit = sbParseVnd(interaction.fields.getTextInputValue('deposit'));
+        const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit;
+        if (deposit < minDeposit) return safeReply(interaction, { content: `❌ Cọc tối thiểu là **${sbFormatVnd(minDeposit)}**.`, flags: MessageFlags.Ephemeral });
         if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
         return sbCreatePaymentTicket(interaction, type, plan, deposit);
     }
