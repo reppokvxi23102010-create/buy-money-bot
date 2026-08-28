@@ -477,7 +477,7 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
                         PermissionsBitField.Flags.AttachFiles
                     ]
                 }] : []),
-                ...(sellerId ? getSellerRoleOverwrite(interaction.guild, sellerId) : []),
+                ...(sellerId ? await getSellerRoleOverwrite(interaction.guild, sellerId) : []),
                 ...ticketRoleOverwrite(info.roleId),
                 ...adminOverwrite(interaction.guild.id)
             ]
@@ -485,6 +485,8 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
 
         const seller = sellerId ? getSellerInfo(sellerId) : null;
         const responsiblePing = seller ? `<@${seller.id}>` : info.ping;
+        const sellerDisplayName = seller ? await getSellerDisplayName(interaction.guild, seller.id) : null;
+        const sellerOnline = seller ? await isSellerOnline(interaction.guild, seller.id) : false;
 
         const embed = new EmbedBuilder()
             .setColor('#5865F2')
@@ -493,7 +495,7 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
                 `Xin chào <@${interaction.user.id}>!\n\n` +
                 `${info.description}\n\n` +
                 `📌 **Người phụ trách:** ${responsiblePing}\n` +
-                (seller ? `📡 **Trạng thái Seller:** ${isSellerOnline(interaction.guild, seller.id) ? 'ONLINE' : 'OFFLINE'}\n` : '') +
+                (seller ? `🏷️ **Seller:** ${sellerDisplayName}\n📡 **Trạng thái Seller:** ${sellerOnline ? 'ONLINE' : 'OFFLINE'}\n` : '') +
                 '🔒 Khi hoàn tất, Admin có thể đóng ticket.'
             )
             .setFooter({ text: `Ticket của ${interaction.user.tag}` })
@@ -650,12 +652,43 @@ function getSellerInfo(sellerId) {
     return ITEM_SELLERS.find(s => s.id === sellerId) || null;
 }
 
-function getSellerRoleOverwrite(guild, sellerId) {
-    const member = guild?.members?.cache?.get(sellerId);
+async function getSellerMember(guild, sellerId) {
+    try {
+        if (!guild || !sellerId) return null;
+        return await guild.members.fetch(sellerId);
+    } catch (err) {
+        return guild?.members?.cache?.get(sellerId) || null;
+    }
+}
+
+async function getSellerDisplayName(guild, sellerId) {
+    // Ưu tiên tên hiển thị trên server. Nếu member chưa fetch được,
+    // fallback sang User API để vẫn lấy đúng tên Discord thay vì hiện ID.
+    const member = await getSellerMember(guild, sellerId);
+    if (member?.displayName) return member.displayName;
+    if (member?.user?.globalName) return member.user.globalName;
+    if (member?.user?.username) return member.user.username;
+
+    try {
+        const user = await client.users.fetch(sellerId);
+        return user?.globalName || user?.username || `Seller ${sellerId.slice(-4)}`;
+    } catch (err) {
+        return `Seller ${sellerId.slice(-4)}`;
+    }
+}
+
+async function getSellerRoleId(guild, sellerId) {
+    const member = await getSellerMember(guild, sellerId);
     const role = member?.roles?.highest;
-    if (!role || role.id === guild.id || role.managed) return [];
+    if (!role || role.id === guild?.id || role.managed) return null;
+    return role.id;
+}
+
+async function getSellerRoleOverwrite(guild, sellerId) {
+    const roleId = await getSellerRoleId(guild, sellerId);
+    if (!roleId) return [];
     return [{
-        id: role.id,
+        id: roleId,
         allow: [
             PermissionsBitField.Flags.ViewChannel,
             PermissionsBitField.Flags.SendMessages,
@@ -664,133 +697,114 @@ function getSellerRoleOverwrite(guild, sellerId) {
     }];
 }
 
-function isSellerOnline(guild, sellerId) {
-    const member = guild?.members?.cache?.get(sellerId);
+async function isSellerOnline(guild, sellerId) {
+    const member = await getSellerMember(guild, sellerId);
     return Boolean(member?.presence?.status && member.presence.status !== 'offline');
 }
 
-function getCurrentTicketSellerId(channel) {
-    const topic = channel?.topic || '';
-    const parts = topic.split(':');
-    if (parts[0] !== 'generalTicket' || parts[1] !== 'buy_items') return null;
-    return parts[3] || null;
+async function buildSellerSelectMenu(guild) {
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId('ticket_seller_select')
+        .setPlaceholder('🛒 Chọn Seller bạn yêu thích...');
+
+    for (const seller of ITEM_SELLERS) {
+        const [name, online] = await Promise.all([
+            getSellerDisplayName(guild, seller.id),
+            isSellerOnline(guild, seller.id)
+        ]);
+
+        menu.addOptions(
+            new StringSelectMenuOptionBuilder()
+                // Dòng trên: tên Seller
+                .setLabel(`${name}`.slice(0, 100))
+                // Dòng dưới: chỉ trạng thái, không hiện ID cho đỡ rối
+                .setDescription(online ? '🟢 ONLINE' : '🔴 OFFLINE')
+                .setEmoji(seller.emoji)
+                .setValue(seller.id)
+        );
+    }
+
+    return new ActionRowBuilder().addComponents(menu);
 }
 
-async function findMainBuyItemsTicketMessage(channel) {
-    try {
-        const messages = await channel.messages.fetch({ limit: 50 });
-        return messages.find(m =>
-            m.author?.id === client.user?.id &&
-            m.embeds?.some(e => e.title === '🛒 MUA VẬT PHẨM KINGSMP / DONUTSMP')
-        ) || null;
-    } catch (err) {
-        console.error('❌ Không tìm được message ticket để cập nhật Seller:', err?.message || err);
-        return null;
-    }
-}
-
-async function changeTicketSeller(interaction, oldSellerId, newSellerId) {
-    const channel = interaction.channel;
-    const seller = getSellerInfo(newSellerId);
-    if (!channel || !interaction.guild || !seller) {
-        return safeReply(interaction, { content: '❌ Không thể đổi Seller.', flags: MessageFlags.Ephemeral });
+async function switchTicketSeller(interaction, sellerId) {
+    if (!interaction.channel || !interaction.guild) {
+        return safeReply(interaction, { content: '❌ Không tìm thấy ticket.', flags: MessageFlags.Ephemeral });
     }
 
-    const oldSeller = getSellerInfo(oldSellerId);
-    const currentTopicParts = (channel.topic || '').split(':');
-    const ticketType = currentTopicParts[1] === 'buy_items' ? 'buy_items' : null;
-    const customerId = currentTopicParts[2];
-    if (ticketType !== 'buy_items' || !customerId) {
-        return safeReply(interaction, { content: '❌ Đây không phải ticket mua vật phẩm hợp lệ.', flags: MessageFlags.Ephemeral });
+    const topic = String(interaction.channel.topic || '');
+    const match = topic.match(/^generalTicket:buy_items:(\d+)(?::(\d+))?$/);
+    if (!match) {
+        return safeReply(interaction, { content: '❌ Ticket này không hỗ trợ chuyển Seller.', flags: MessageFlags.Ephemeral });
     }
 
-    if (!(await safeDeferUpdate(interaction))) return;
+    const customerId = match[1];
+    const oldSellerId = match[2] || null;
+    if (interaction.user.id !== customerId && !isAdminUser(interaction)) {
+        return safeReply(interaction, { content: '❌ Chỉ khách trong ticket hoặc Admin mới được đổi Seller.', flags: MessageFlags.Ephemeral });
+    }
+
+    const newSeller = getSellerInfo(sellerId);
+    if (!newSeller) {
+        return safeReply(interaction, { content: '❌ Seller không hợp lệ.', flags: MessageFlags.Ephemeral });
+    }
+
+    if (oldSellerId === sellerId) {
+        return safeReply(interaction, { content: 'ℹ️ Ticket đang phụ trách bởi Seller này rồi.', flags: MessageFlags.Ephemeral });
+    }
+
+    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
 
     try {
-        if (oldSellerId && oldSellerId !== newSellerId) {
-            await channel.permissionOverwrites.delete(oldSellerId).catch(() => {});
-            const oldRole = getSellerRoleOverwrite(interaction.guild, oldSellerId);
-            for (const overwrite of oldRole) {
-                await channel.permissionOverwrites.delete(overwrite.id).catch(() => {});
+        // Gỡ quyền Seller cũ và role cũ.
+        if (oldSellerId) {
+            await interaction.channel.permissionOverwrites.delete(oldSellerId).catch(() => {});
+            const oldRoleId = await getSellerRoleId(interaction.guild, oldSellerId);
+            if (oldRoleId) {
+                await interaction.channel.permissionOverwrites.delete(oldRoleId).catch(() => {});
             }
         }
 
-        await channel.permissionOverwrites.edit(newSellerId, {
+        // Cấp quyền Seller mới + role của Seller mới.
+        await interaction.channel.permissionOverwrites.edit(newSeller.id, {
             ViewChannel: true,
             SendMessages: true,
             AttachFiles: true
         });
 
-        const newRole = getSellerRoleOverwrite(interaction.guild, newSellerId);
-        for (const overwrite of newRole) {
-            await channel.permissionOverwrites.edit(overwrite.id, {
+        const newRoleId = await getSellerRoleId(interaction.guild, newSeller.id);
+        if (newRoleId) {
+            await interaction.channel.permissionOverwrites.edit(newRoleId, {
                 ViewChannel: true,
                 SendMessages: true,
                 AttachFiles: true
             });
         }
 
-        await channel.setTopic(`generalTicket:buy_items:${customerId}:${newSellerId}`);
+        await interaction.channel.setTopic(`generalTicket:buy_items:${customerId}:${newSeller.id}`);
 
-        const ticketMessage = await findMainBuyItemsTicketMessage(channel);
-        const currentEmbed = ticketMessage?.embeds?.[0] ? EmbedBuilder.from(ticketMessage.embeds[0]) : null;
-        if (ticketMessage && currentEmbed) {
-            const oldDescription = currentEmbed.data.description || '';
-            const nextDescription = oldDescription
-                .replace(/📌 \*\*Người phụ trách:\*\*.*(?:\n|$)/, `📌 **Người phụ trách:** <@${newSellerId}>\n`)
-                .replace(/📡 \*\*Trạng thái Seller:\*\*.*(?:\n|$)/, `📡 **Trạng thái Seller:** ${isSellerOnline(interaction.guild, newSellerId) ? 'ONLINE' : 'OFFLINE'}\n`);
-            const nextRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId('ticket_change_seller')
-                    .setLabel('Chuyển Seller')
-                    .setEmoji('🔄')
-                    .setStyle(ButtonStyle.Primary),
-                new ButtonBuilder()
-                    .setCustomId('close_ticket')
-                    .setLabel('Đóng Ticket')
-                    .setEmoji('🔒')
-                    .setStyle(ButtonStyle.Danger)
-            );
-            await ticketMessage.edit({ embeds: [currentEmbed.setDescription(nextDescription)], components: [nextRow] }).catch(() => {});
-        }
-
-        await channel.send({
-            content: `<@${newSellerId}>`,
+        const displayName = await getSellerDisplayName(interaction.guild, newSeller.id);
+        const online = await isSellerOnline(interaction.guild, newSeller.id);
+        const message = await interaction.channel.send({
+            content: `<@${customerId}> <@${newSeller.id}>`,
             embeds: [new EmbedBuilder()
-                .setColor('#3498db')
+                .setColor('#5865F2')
                 .setTitle('🔄 ĐÃ CHUYỂN SELLER')
                 .setDescription(
-                    `👤 Khách: <@${customerId}>\n` +
-                    `📌 Seller mới: <@${newSellerId}>\n` +
-                    `📡 Trạng thái: **${isSellerOnline(interaction.guild, newSellerId) ? 'ONLINE' : 'OFFLINE'}**\n\n` +
-                    `✅ Seller offline vẫn nhận ticket bình thường. Khách có thể đổi Seller bất cứ lúc nào.`
+                    `👤 Seller mới: **${displayName}**\n` +
+                    `📡 Trạng thái: **${online ? 'ONLINE' : 'OFFLINE'}**\n\n` +
+                    `Khách có thể tiếp tục giao dịch với Seller này.`
                 )
                 .setTimestamp()],
-            allowedMentions: { users: [newSellerId] }
+            allowedMentions: { users: [customerId, newSeller.id] }
         });
 
         return safeEditReply(interaction, {
-            content: `✅ Đã chuyển từ ${oldSeller ? `<@${oldSeller.id}>` : '`Seller cũ`'} sang <@${newSellerId}>.\n📡 Trạng thái hiện tại: **${isSellerOnline(interaction.guild, newSellerId) ? 'ONLINE' : 'OFFLINE'}**`
+            content: `✅ Đã chuyển ticket sang **${displayName}**${online ? ' • 🟢 ONLINE' : ' • 🔴 OFFLINE'}.`
         });
     } catch (err) {
         return safeEditReply(interaction, { content: `❌ Không thể chuyển Seller: \`${err.message}\`` });
     }
-}
-
-function buildSellerSelectMenu(guild, currentSellerId = null) {
-    const menu = new StringSelectMenuBuilder()
-        .setCustomId(currentSellerId ? `ticket_seller_change:${currentSellerId}` : 'ticket_seller_select')
-        .setPlaceholder('🛒 Chọn Seller bạn yêu thích (theo ID)...')
-        .addOptions(ITEM_SELLERS.map(seller => {
-            const online = isSellerOnline(guild, seller.id);
-            const isCurrent = currentSellerId === seller.id;
-            return new StringSelectMenuOptionBuilder()
-                .setLabel(`${seller.id}${isCurrent ? ' • ĐANG CHỌN' : ''}`)
-                .setDescription(`${online ? '🟢 ONLINE' : '🔴 OFFLINE'} • ${isCurrent ? 'Seller hiện tại' : 'Chọn Seller này để giao dịch'}`)
-                .setEmoji(seller.emoji)
-                .setValue(seller.id);
-        }));
-    return new ActionRowBuilder().addComponents(menu);
 }
 
 function getMoneyOrders() {
@@ -3783,8 +3797,8 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (id === 'ticket_change_seller') {
                 return safeReply(interaction, {
-                    content: '🔄 **Chọn Seller mới mà bạn yêu thích:**',
-                    components: [buildSellerSelectMenu(interaction.guild, getCurrentTicketSellerId(interaction.channel))],
+                    content: '🔄 **Chọn Seller bạn yêu thích để chuyển sang:**',
+                    components: [await buildSellerSelectMenu(interaction.guild)],
                     flags: MessageFlags.Ephemeral
                 });
             }
@@ -3834,8 +3848,8 @@ client.on(Events.InteractionCreate, async interaction => {
                 const type = interaction.values[0];
                 if (type === 'buy_items') {
                     return safeReply(interaction, {
-                        content: '🛒 **Chọn Seller muốn giao dịch:**\n\nBot đã kiểm tra trạng thái Online/Offline hiện tại.',
-                        components: [buildSellerSelectMenu(interaction.guild)],
+                        content: '🛒 **Chọn Seller bạn yêu thích:**\n\nTên Seller ở trên, trạng thái Online/Offline ở dưới.',
+                        components: [await buildSellerSelectMenu(interaction.guild)],
                         flags: MessageFlags.Ephemeral
                     });
                 }
@@ -3846,13 +3860,13 @@ client.on(Events.InteractionCreate, async interaction => {
                 const sellerId = interaction.values[0];
                 const seller = getSellerInfo(sellerId);
                 if (!seller) return safeReply(interaction, { content: '❌ Seller không hợp lệ.', flags: MessageFlags.Ephemeral });
-                return await createGeneralTicket(interaction, 'buy_items', sellerId);
-            }
 
-            if (id.startsWith('ticket_seller_change:')) {
-                const oldSellerId = id.split(':')[1] || null;
-                const newSellerId = interaction.values[0];
-                return await changeTicketSeller(interaction, oldSellerId, newSellerId);
+                const topic = String(interaction.channel?.topic || '');
+                if (topic.startsWith('generalTicket:buy_items:')) {
+                    return await switchTicketSeller(interaction, sellerId);
+                }
+
+                return await createGeneralTicket(interaction, 'buy_items', sellerId);
             }
 
             if (
