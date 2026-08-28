@@ -649,7 +649,38 @@ function isWithinThuMoneyWorkingHours() {
 }
 
 function getSellerInfo(sellerId) {
-    return ITEM_SELLERS.find(s => s.id === sellerId) || null;
+    if (!sellerId) return null;
+
+    // Ưu tiên Seller đang ACTIVE được tạo từ hệ thống tuyển dụng.
+    // Như vậy ID Seller vừa đăng ký sẽ tự động xuất hiện trong menu
+    // chọn Seller của Ticket mua hàng, không cần thêm ID thủ công.
+    const sellers = sbDataForType('seller');
+    const record = sellers[String(sellerId)];
+    if (record && record.status === 'ACTIVE' && record.channelId) {
+        return {
+            id: String(record.userId || sellerId),
+            label: record.shopName || `Seller ${String(sellerId).slice(-4)}`,
+            emoji: '👑',
+            shopName: record.shopName || '',
+            shopSlug: record.shopSlug || '',
+            channelId: record.channelId,
+            dynamic: true
+        };
+    }
+
+    // Tương thích với Seller cũ đã cấu hình sẵn trong ITEM_SELLERS.
+    return ITEM_SELLERS.find(s => s.id === String(sellerId)) || null;
+}
+
+function getActiveSellerRecords() {
+    const sellers = sbDataForType('seller');
+    return Object.values(sellers)
+        .filter(record => record?.userId && record.status === 'ACTIVE' && record.channelId)
+        .sort((a, b) => {
+            const aName = String(a.shopName || '').toLowerCase();
+            const bName = String(b.shopName || '').toLowerCase();
+            return aName.localeCompare(bName, 'vi');
+        });
 }
 
 async function getSellerMember(guild, sellerId) {
@@ -707,7 +738,34 @@ async function buildSellerSelectMenu(guild) {
         .setCustomId('ticket_seller_select')
         .setPlaceholder('🛒 Chọn Seller bạn yêu thích...');
 
+    // Lấy Seller trực tiếp từ sellers.json: Seller vừa được tuyển, thanh toán
+    // và tạo shop xong sẽ tự xuất hiện ở đây bằng chính Discord User ID của họ.
+    const activeRecords = getActiveSellerRecords();
+    const dynamicIds = new Set(activeRecords.map(record => String(record.userId)));
+
+    for (const record of activeRecords) {
+        const sellerId = String(record.userId);
+        const [displayName, online] = await Promise.all([
+            getSellerDisplayName(guild, sellerId),
+            isSellerOnline(guild, sellerId)
+        ]);
+
+        const label = (record.shopName || displayName || `Seller ${sellerId.slice(-4)}`).slice(0, 100);
+        const description = `${online ? '🟢 ONLINE' : '🔴 OFFLINE'} • Seller đã xác thực`.slice(0, 100);
+
+        menu.addOptions(
+            new StringSelectMenuOptionBuilder()
+                .setLabel(label)
+                .setDescription(description)
+                .setEmoji('👑')
+                .setValue(sellerId)
+        );
+    }
+
+    // Giữ tương thích với các Seller cũ chưa có dữ liệu sellers.json.
     for (const seller of ITEM_SELLERS) {
+        if (dynamicIds.has(String(seller.id))) continue;
+
         const [name, online] = await Promise.all([
             getSellerDisplayName(guild, seller.id),
             isSellerOnline(guild, seller.id)
@@ -715,12 +773,20 @@ async function buildSellerSelectMenu(guild) {
 
         menu.addOptions(
             new StringSelectMenuOptionBuilder()
-                // Dòng trên: tên Seller
                 .setLabel(`${name}`.slice(0, 100))
-                // Dòng dưới: chỉ trạng thái, không hiện ID cho đỡ rối
                 .setDescription(online ? '🟢 ONLINE' : '🔴 OFFLINE')
                 .setEmoji(seller.emoji)
-                .setValue(seller.id)
+                .setValue(String(seller.id))
+        );
+    }
+
+    if (menu.options.length === 0) {
+        menu.addOptions(
+            new StringSelectMenuOptionBuilder()
+                .setLabel('Chưa có Seller hoạt động')
+                .setDescription('Hiện chưa có Seller nào có Shop ACTIVE')
+                .setEmoji('⚠️')
+                .setValue('no_seller')
         );
     }
 
@@ -4854,15 +4920,28 @@ async function sbAdminClose(interaction, type, userId) {
     const data = sbDataForType(type);
     const record = data[userId];
     if (!record) return safeReply(interaction, { content: `❌ Không tìm thấy hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
+
+    const channelId = record.channelId;
     record.status = 'CLOSED';
     record.closedAt = Date.now();
+    record.channelId = null;
     data[userId] = record;
     sbSaveDataForType(type, data);
-    if (record.channelId) {
-        const ch = await interaction.guild.channels.fetch(record.channelId).catch(() => null);
-        if (ch) await ch.permissionOverwrites.edit(userId, { SendMessages: false, ViewChannel: true }).catch(() => {});
+
+    // Đóng shop bằng /seller close hoặc /builder close sẽ XÓA luôn channel shop.
+    if (channelId && interaction.guild) {
+        const ch = await interaction.guild.channels.fetch(channelId).catch(() => null);
+        if (ch) {
+            await ch.delete(`Đóng shop ${type} cho ${userId} bởi Admin`).catch(err =>
+                console.error(`❌ Không thể xóa channel shop ${type}:`, err?.message || err)
+            );
+        }
     }
-    return safeReply(interaction, { content: `✅ Đã đóng shop ${type} của <@${userId}>. Channel không bị xóa.`, flags: MessageFlags.Ephemeral });
+
+    return safeReply(interaction, {
+        content: `✅ Đã đóng shop ${type} của <@${userId}> và xóa channel shop.`,
+        flags: MessageFlags.Ephemeral
+    });
 }
 
 async function sbAdminSetDepositType(interaction, type, userId, amount) {
@@ -5650,6 +5729,9 @@ client.on(Events.InteractionCreate, async interaction => {
 
             if (id === 'ticket_seller_select') {
                 const sellerId = interaction.values[0];
+                if (sellerId === 'no_seller') {
+                    return safeReply(interaction, { content: '❌ Hiện chưa có Seller nào hoạt động.', flags: MessageFlags.Ephemeral });
+                }
                 const seller = getSellerInfo(sellerId);
                 if (!seller) return safeReply(interaction, { content: '❌ Seller không hợp lệ.', flags: MessageFlags.Ephemeral });
 
