@@ -102,7 +102,16 @@ const ACC_STOCK_FILE = path.join(__dirname, 'accounts.json');
 const ACC_DETAIL_FILE = path.join(__dirname, 'accounts_detail.json');
 
 const MONEY_ORDERS_FILE = path.join(__dirname, 'money_orders.json');
+const THU_MONEY_CONFIG_KEY = 'thuMoneyPanel';
+const THU_MONEY_TICKET_PREFIX = 'ticket-thumoney-';
 const TICKET_CONFIG_KEY = 'ticketPanel';
+
+const ITEM_SELLERS = [
+    { id: '1513494095559921775', label: 'T1', emoji: '1️⃣' },
+    { id: '1542430933724962817', label: 'T2', emoji: '2️⃣' },
+    { id: '1198608624080142517', label: 'T3', emoji: '3️⃣' },
+    { id: '908316104391266325', label: 'T4', emoji: '4️⃣' }
+];
 
 // ============================================================
 // 4. SAFE JSON HELPERS
@@ -337,7 +346,7 @@ function buildTicketPanel() {
         .setTitle('🎫 HỖ TRỢ & DỊCH VỤ')
         .setDescription(
             'Bấm nút **Mở Menu Ticket** bên dưới để chọn đúng nhu cầu của bạn.\n\n' +
-            '🛒 **Mua vật phẩm KingSMP / DonutSMP** → Ping Seller\n' +
+            '🛒 **Mua vật phẩm KingSMP / DonutSMP** → Chọn Seller (bot kiểm tra Online/Offline)\n' +
             '🏗️ **Builder xây Farm / Stash** → Ping Builder\n' +
             '🛠️ **Hỗ trợ Partner / Khác** → Ping Admin\n' +
             '💎 **Thu mua Account Minecraft Premium** → Ping Admin'
@@ -421,7 +430,7 @@ function ticketTypeInfo(type) {
     return map[type] || null;
 }
 
-async function createGeneralTicket(interaction, type) {
+async function createGeneralTicket(interaction, type, sellerId = null) {
     const info = ticketTypeInfo(type);
 
     if (!info || !interaction.guild) {
@@ -441,7 +450,7 @@ async function createGeneralTicket(interaction, type) {
 
     try {
         // Gán topic ngay lúc create => bỏ 1 request API setTopic riêng, tạo ticket nhanh hơn.
-        const ticketTopic = `generalTicket:${type}:${interaction.user.id}`;
+        const ticketTopic = `generalTicket:${type}:${interaction.user.id}${sellerId ? `:${sellerId}` : ''}`;
 
         const ticketChannel = await interaction.guild.channels.create({
             name: `ticket-${baseName}`,
@@ -460,10 +469,22 @@ async function createGeneralTicket(interaction, type) {
                         PermissionsBitField.Flags.AttachFiles
                     ]
                 },
+                ...(sellerId ? [{
+                    id: sellerId,
+                    allow: [
+                        PermissionsBitField.Flags.ViewChannel,
+                        PermissionsBitField.Flags.SendMessages,
+                        PermissionsBitField.Flags.AttachFiles
+                    ]
+                }] : []),
+                ...(sellerId ? getSellerRoleOverwrite(interaction.guild, sellerId) : []),
                 ...ticketRoleOverwrite(info.roleId),
                 ...adminOverwrite(interaction.guild.id)
             ]
         });
+
+        const seller = sellerId ? getSellerInfo(sellerId) : null;
+        const responsiblePing = seller ? `<@${seller.id}>` : info.ping;
 
         const embed = new EmbedBuilder()
             .setColor('#5865F2')
@@ -471,13 +492,21 @@ async function createGeneralTicket(interaction, type) {
             .setDescription(
                 `Xin chào <@${interaction.user.id}>!\n\n` +
                 `${info.description}\n\n` +
-                `📌 **Người phụ trách:** ${info.ping}\n` +
+                `📌 **Người phụ trách:** ${responsiblePing}\n` +
+                (seller ? `📡 **Trạng thái Seller:** ${isSellerOnline(interaction.guild, seller.id) ? 'ONLINE' : 'OFFLINE'}\n` : '') +
                 '🔒 Khi hoàn tất, Admin có thể đóng ticket.'
             )
             .setFooter({ text: `Ticket của ${interaction.user.tag}` })
             .setTimestamp();
 
         const closeRow = new ActionRowBuilder().addComponents(
+            ...(sellerId ? [
+                new ButtonBuilder()
+                    .setCustomId('ticket_change_seller')
+                    .setLabel('Chuyển Seller')
+                    .setEmoji('🔄')
+                    .setStyle(ButtonStyle.Primary)
+            ] : []),
             new ButtonBuilder()
                 .setCustomId('close_ticket')
                 .setLabel('Đóng Ticket')
@@ -486,12 +515,13 @@ async function createGeneralTicket(interaction, type) {
         );
 
         // Gửi ticket message và log gần như đồng thời để giảm thời gian chờ.
+        const mentionUsers = sellerId ? [interaction.user.id, sellerId] : [interaction.user.id];
         const ticketMessagePromise = ticketChannel.send({
-            content: `<@${interaction.user.id}> ${info.ping}`,
+            content: sellerId ? `<@${interaction.user.id}> <@${sellerId}>` : `<@${interaction.user.id}> ${info.ping}`,
             embeds: [embed],
             components: [closeRow],
             allowedMentions: {
-                users: [interaction.user.id],
+                users: mentionUsers,
                 roles: info.roleId ? [info.roleId] : []
             }
         });
@@ -576,6 +606,191 @@ function loadMoneyConfig() {
 
 function saveMoneyConfig(data) {
     writeJson(CONFIG_FILE, data);
+}
+
+function loadThuMoneyConfig() {
+    const config = readJson(CONFIG_FILE, {});
+    return config?.[THU_MONEY_CONFIG_KEY] || {};
+}
+
+function saveThuMoneyConfig(data) {
+    const config = readJson(CONFIG_FILE, {});
+    config[THU_MONEY_CONFIG_KEY] = data || {};
+    saveMoneyConfig(config);
+}
+
+function getVietnamDateKey() {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        year: 'numeric', month: '2-digit', day: '2-digit'
+    }).formatToParts(new Date());
+    const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+    return `${map.year}-${map.month}-${map.day}`;
+}
+
+function getThuMoneyRate() {
+    const config = loadThuMoneyConfig();
+    const dailyRate = Number(config.dailyRates?.[getVietnamDateKey()]);
+    if (Number.isFinite(dailyRate) && dailyRate > 0) return dailyRate;
+    const fallback = Number(config.rate);
+    return Number.isFinite(fallback) && fallback > 0 ? fallback : 100;
+}
+
+function isWithinThuMoneyWorkingHours() {
+    const config = loadThuMoneyConfig();
+    const start = Number.isInteger(config.workingHours?.start) ? config.workingHours.start : 10;
+    const end = Number.isInteger(config.workingHours?.end) ? config.workingHours.end : 22;
+    const hour = Number(new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Ho_Chi_Minh', hour: '2-digit', hour12: false
+    }).format(new Date()));
+    return start <= end ? (hour >= start && hour < end) : (hour >= start || hour < end);
+}
+
+function getSellerInfo(sellerId) {
+    return ITEM_SELLERS.find(s => s.id === sellerId) || null;
+}
+
+function getSellerRoleOverwrite(guild, sellerId) {
+    const member = guild?.members?.cache?.get(sellerId);
+    const role = member?.roles?.highest;
+    if (!role || role.id === guild.id || role.managed) return [];
+    return [{
+        id: role.id,
+        allow: [
+            PermissionsBitField.Flags.ViewChannel,
+            PermissionsBitField.Flags.SendMessages,
+            PermissionsBitField.Flags.AttachFiles
+        ]
+    }];
+}
+
+function isSellerOnline(guild, sellerId) {
+    const member = guild?.members?.cache?.get(sellerId);
+    return Boolean(member?.presence?.status && member.presence.status !== 'offline');
+}
+
+function getCurrentTicketSellerId(channel) {
+    const topic = channel?.topic || '';
+    const parts = topic.split(':');
+    if (parts[0] !== 'generalTicket' || parts[1] !== 'buy_items') return null;
+    return parts[3] || null;
+}
+
+async function findMainBuyItemsTicketMessage(channel) {
+    try {
+        const messages = await channel.messages.fetch({ limit: 50 });
+        return messages.find(m =>
+            m.author?.id === client.user?.id &&
+            m.embeds?.some(e => e.title === '🛒 MUA VẬT PHẨM KINGSMP / DONUTSMP')
+        ) || null;
+    } catch (err) {
+        console.error('❌ Không tìm được message ticket để cập nhật Seller:', err?.message || err);
+        return null;
+    }
+}
+
+async function changeTicketSeller(interaction, oldSellerId, newSellerId) {
+    const channel = interaction.channel;
+    const seller = getSellerInfo(newSellerId);
+    if (!channel || !interaction.guild || !seller) {
+        return safeReply(interaction, { content: '❌ Không thể đổi Seller.', flags: MessageFlags.Ephemeral });
+    }
+
+    const oldSeller = getSellerInfo(oldSellerId);
+    const currentTopicParts = (channel.topic || '').split(':');
+    const ticketType = currentTopicParts[1] === 'buy_items' ? 'buy_items' : null;
+    const customerId = currentTopicParts[2];
+    if (ticketType !== 'buy_items' || !customerId) {
+        return safeReply(interaction, { content: '❌ Đây không phải ticket mua vật phẩm hợp lệ.', flags: MessageFlags.Ephemeral });
+    }
+
+    if (!(await safeDeferUpdate(interaction))) return;
+
+    try {
+        if (oldSellerId && oldSellerId !== newSellerId) {
+            await channel.permissionOverwrites.delete(oldSellerId).catch(() => {});
+            const oldRole = getSellerRoleOverwrite(interaction.guild, oldSellerId);
+            for (const overwrite of oldRole) {
+                await channel.permissionOverwrites.delete(overwrite.id).catch(() => {});
+            }
+        }
+
+        await channel.permissionOverwrites.edit(newSellerId, {
+            ViewChannel: true,
+            SendMessages: true,
+            AttachFiles: true
+        });
+
+        const newRole = getSellerRoleOverwrite(interaction.guild, newSellerId);
+        for (const overwrite of newRole) {
+            await channel.permissionOverwrites.edit(overwrite.id, {
+                ViewChannel: true,
+                SendMessages: true,
+                AttachFiles: true
+            });
+        }
+
+        await channel.setTopic(`generalTicket:buy_items:${customerId}:${newSellerId}`);
+
+        const ticketMessage = await findMainBuyItemsTicketMessage(channel);
+        const currentEmbed = ticketMessage?.embeds?.[0] ? EmbedBuilder.from(ticketMessage.embeds[0]) : null;
+        if (ticketMessage && currentEmbed) {
+            const oldDescription = currentEmbed.data.description || '';
+            const nextDescription = oldDescription
+                .replace(/📌 \*\*Người phụ trách:\*\*.*(?:\n|$)/, `📌 **Người phụ trách:** <@${newSellerId}>\n`)
+                .replace(/📡 \*\*Trạng thái Seller:\*\*.*(?:\n|$)/, `📡 **Trạng thái Seller:** ${isSellerOnline(interaction.guild, newSellerId) ? 'ONLINE' : 'OFFLINE'}\n`);
+            const nextRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('ticket_change_seller')
+                    .setLabel('Chuyển Seller')
+                    .setEmoji('🔄')
+                    .setStyle(ButtonStyle.Primary),
+                new ButtonBuilder()
+                    .setCustomId('close_ticket')
+                    .setLabel('Đóng Ticket')
+                    .setEmoji('🔒')
+                    .setStyle(ButtonStyle.Danger)
+            );
+            await ticketMessage.edit({ embeds: [currentEmbed.setDescription(nextDescription)], components: [nextRow] }).catch(() => {});
+        }
+
+        await channel.send({
+            content: `<@${newSellerId}>`,
+            embeds: [new EmbedBuilder()
+                .setColor('#3498db')
+                .setTitle('🔄 ĐÃ CHUYỂN SELLER')
+                .setDescription(
+                    `👤 Khách: <@${customerId}>\n` +
+                    `📌 Seller mới: <@${newSellerId}>\n` +
+                    `📡 Trạng thái: **${isSellerOnline(interaction.guild, newSellerId) ? 'ONLINE' : 'OFFLINE'}**\n\n` +
+                    `✅ Seller offline vẫn nhận ticket bình thường. Khách có thể đổi Seller bất cứ lúc nào.`
+                )
+                .setTimestamp()],
+            allowedMentions: { users: [newSellerId] }
+        });
+
+        return safeEditReply(interaction, {
+            content: `✅ Đã chuyển từ ${oldSeller ? `<@${oldSeller.id}>` : '`Seller cũ`'} sang <@${newSellerId}>.\n📡 Trạng thái hiện tại: **${isSellerOnline(interaction.guild, newSellerId) ? 'ONLINE' : 'OFFLINE'}**`
+        });
+    } catch (err) {
+        return safeEditReply(interaction, { content: `❌ Không thể chuyển Seller: \`${err.message}\`` });
+    }
+}
+
+function buildSellerSelectMenu(guild, currentSellerId = null) {
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId(currentSellerId ? `ticket_seller_change:${currentSellerId}` : 'ticket_seller_select')
+        .setPlaceholder('🛒 Chọn Seller bạn yêu thích (theo ID)...')
+        .addOptions(ITEM_SELLERS.map(seller => {
+            const online = isSellerOnline(guild, seller.id);
+            const isCurrent = currentSellerId === seller.id;
+            return new StringSelectMenuOptionBuilder()
+                .setLabel(`${seller.id}${isCurrent ? ' • ĐANG CHỌN' : ''}`)
+                .setDescription(`${online ? '🟢 ONLINE' : '🔴 OFFLINE'} • ${isCurrent ? 'Seller hiện tại' : 'Chọn Seller này để giao dịch'}`)
+                .setEmoji(seller.emoji)
+                .setValue(seller.id);
+        }));
+    return new ActionRowBuilder().addComponents(menu);
 }
 
 function getMoneyOrders() {
@@ -833,6 +1048,139 @@ async function updateAutoBuyPanel() {
 }
 
 
+function buildThuMoneyPanel() {
+    const config = loadThuMoneyConfig();
+    const rate = getThuMoneyRate();
+    const start = config.workingHours?.start ?? 10;
+    const end = config.workingHours?.end ?? 22;
+    const open = isWithinThuMoneyWorkingHours();
+
+    const embed = new EmbedBuilder()
+        .setColor(open ? '#2ecc71' : '#e74c3c')
+        .setTitle('💰 THU MONEY KINGSMP')
+        .setDescription(
+            `📅 **Giá hôm nay (${getVietnamDateKey()})**\n` +
+            `💵 **${rate.toLocaleString('vi-VN')} VNĐ = 1M$**\n\n` +
+            `📊 **Trạng thái:** ${open ? '🟢 ĐANG NHẬN' : '🔴 ĐANG OFF'}\n` +
+            `⏰ **Giờ làm việc:** \`${start}h00 - ${end}h00\`\n\n` +
+            `Bấm nút bên dưới để tạo ticket thu Money.\n` +
+            `🔒 Ticket chỉ hiển thị với **khách + Admin**.`
+        )
+        .setFooter({ text: 'Giá theo ngày • /rate type:thu để đổi giá hôm nay' })
+        .setTimestamp();
+
+    return {
+        embeds: [embed],
+        components: [
+            new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId('thu_money_create')
+                    .setLabel('Thu Money')
+                    .setEmoji('💰')
+                    .setStyle(ButtonStyle.Success)
+                    .setDisabled(!open)
+            )
+        ]
+    };
+}
+
+async function updateThuMoneyPanel() {
+    const config = loadThuMoneyConfig();
+    if (!config.channelId) return;
+    try {
+        const channel = await client.channels.fetch(String(config.channelId));
+        if (!channel?.isTextBased()) return;
+        if (config.messageId) {
+            try {
+                const message = await channel.messages.fetch(String(config.messageId));
+                await message.edit(buildThuMoneyPanel());
+                return;
+            } catch (_) {}
+        }
+        const newMessage = await channel.send(buildThuMoneyPanel());
+        saveThuMoneyConfig({ ...config, channelId: channel.id, messageId: newMessage.id });
+    } catch (err) {
+        console.error('❌ Lỗi cập nhật bảng Thu Money:', err?.message || err);
+    }
+}
+
+async function handleThuMoneyCommand(interaction) {
+    if (!isAdminUser(interaction)) {
+        return safeReply(interaction, { content: '❌ Bạn không có quyền dùng lệnh này!', flags: MessageFlags.Ephemeral });
+    }
+    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+    try {
+        const config = loadThuMoneyConfig();
+        if (interaction.commandName === 'thumoney') {
+            saveThuMoneyConfig({ ...config, channelId: interaction.channelId });
+            await updateThuMoneyPanel();
+            return safeEditReply(interaction, { content: '✅ Đã tạo/cập nhật **Bảng Thu Money KingSMP cố định** trong kênh này.' });
+        }
+        if (interaction.commandName === 'thu-time') {
+            const start = interaction.options.getInteger('start');
+            const end = interaction.options.getInteger('end');
+            saveThuMoneyConfig({ ...config, workingHours: { start, end } });
+            await updateThuMoneyPanel();
+            return safeEditReply(interaction, { content: `✅ Giờ làm việc Thu Money: **${start}h00 - ${end}h00**` });
+        }
+    } catch (err) {
+        return safeEditReply(interaction, { content: `❌ Lỗi Thu Money: \`${err.message}\`` });
+    }
+}
+
+async function createThuMoneyTicket(interaction) {
+    if (!interaction.guild) return;
+    const config = loadThuMoneyConfig();
+    const rate = getThuMoneyRate();
+    const start = config.workingHours?.start ?? 10;
+    const end = config.workingHours?.end ?? 22;
+    if (!isWithinThuMoneyWorkingHours()) {
+        return safeReply(interaction, {
+            content: `🌙 **Thu Money hiện đang OFF**\n⏰ Giờ làm việc: **${start}h00 - ${end}h00**`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
+    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+    const safeUser = interaction.user.username.toLowerCase().replace(/[^a-z0-9-_]/g, '').slice(0, 55) || 'user';
+    try {
+        const channel = await interaction.guild.channels.create({
+            name: `${THU_MONEY_TICKET_PREFIX}${safeUser}`,
+            type: ChannelType.GuildText,
+            topic: `thuMoney:${interaction.user.id}:${getVietnamDateKey()}`,
+            permissionOverwrites: [
+                { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+                { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.AttachFiles] },
+                ...adminOverwrite(interaction.guild.id)
+            ]
+        });
+        const embed = new EmbedBuilder()
+            .setColor('#2ecc71')
+            .setTitle('💰 TICKET THU MONEY KINGSMP')
+            .setDescription(
+                `<@${interaction.user.id}> hãy gửi thông tin Money cần bán cho Admin.\n\n` +
+                `💵 **Giá hôm nay:** ${rate.toLocaleString('vi-VN')} VNĐ = 1M$\n` +
+                `📅 **Ngày:** ${getVietnamDateKey()}\n` +
+                `🔒 Kênh này chỉ có **khách + Admin** nhìn thấy.`
+            )
+            .setTimestamp();
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('close_ticket').setLabel('Đóng Ticket').setEmoji('🔒').setStyle(ButtonStyle.Danger)
+        );
+        const adminRoleId = getTicketAdminRoleId();
+        await channel.send({
+            content: `<@${interaction.user.id}> ${getTicketAdminMention()}`,
+            embeds: [embed], components: [row],
+            allowedMentions: { users: [interaction.user.id], roles: adminRoleId ? [adminRoleId] : [] }
+        });
+        const admin = await interaction.guild.members.fetch('1458470035763888250').catch(() => null);
+        const adminOnline = Boolean(admin?.presence?.status && admin.presence.status !== 'offline');
+        await channel.send({ content: adminOnline ? '✅ **Admin đang online** — giao dịch sẽ được hỗ trợ sớm.' : '🌙 **Admin hiện đang offline** — hãy để lại thông tin, Admin sẽ xử lý khi online.' });
+        return safeEditReply(interaction, { content: `✅ **Đã tạo Ticket Thu Money!**\n👉 ${channel}` });
+    } catch (err) {
+        return safeEditReply(interaction, { content: `❌ Không thể tạo Ticket Thu Money: \`${err.message}\`` });
+    }
+}
+
 // ============================================================
 // 10. MONEY COMMANDS
 // ============================================================
@@ -899,32 +1247,29 @@ async function handleMoneyCommand(interaction) {
     }
 
     if (interaction.commandName === 'rate') {
-        if (!(await safeDeferReply(interaction, {
-            flags: MessageFlags.Ephemeral
-        }))) return;
-
+        if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
         try {
             const newRate = interaction.options.getInteger('value');
-
+            const type = interaction.options.getString('type') || 'buy';
             if (!Number.isInteger(newRate) || newRate <= 0) {
+                return safeEditReply(interaction, { content: '❌ Rate không hợp lệ.' });
+            }
+            if (type === 'thu') {
+                const thuConfig = loadThuMoneyConfig();
+                const dailyRates = { ...(thuConfig.dailyRates || {}), [getVietnamDateKey()]: newRate };
+                saveThuMoneyConfig({ ...thuConfig, rate: newRate, dailyRates });
+                await updateThuMoneyPanel();
                 return safeEditReply(interaction, {
-                    content: '❌ Rate không hợp lệ. Ví dụ: `/rate value:130`'
+                    content: `✅ Đã đổi **giá Thu Money hôm nay** thành **${newRate.toLocaleString('vi-VN')}đ / 1M$**\n📅 Ngày: **${getVietnamDateKey()}**`
                 });
             }
-
             RATE = newRate;
             moneyConfig.rate = RATE;
             saveMoneyConfig(moneyConfig);
-
             await updateAutoBuyPanel();
-
-            return safeEditReply(interaction, {
-                content: `✅ Đã đổi Rate thành **${RATE}đ / 1M$**\n\n📌 Rate được lưu vào config.json nên restart bot vẫn giữ nguyên.`
-            });
+            return safeEditReply(interaction, { content: `✅ Đã đổi Rate Buy Money thành **${RATE}đ / 1M$**` });
         } catch (err) {
-            return safeEditReply(interaction, {
-                content: `❌ Không thể đổi Rate: \`${err.message}\``
-            });
+            return safeEditReply(interaction, { content: `❌ Không thể đổi Rate: \`${err.message}\`` });
         }
     }
 
@@ -3022,10 +3367,11 @@ async function handleTicketCommand(interaction) {
 }
 
 const MONEY_COMMAND_NAMES = [
-    'setup',
-    'setstock',
-    'rate',
-    'time'
+    'setup', 'setstock', 'rate', 'time'
+];
+
+const THU_MONEY_COMMAND_NAMES = [
+    'thumoney', 'thu-time'
 ];
 
 const ACC_COMMAND_NAMES = [
@@ -3065,13 +3411,37 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('rate')
-        .setDescription('Đổi tỷ giá Money (VNĐ / 1M$)')
+        .setDescription('Đổi tỷ giá Buy Money hoặc Thu Money')
         .addIntegerOption(opt =>
             opt
                 .setName('value')
                 .setDescription('Rate mới, ví dụ: 130')
                 .setMinValue(1)
                 .setRequired(true)
+        )
+        .addStringOption(opt =>
+            opt
+                .setName('type')
+                .setDescription('Chọn loại giá muốn đổi')
+                .addChoices(
+                    { name: 'Buy Money (mặc định)', value: 'buy' },
+                    { name: 'Thu Money hôm nay', value: 'thu' }
+                )
+                .setRequired(false)
+        ),
+
+    new SlashCommandBuilder()
+        .setName('thumoney')
+        .setDescription('Tạo bảng Thu Money KingSMP cố định'),
+
+    new SlashCommandBuilder()
+        .setName('thu-time')
+        .setDescription('Cài đặt giờ làm việc riêng cho Thu Money')
+        .addIntegerOption(opt =>
+            opt.setName('start').setDescription('Giờ bắt đầu (0-23)').setMinValue(0).setMaxValue(23).setRequired(true)
+        )
+        .addIntegerOption(opt =>
+            opt.setName('end').setDescription('Giờ kết thúc (0-23)').setMinValue(0).setMaxValue(23).setRequired(true)
         ),
 
     new SlashCommandBuilder()
@@ -3385,12 +3755,12 @@ client.on(Events.InteractionCreate, async interaction => {
                 return await handleTicketCommand(interaction);
             }
 
-            if (
-                MONEY_COMMAND_NAMES.includes(
-                    interaction.commandName
-                )
-            ) {
+            if (MONEY_COMMAND_NAMES.includes(interaction.commandName)) {
                 return await handleMoneyCommand(interaction);
+            }
+
+            if (THU_MONEY_COMMAND_NAMES.includes(interaction.commandName)) {
+                return await handleThuMoneyCommand(interaction);
             }
 
             if (
@@ -3411,12 +3781,24 @@ client.on(Events.InteractionCreate, async interaction => {
                 return await handleCloseTicket(interaction);
             }
 
+            if (id === 'ticket_change_seller') {
+                return safeReply(interaction, {
+                    content: '🔄 **Chọn Seller mới mà bạn yêu thích:**',
+                    components: [buildSellerSelectMenu(interaction.guild, getCurrentTicketSellerId(interaction.channel))],
+                    flags: MessageFlags.Ephemeral
+                });
+            }
+
             if (id === 'ticket_open_menu') {
                 return safeReply(interaction, {
                     content: '🎫 **Chọn loại Ticket bạn cần:**',
                     components: [buildTicketTypeMenu()],
                     flags: MessageFlags.Ephemeral
                 });
+            }
+
+            if (id === 'thu_money_create') {
+                return await createThuMoneyTicket(interaction);
             }
 
             if (
@@ -3449,7 +3831,28 @@ client.on(Events.InteractionCreate, async interaction => {
             const id = interaction.customId;
 
             if (id === 'ticket_type_select') {
-                return await createGeneralTicket(interaction, interaction.values[0]);
+                const type = interaction.values[0];
+                if (type === 'buy_items') {
+                    return safeReply(interaction, {
+                        content: '🛒 **Chọn Seller muốn giao dịch:**\n\nBot đã kiểm tra trạng thái Online/Offline hiện tại.',
+                        components: [buildSellerSelectMenu(interaction.guild)],
+                        flags: MessageFlags.Ephemeral
+                    });
+                }
+                return await createGeneralTicket(interaction, type);
+            }
+
+            if (id === 'ticket_seller_select') {
+                const sellerId = interaction.values[0];
+                const seller = getSellerInfo(sellerId);
+                if (!seller) return safeReply(interaction, { content: '❌ Seller không hợp lệ.', flags: MessageFlags.Ephemeral });
+                return await createGeneralTicket(interaction, 'buy_items', sellerId);
+            }
+
+            if (id.startsWith('ticket_seller_change:')) {
+                const oldSellerId = id.split(':')[1] || null;
+                const newSellerId = interaction.values[0];
+                return await changeTicketSeller(interaction, oldSellerId, newSellerId);
             }
 
             if (
@@ -3524,6 +3927,8 @@ client.once(Events.ClientReady, async c => {
     console.log(`🧩 [STARTUP] Panel config: channel=${moneyConfig?.channelId || 'none'} message=${moneyConfig?.messageId || 'none'}`);
     await registerSlashCommands();
     await updateAutoBuyPanel();
+    await updateThuMoneyPanel();
+    setInterval(() => updateThuMoneyPanel(), 60 * 1000);
 });
 
 // ============================================================
