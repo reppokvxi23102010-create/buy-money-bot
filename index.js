@@ -452,35 +452,48 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
         // Gán topic ngay lúc create => bỏ 1 request API setTopic riêng, tạo ticket nhanh hơn.
         const ticketTopic = `generalTicket:${type}:${interaction.user.id}${sellerId ? `:${sellerId}` : ''}`;
 
+        // Gộp permission overwrite theo ID để không gửi trùng Role/Member.
+        // Trùng overwrite (đặc biệt Seller Role) có thể khiến Discord từ chối
+        // request tạo ticket của Seller mới.
+        const rawOverwrites = [
+            {
+                id: interaction.guild.id,
+                deny: [PermissionsBitField.Flags.ViewChannel]
+            },
+            {
+                id: interaction.user.id,
+                allow: [
+                    PermissionsBitField.Flags.ViewChannel,
+                    PermissionsBitField.Flags.SendMessages,
+                    PermissionsBitField.Flags.AttachFiles
+                ]
+            },
+            ...(sellerId ? [{
+                id: sellerId,
+                allow: [
+                    PermissionsBitField.Flags.ViewChannel,
+                    PermissionsBitField.Flags.SendMessages,
+                    PermissionsBitField.Flags.AttachFiles
+                ]
+            }] : []),
+            ...(sellerId ? await getSellerRoleOverwrite(interaction.guild, sellerId) : []),
+            ...ticketRoleOverwrite(info.roleId),
+            ...adminOverwrite(interaction.guild.id)
+        ];
+
+        const seenOverwriteIds = new Set();
+        const permissionOverwrites = rawOverwrites.filter(overwrite => {
+            const id = String(overwrite?.id || '');
+            if (!id || seenOverwriteIds.has(id)) return false;
+            seenOverwriteIds.add(id);
+            return true;
+        });
+
         const ticketChannel = await interaction.guild.channels.create({
             name: `ticket-${baseName}`,
             type: ChannelType.GuildText,
             topic: ticketTopic,
-            permissionOverwrites: [
-                {
-                    id: interaction.guild.id,
-                    deny: [PermissionsBitField.Flags.ViewChannel]
-                },
-                {
-                    id: interaction.user.id,
-                    allow: [
-                        PermissionsBitField.Flags.ViewChannel,
-                        PermissionsBitField.Flags.SendMessages,
-                        PermissionsBitField.Flags.AttachFiles
-                    ]
-                },
-                ...(sellerId ? [{
-                    id: sellerId,
-                    allow: [
-                        PermissionsBitField.Flags.ViewChannel,
-                        PermissionsBitField.Flags.SendMessages,
-                        PermissionsBitField.Flags.AttachFiles
-                    ]
-                }] : []),
-                ...(sellerId ? await getSellerRoleOverwrite(interaction.guild, sellerId) : []),
-                ...ticketRoleOverwrite(info.roleId),
-                ...adminOverwrite(interaction.guild.id)
-            ]
+            permissionOverwrites
         });
 
         const seller = sellerId ? getSellerInfo(sellerId) : null;
@@ -676,10 +689,13 @@ function getActiveSellerRecords() {
     const sellers = sbDataForType('seller');
     return Object.values(sellers)
         .filter(record => record?.userId && record.status === 'ACTIVE' && record.channelId)
+        // Seller mới đăng ký phải nằm ở cuối danh sách.
+        // createdAt có ở record mới; fallback sang startDate/updatedAt để
+        // dữ liệu cũ vẫn được sắp xếp ổn định.
         .sort((a, b) => {
-            const aName = String(a.shopName || '').toLowerCase();
-            const bName = String(b.shopName || '').toLowerCase();
-            return aName.localeCompare(bName, 'vi');
+            const aTime = Number(a.createdAt) || Date.parse(a.startDate || '') || Number(a.updatedAt) || 0;
+            const bTime = Number(b.createdAt) || Date.parse(b.startDate || '') || Number(b.updatedAt) || 0;
+            return aTime - bTime;
         });
 }
 
@@ -710,7 +726,16 @@ async function getSellerDisplayName(guild, sellerId) {
 
 async function getSellerRoleId(guild, sellerId) {
     const member = await getSellerMember(guild, sellerId);
-    const role = member?.roles?.highest;
+    if (!member) return null;
+
+    // Ưu tiên đúng Seller Role ID của hệ thống.
+    const sellerRoleId = sbRoleId('seller');
+    if (sellerRoleId && member.roles?.cache?.has(sellerRoleId)) {
+        return sellerRoleId;
+    }
+
+    // Fallback cho dữ liệu Seller cũ chưa dùng Seller Role ID chung.
+    const role = member.roles?.highest;
     if (!role || role.id === guild?.id || role.managed) return null;
     return role.id;
 }
@@ -775,7 +800,7 @@ async function buildSellerSelectMenu(guild) {
             new StringSelectMenuOptionBuilder()
                 .setLabel(`${name}`.slice(0, 100))
                 .setDescription(online ? '🟢 ONLINE' : '🔴 OFFLINE')
-                .setEmoji(seller.emoji)
+                .setEmoji('👑')
                 .setValue(String(seller.id))
         );
     }
@@ -2334,6 +2359,40 @@ async function updateAccListingMessage(acc) {
     }
 }
 
+async function updateAccListingPending(acc) {
+    if (!acc?.channelId || !acc?.messageId) return false;
+
+    try {
+        const channel = await client.channels.fetch(String(acc.channelId));
+        if (!channel || !channel.isTextBased()) return false;
+
+        const message = await channel.messages.fetch(String(acc.messageId));
+
+        const pendingRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`pending_${acc.id}`)
+                .setLabel('Đang Có Người Mua')
+                .setEmoji('🟡')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(true)
+        );
+
+        await message.edit({
+            embeds: [createAccEmbed(acc)],
+            components: [pendingRow]
+        });
+
+        console.log(`✅ Listing ${acc.username} đã chuyển sang ĐANG CÓ NGƯỜI MUA.`);
+        return true;
+    } catch (err) {
+        console.error(
+            `❌ Không cập nhật được listing pending ${acc.username}:`,
+            err?.message || err
+        );
+        return false;
+    }
+}
+
 async function updateAccListingAvailable(acc) {
     if (!acc?.channelId || !acc?.messageId) return false;
 
@@ -2736,6 +2795,7 @@ async function createAccountPurchaseTicket(interaction, accId, paymentMethod) {
         target.pendingBuyerId = interaction.user.id;
         target.paymentMethod = paymentMethod;
         saveDetailedAccs(accs);
+        await updateAccListingPending(target);
 
         const adminRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -2846,6 +2906,7 @@ async function createAccountPurchaseTicket(interaction, accId, paymentMethod) {
         target.pendingBuyerId = null;
         target.paymentMethod = null;
         saveDetailedAccs(accs);
+        await updateAccListingAvailable(target);
 
         return safeEditReply(interaction, {
             content: `❌ Lỗi khi tạo Ticket: \`${err.message}\``,
@@ -4537,6 +4598,7 @@ async function sbCreateShop(interaction, type, shopName) {
         record.shopSlug = valid.slug;
         record.channelId = channel.id;
         record.categoryId = category.id;
+        record.createdAt = Number(record.createdAt) || Date.now();
         record.status = new Date(record.expireDate).getTime() > Date.now() ? 'ACTIVE' : 'EXPIRED';
         record.updatedAt = Date.now();
         data[interaction.user.id] = record;
@@ -4922,11 +4984,23 @@ async function sbAdminClose(interaction, type, userId) {
     if (!record) return safeReply(interaction, { content: `❌ Không tìm thấy hồ sơ ${type}.`, flags: MessageFlags.Ephemeral });
 
     const channelId = record.channelId;
+    const roleId = sbRoleId(type);
+
     record.status = 'CLOSED';
     record.closedAt = Date.now();
     record.channelId = null;
     data[userId] = record;
     sbSaveDataForType(type, data);
+
+    // Đóng shop sẽ gỡ luôn Role Seller/Builder tương ứng.
+    if (roleId && interaction.guild) {
+        const member = await sbFetchMember(interaction.guild, userId);
+        if (member) {
+            await member.roles.remove(roleId, `Đóng shop ${type} cho ${userId} bởi Admin`).catch(err =>
+                console.error(`❌ Không thể gỡ role ${type}:`, err?.message || err)
+            );
+        }
+    }
 
     // Đóng shop bằng /seller close hoặc /builder close sẽ XÓA luôn channel shop.
     if (channelId && interaction.guild) {
@@ -4939,7 +5013,7 @@ async function sbAdminClose(interaction, type, userId) {
     }
 
     return safeReply(interaction, {
-        content: `✅ Đã đóng shop ${type} của <@${userId}> và xóa channel shop.`,
+        content: `✅ Đã đóng shop ${type} của <@${userId}>, gỡ role và xóa channel shop.`,
         flags: MessageFlags.Ephemeral
     });
 }
