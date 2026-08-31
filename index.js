@@ -177,10 +177,6 @@ async function safeReply(interaction, data) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge trước đó.`);
             return null;
         }
-        if (err?.code === 10062) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi reply.`);
-            return null;
-        }
 
         console.error('Lỗi safeReply:', err.message);
         return null;
@@ -195,10 +191,6 @@ async function safeDeferReply(interaction, data = {}) {
     } catch (err) {
         if (err?.code === 40060) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
-            return false;
-        }
-        if (err?.code === 10062) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi deferReply.`);
             return false;
         }
 
@@ -217,10 +209,6 @@ async function safeDeferUpdate(interaction) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
             return false;
         }
-        if (err?.code === 10062) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi deferUpdate.`);
-            return false;
-        }
 
         console.error('Lỗi deferUpdate:', err.message);
         return false;
@@ -235,10 +223,6 @@ async function safeEditReply(interaction, data) {
 
         return await interaction.editReply(data);
     } catch (err) {
-        if (err?.code === 10062) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi editReply.`);
-            return null;
-        }
         console.error('Lỗi editReply:', err.message);
         return null;
     }
@@ -784,8 +768,7 @@ async function buildSellerSelectMenu(guild) {
     const activeRecords = getActiveSellerRecords();
     const dynamicIds = new Set(activeRecords.map(record => String(record.userId)));
 
-    // Seller cũ cấu hình sẵn hiển thị trước. Seller mới được tuyển hiển thị phía cuối;
-    // record mới nhất sẽ nằm cuối danh sách.
+    // Seller cũ cấu hình sẵn hiển thị trước. Seller mới được tuyển hiển thị phía cuối.
     for (const seller of ITEM_SELLERS) {
         if (dynamicIds.has(String(seller.id))) continue;
 
@@ -803,6 +786,7 @@ async function buildSellerSelectMenu(guild) {
         );
     }
 
+    // Seller mới tuyển: giữ thứ tự createdAt để người mới nhất nằm cuối.
     for (const record of activeRecords) {
         const sellerId = String(record.userId);
         const [displayName, online] = await Promise.all([
@@ -1042,7 +1026,6 @@ function buildAutoBuyEmbed() {
             }\n` +
             `⏰ **Giờ làm việc:** \`${startHour}h00 - ${endHour}h00\`\n` +
             `💸 **Tỷ giá:** \`${RATE} VNĐ = 1M$\`\n` +
-            `💵 **Giao dịch tối thiểu:** \`10.000 VNĐ\`\n` +
             `🎟️ **Thẻ cào:** Trừ ${CARD_DISCOUNT * 100}% mệnh giá\n` +
             `📦 **Kho:** \`${stockText}\`\n\n` +
             (
@@ -1661,10 +1644,6 @@ async function handleMoneyButton(interaction) {
                 console.log('⚠️ Modal bank đã được acknowledge.');
                 return;
             }
-            if (err?.code === 10062) {
-                console.warn(`⏱️ Modal bank: interaction ${interaction.id} đã hết hạn (>3s).`);
-                return;
-            }
             console.error('Lỗi show modal bank:', err.message);
         }
     }
@@ -1721,10 +1700,6 @@ async function handleMoneyButton(interaction) {
                 console.log('⚠️ Modal card đã được acknowledge.');
                 return;
             }
-            if (err?.code === 10062) {
-                console.warn(`⏱️ Modal card: interaction ${interaction.id} đã hết hạn (>3s).`);
-                return;
-            }
             console.error('Lỗi show modal card:', err.message);
         }
     }
@@ -1749,10 +1724,6 @@ async function handleMoneyButton(interaction) {
         } catch (err) {
             if (err?.code === 40060) {
                 console.log('⚠️ Modal calc đã được acknowledge.');
-                return;
-            }
-            if (err?.code === 10062) {
-                console.warn(`⏱️ Modal calc: interaction ${interaction.id} đã hết hạn (>3s).`);
                 return;
             }
             console.error('Lỗi show modal calc:', err.message);
@@ -3558,6 +3529,7 @@ const SB_ENV = {
     memberRoleId: String(process.env.MEMBER_ROLE_ID || '1507904869997219840').trim(),
     memberUserId: String(process.env.MEMBER_USER_ID || '').trim(),
     sellerMinDeposit: Math.max(0, Number.parseInt(process.env.SELLER_MIN_DEPOSIT || '100000', 10) || 100000),
+    builderMinDeposit: Math.max(0, Number.parseInt(process.env.BUILDER_MIN_DEPOSIT || '100000', 10) || 100000),
     sellerWeeklyPrice: Math.max(0, Number.parseInt(process.env.SELLER_WEEKLY_PRICE || '30000', 10) || 30000),
     sellerMonthlyPrice: Math.max(0, Number.parseInt(process.env.SELLER_MONTHLY_PRICE || '100000', 10) || 100000),
     builderWeeklyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_WEEKLY_PRICE || '30000', 10) || 30000),
@@ -3580,10 +3552,10 @@ function sbEnsureFiles() {
         ensureJsonFile(SB_CONFIG_FILE, {
             sellerWeeklyPrice: SB_ENV.sellerWeeklyPrice,
             sellerMonthlyPrice: SB_ENV.sellerMonthlyPrice,
-            builderWeeklyPrice: SB_ENV.builderWeeklyPrice,
-            builderMonthlyPrice: SB_ENV.builderMonthlyPrice,
             sellerMinDeposit: SB_ENV.sellerMinDeposit,
             builderMinDeposit: SB_ENV.builderMinDeposit,
+            builderWeeklyPrice: SB_ENV.builderWeeklyPrice,
+            builderMonthlyPrice: SB_ENV.builderMonthlyPrice,
             builderPricingVersion: 2,
             panel: {}
         });
@@ -3617,23 +3589,23 @@ function sbGetConfig() {
     return {
         sellerWeeklyPrice: Number.isFinite(Number(cfg.sellerWeeklyPrice)) ? Number(cfg.sellerWeeklyPrice) : SB_ENV.sellerWeeklyPrice,
         sellerMonthlyPrice: Number.isFinite(Number(cfg.sellerMonthlyPrice)) ? Number(cfg.sellerMonthlyPrice) : SB_ENV.sellerMonthlyPrice,
-        builderWeeklyPrice: Number.isFinite(Number(cfg.builderWeeklyPrice)) ? Number(cfg.builderWeeklyPrice) : SB_ENV.builderWeeklyPrice,
-        builderMonthlyPrice: Number.isFinite(Number(cfg.builderMonthlyPrice)) ? Number(cfg.builderMonthlyPrice) : SB_ENV.builderMonthlyPrice,
         sellerMinDeposit: Number.isFinite(Number(cfg.sellerMinDeposit)) ? Math.max(0, Number(cfg.sellerMinDeposit)) : SB_ENV.sellerMinDeposit,
         builderMinDeposit: Number.isFinite(Number(cfg.builderMinDeposit)) ? Math.max(0, Number(cfg.builderMinDeposit)) : SB_ENV.builderMinDeposit,
+        builderWeeklyPrice: Number.isFinite(Number(cfg.builderWeeklyPrice)) ? Number(cfg.builderWeeklyPrice) : SB_ENV.builderWeeklyPrice,
+        builderMonthlyPrice: Number.isFinite(Number(cfg.builderMonthlyPrice)) ? Number(cfg.builderMonthlyPrice) : SB_ENV.builderMonthlyPrice,
         panel: cfg.panel || {}
     };
-}
-
-function sbGetMinDeposit(type) {
-    const cfg = sbGetConfig();
-    return type === 'seller' ? cfg.sellerMinDeposit : cfg.builderMinDeposit;
 }
 
 function sbSetConfig(patch) {
     const cfg = sbGetConfig();
     const next = { ...cfg, ...patch };
     return sbWrite(SB_CONFIG_FILE, next);
+}
+
+function sbGetMinDeposit(type) {
+    const cfg = sbGetConfig();
+    return type === 'seller' ? cfg.sellerMinDeposit : cfg.builderMinDeposit;
 }
 
 function sbFormatVnd(amount) {
@@ -3748,7 +3720,7 @@ function sbApplicationPanel() {
             '        👑 **TUYỂN SELLER**\n' +
             '╚════════════════════════════╝\n\n' +
             'Bạn muốn mở shop và kinh doanh trong server?\n\n' +
-            `💰 **Cọc:** từ ${sbFormatVnd(sbGetMinDeposit('seller'))}\n` +
+            `💰 **Cọc:** từ ${sbFormatVnd(SB_ENV.sellerMinDeposit)}\n` +
             `📅 **7 ngày:** ${sbFormatVnd(cfg.sellerWeeklyPrice)}\n` +
             `📅 **30 ngày:** ${sbFormatVnd(cfg.sellerMonthlyPrice)}\n\n` +
             '✅ Có shop riêng\n' +
@@ -4284,7 +4256,7 @@ async function sbHandleBeginSetup(interaction, type) {
     if (!app) return safeReply(interaction, { content: `❌ Chưa có application ${type} đang được tiếp nhận.`, flags: MessageFlags.Ephemeral });
     return safeReply(interaction, {
         content: type === 'seller'
-            ? `👑 **Chọn gói Seller**\nCọc tối thiểu: **${sbFormatVnd(sbGetMinDeposit('seller'))}**` 
+            ? `👑 **Chọn gói Seller**\nCọc tối thiểu: **${sbFormatVnd(SB_ENV.sellerMinDeposit)}**` 
             : '🛠️ **Chọn gói Builder**',
         components: [await sbBuildPlanMenu(type)],
         flags: MessageFlags.Ephemeral
@@ -5670,18 +5642,13 @@ async function registerSlashCommands() {
 // 20. MESSAGE CREATE
 // ============================================================
 
-client.on(Events.MessageCreate, message => {
+client.on(Events.MessageCreate, async message => {
     if (message.author.bot) return;
 
-    // Không chặn event loop bằng Seller/Builder + sync JSON trước khi
-    // InteractionCreate có cơ hội xử lý button/modal. Khi server đông,
-    // việc await handler này có thể làm Interaction bị quá hạn 3 giây.
-    setImmediate(() => {
-        void (async () => {
-            try {
-                await sbHandleShopMessage(message);
-                const contentLower =
-                    message.content.toLowerCase();
+    try {
+        await sbHandleShopMessage(message);
+        const contentLower =
+            message.content.toLowerCase();
 
         if (
             contentLower.includes('sell') ||
@@ -5764,14 +5731,12 @@ client.on(Events.MessageCreate, message => {
                 components: [row]
             });
         }
-            } catch (err) {
-                console.error(
-                    'Lỗi MessageCreate:',
-                    err.message
-                );
-            }
-        })();
-    });
+    } catch (err) {
+        console.error(
+            'Lỗi MessageCreate:',
+            err.message
+        );
+    }
 });
 
 // ============================================================
