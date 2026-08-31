@@ -177,6 +177,10 @@ async function safeReply(interaction, data) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge trước đó.`);
             return null;
         }
+        if (err?.code === 10062) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi reply.`);
+            return null;
+        }
 
         console.error('Lỗi safeReply:', err.message);
         return null;
@@ -191,6 +195,10 @@ async function safeDeferReply(interaction, data = {}) {
     } catch (err) {
         if (err?.code === 40060) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
+            return false;
+        }
+        if (err?.code === 10062) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi deferReply.`);
             return false;
         }
 
@@ -209,6 +217,10 @@ async function safeDeferUpdate(interaction) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
             return false;
         }
+        if (err?.code === 10062) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi deferUpdate.`);
+            return false;
+        }
 
         console.error('Lỗi deferUpdate:', err.message);
         return false;
@@ -223,6 +235,10 @@ async function safeEditReply(interaction, data) {
 
         return await interaction.editReply(data);
     } catch (err) {
+        if (err?.code === 10062) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi editReply.`);
+            return null;
+        }
         console.error('Lỗi editReply:', err.message);
         return null;
     }
@@ -768,26 +784,8 @@ async function buildSellerSelectMenu(guild) {
     const activeRecords = getActiveSellerRecords();
     const dynamicIds = new Set(activeRecords.map(record => String(record.userId)));
 
-    for (const record of activeRecords) {
-        const sellerId = String(record.userId);
-        const [displayName, online] = await Promise.all([
-            getSellerDisplayName(guild, sellerId),
-            isSellerOnline(guild, sellerId)
-        ]);
-
-        const label = (record.shopName || displayName || `Seller ${sellerId.slice(-4)}`).slice(0, 100);
-        const description = `${online ? '🟢 ONLINE' : '🔴 OFFLINE'} • Seller đã xác thực`.slice(0, 100);
-
-        menu.addOptions(
-            new StringSelectMenuOptionBuilder()
-                .setLabel(label)
-                .setDescription(description)
-                .setEmoji('👑')
-                .setValue(sellerId)
-        );
-    }
-
-    // Giữ tương thích với các Seller cũ chưa có dữ liệu sellers.json.
+    // Seller cũ cấu hình sẵn hiển thị trước. Seller mới được tuyển hiển thị phía cuối;
+    // record mới nhất sẽ nằm cuối danh sách.
     for (const seller of ITEM_SELLERS) {
         if (dynamicIds.has(String(seller.id))) continue;
 
@@ -802,6 +800,25 @@ async function buildSellerSelectMenu(guild) {
                 .setDescription(online ? '🟢 ONLINE' : '🔴 OFFLINE')
                 .setEmoji('👑')
                 .setValue(String(seller.id))
+        );
+    }
+
+    for (const record of activeRecords) {
+        const sellerId = String(record.userId);
+        const [displayName, online] = await Promise.all([
+            getSellerDisplayName(guild, sellerId),
+            isSellerOnline(guild, sellerId)
+        ]);
+
+        const label = (record.shopName || displayName || `Seller ${sellerId.slice(-4)}`).slice(0, 100);
+        const description = online ? '🟢 ONLINE' : '🔴 OFFLINE';
+
+        menu.addOptions(
+            new StringSelectMenuOptionBuilder()
+                .setLabel(label)
+                .setDescription(description)
+                .setEmoji('👑')
+                .setValue(sellerId)
         );
     }
 
@@ -1025,6 +1042,7 @@ function buildAutoBuyEmbed() {
             }\n` +
             `⏰ **Giờ làm việc:** \`${startHour}h00 - ${endHour}h00\`\n` +
             `💸 **Tỷ giá:** \`${RATE} VNĐ = 1M$\`\n` +
+            `💵 **Giao dịch tối thiểu:** \`10.000 VNĐ\`\n` +
             `🎟️ **Thẻ cào:** Trừ ${CARD_DISCOUNT * 100}% mệnh giá\n` +
             `📦 **Kho:** \`${stockText}\`\n\n` +
             (
@@ -1643,6 +1661,10 @@ async function handleMoneyButton(interaction) {
                 console.log('⚠️ Modal bank đã được acknowledge.');
                 return;
             }
+            if (err?.code === 10062) {
+                console.warn(`⏱️ Modal bank: interaction ${interaction.id} đã hết hạn (>3s).`);
+                return;
+            }
             console.error('Lỗi show modal bank:', err.message);
         }
     }
@@ -1699,6 +1721,10 @@ async function handleMoneyButton(interaction) {
                 console.log('⚠️ Modal card đã được acknowledge.');
                 return;
             }
+            if (err?.code === 10062) {
+                console.warn(`⏱️ Modal card: interaction ${interaction.id} đã hết hạn (>3s).`);
+                return;
+            }
             console.error('Lỗi show modal card:', err.message);
         }
     }
@@ -1723,6 +1749,10 @@ async function handleMoneyButton(interaction) {
         } catch (err) {
             if (err?.code === 40060) {
                 console.log('⚠️ Modal calc đã được acknowledge.');
+                return;
+            }
+            if (err?.code === 10062) {
+                console.warn(`⏱️ Modal calc: interaction ${interaction.id} đã hết hạn (>3s).`);
                 return;
             }
             console.error('Lỗi show modal calc:', err.message);
@@ -1763,9 +1793,9 @@ async function handleMoneyModal(interaction) {
                 ? Math.floor(vndAmount / RATE)
                 : 0;
 
-        if (vndAmount < 1000) {
+        if (vndAmount < 10000) {
             return safeReply(interaction, {
-                content: '❌ Số tiền không hợp lệ! Tối thiểu 1.000 VNĐ.',
+                content: '❌ Số tiền không hợp lệ! Tối thiểu 10.000 VNĐ.',
                 flags: MessageFlags.Ephemeral
             });
         }
@@ -1999,9 +2029,9 @@ async function handleMoneyModal(interaction) {
 
         const cardValueVnd = Math.floor(parseCardValue(val));
 
-        if (cardValueVnd < 1000) {
+        if (cardValueVnd < 10000) {
             return safeReply(interaction, {
-                content: '❌ Mệnh giá thẻ không hợp lệ.',
+                content: '❌ Mệnh giá thẻ không hợp lệ! Tối thiểu 10.000 VNĐ.',
                 flags: MessageFlags.Ephemeral
             });
         }
@@ -3552,6 +3582,8 @@ function sbEnsureFiles() {
             sellerMonthlyPrice: SB_ENV.sellerMonthlyPrice,
             builderWeeklyPrice: SB_ENV.builderWeeklyPrice,
             builderMonthlyPrice: SB_ENV.builderMonthlyPrice,
+            sellerMinDeposit: SB_ENV.sellerMinDeposit,
+            builderMinDeposit: SB_ENV.builderMinDeposit,
             builderPricingVersion: 2,
             panel: {}
         });
@@ -3587,8 +3619,15 @@ function sbGetConfig() {
         sellerMonthlyPrice: Number.isFinite(Number(cfg.sellerMonthlyPrice)) ? Number(cfg.sellerMonthlyPrice) : SB_ENV.sellerMonthlyPrice,
         builderWeeklyPrice: Number.isFinite(Number(cfg.builderWeeklyPrice)) ? Number(cfg.builderWeeklyPrice) : SB_ENV.builderWeeklyPrice,
         builderMonthlyPrice: Number.isFinite(Number(cfg.builderMonthlyPrice)) ? Number(cfg.builderMonthlyPrice) : SB_ENV.builderMonthlyPrice,
+        sellerMinDeposit: Number.isFinite(Number(cfg.sellerMinDeposit)) ? Math.max(0, Number(cfg.sellerMinDeposit)) : SB_ENV.sellerMinDeposit,
+        builderMinDeposit: Number.isFinite(Number(cfg.builderMinDeposit)) ? Math.max(0, Number(cfg.builderMinDeposit)) : SB_ENV.builderMinDeposit,
         panel: cfg.panel || {}
     };
+}
+
+function sbGetMinDeposit(type) {
+    const cfg = sbGetConfig();
+    return type === 'seller' ? cfg.sellerMinDeposit : cfg.builderMinDeposit;
 }
 
 function sbSetConfig(patch) {
@@ -3709,7 +3748,7 @@ function sbApplicationPanel() {
             '        👑 **TUYỂN SELLER**\n' +
             '╚════════════════════════════╝\n\n' +
             'Bạn muốn mở shop và kinh doanh trong server?\n\n' +
-            `💰 **Cọc:** từ ${sbFormatVnd(SB_ENV.sellerMinDeposit)}\n` +
+            `💰 **Cọc:** từ ${sbFormatVnd(sbGetMinDeposit('seller'))}\n` +
             `📅 **7 ngày:** ${sbFormatVnd(cfg.sellerWeeklyPrice)}\n` +
             `📅 **30 ngày:** ${sbFormatVnd(cfg.sellerMonthlyPrice)}\n\n` +
             '✅ Có shop riêng\n' +
@@ -3858,7 +3897,7 @@ async function sbSendApplication(type, interaction) {
         fields.push(
             { name: '📅 Gói tuần', value: sbFormatVnd(type === 'seller' ? cfg.sellerWeeklyPrice : cfg.builderWeeklyPrice), inline: true },
             { name: '📅 Gói tháng', value: sbFormatVnd(type === 'seller' ? cfg.sellerMonthlyPrice : cfg.builderMonthlyPrice), inline: true },
-            { name: '🛡️ Cọc tối thiểu', value: sbFormatVnd(type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit), inline: true }
+            { name: '🛡️ Cọc tối thiểu', value: sbFormatVnd(sbGetMinDeposit(type)), inline: true }
         );
 
         const embed = new EmbedBuilder()
@@ -4027,7 +4066,7 @@ async function sbBuildPlanMenu(type) {
 }
 
 function sbSetupPaymentModal(type, plan) {
-    const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit;
+    const minDeposit = sbGetMinDeposit(type);
     const modal = new ModalBuilder()
         .setCustomId(`sb_payment_modal_${type}_${plan}`)
         .setTitle(type === 'seller' ? `👑 Thanh toán Seller • ${sbPlanLabel(plan)}` : `🛠️ Thanh toán Builder • ${sbPlanLabel(plan)}`);
@@ -4245,7 +4284,7 @@ async function sbHandleBeginSetup(interaction, type) {
     if (!app) return safeReply(interaction, { content: `❌ Chưa có application ${type} đang được tiếp nhận.`, flags: MessageFlags.Ephemeral });
     return safeReply(interaction, {
         content: type === 'seller'
-            ? `👑 **Chọn gói Seller**\nCọc tối thiểu: **${sbFormatVnd(SB_ENV.sellerMinDeposit)}**` 
+            ? `👑 **Chọn gói Seller**\nCọc tối thiểu: **${sbFormatVnd(sbGetMinDeposit('seller'))}**` 
             : '🛠️ **Chọn gói Builder**',
         components: [await sbBuildPlanMenu(type)],
         flags: MessageFlags.Ephemeral
@@ -4946,7 +4985,7 @@ async function sbAdminAdd(interaction, type, userId, plan, deposit, shopName) {
         shopSlug: '',
         channelId: null,
         categoryId: sbCategoryId(type),
-        deposit: type === 'seller' ? Math.max(SB_ENV.sellerMinDeposit, Number(deposit) || 0) : Math.max(SB_ENV.builderMinDeposit, Number(deposit) || 0),
+        deposit: Math.max(sbGetMinDeposit(type), Number(deposit) || 0),
         plan: plan || 'monthly',
         startDate: now.toISOString(),
         expireDate: new Date(now.getTime() + sbPlanDays(plan || 'monthly') * 86400000).toISOString(),
@@ -5045,6 +5084,34 @@ async function sbAdminSetPlan(interaction, type, plan, price) {
     const key = type === 'seller' ? (plan === 'weekly' ? 'sellerWeeklyPrice' : 'sellerMonthlyPrice') : (plan === 'weekly' ? 'builderWeeklyPrice' : 'builderMonthlyPrice');
     sbSetConfig({ [key]: Math.max(0, Number(price) || 0) });
     return safeReply(interaction, { content: `✅ Giá ${type} ${sbPlanLabel(plan)} đã đổi thành **${sbFormatVnd(price)}**.`, flags: MessageFlags.Ephemeral });
+}
+
+async function sbSetDepositCommand(interaction) {
+    if (!isAdminUser(interaction)) {
+        return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
+    }
+
+    const type = interaction.options.getString('type');
+    const amount = interaction.options.getInteger('amount');
+    const key = type === 'seller' ? 'sellerMinDeposit' : 'builderMinDeposit';
+    const oldAmount = sbGetMinDeposit(type);
+    const newAmount = Math.max(0, Number(amount) || 0);
+
+    sbSetConfig({ [key]: newAmount });
+
+    const cfg = sbGetConfig();
+    if (cfg.panel?.channelId && cfg.panel?.messageId) {
+        const channel = await client.channels.fetch(String(cfg.panel.channelId)).catch(() => null);
+        if (channel?.isTextBased()) {
+            const msg = await channel.messages.fetch(String(cfg.panel.messageId)).catch(() => null);
+            if (msg) await msg.edit(sbApplicationPanel()).catch(() => {});
+        }
+    }
+
+    return safeReply(interaction, {
+        content: `✅ Đã đổi **cọc tối thiểu ${type === 'seller' ? 'Seller' : 'Builder'}** từ **${sbFormatVnd(oldAmount)}** → **${sbFormatVnd(newAmount)}**.`,
+        flags: MessageFlags.Ephemeral
+    });
 }
 
 async function sbHandleCommand(interaction) {
@@ -5206,7 +5273,7 @@ async function sbHandleModal(interaction) {
         const type = parts[3];
         const plan = parts[4];
         const deposit = sbParseVnd(interaction.fields.getTextInputValue('deposit'));
-        const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit;
+        const minDeposit = sbGetMinDeposit(type);
         if (deposit < minDeposit) return safeReply(interaction, { content: `❌ Cọc tối thiểu là **${sbFormatVnd(minDeposit)}**.`, flags: MessageFlags.Ephemeral });
         if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
         return sbCreatePaymentTicket(interaction, type, plan, deposit);
@@ -5277,6 +5344,7 @@ const MONEY_COMMAND_NAMES = [
 ];
 
 const SELLER_BUILDER_COMMAND_NAMES = ['seller', 'builder'];
+const DEPOSIT_COMMAND_NAMES = ['coc'];
 
 const THU_MONEY_COMMAND_NAMES = [
     'thumoney', 'thu-time'
@@ -5376,6 +5444,25 @@ const commands = [
     new SlashCommandBuilder()
         .setName('tuyendung')
         .setDescription('Tạo panel tuyển dụng Seller / Builder cố định'),
+
+    new SlashCommandBuilder()
+        .setName('coc')
+        .setDescription('Đổi mức cọc tối thiểu khi tuyển dụng')
+        .addStringOption(o => o
+            .setName('type')
+            .setDescription('Loại tuyển dụng')
+            .addChoices(
+                { name: 'Seller', value: 'seller' },
+                { name: 'Builder', value: 'builder' }
+            )
+            .setRequired(true)
+        )
+        .addIntegerOption(o => o
+            .setName('amount')
+            .setDescription('Mức cọc tối thiểu (VNĐ)')
+            .setMinValue(0)
+            .setRequired(true)
+        ),
 
     new SlashCommandBuilder()
         .setName('seller')
@@ -5583,13 +5670,18 @@ async function registerSlashCommands() {
 // 20. MESSAGE CREATE
 // ============================================================
 
-client.on(Events.MessageCreate, async message => {
+client.on(Events.MessageCreate, message => {
     if (message.author.bot) return;
 
-    try {
-        await sbHandleShopMessage(message);
-        const contentLower =
-            message.content.toLowerCase();
+    // Không chặn event loop bằng Seller/Builder + sync JSON trước khi
+    // InteractionCreate có cơ hội xử lý button/modal. Khi server đông,
+    // việc await handler này có thể làm Interaction bị quá hạn 3 giây.
+    setImmediate(() => {
+        void (async () => {
+            try {
+                await sbHandleShopMessage(message);
+                const contentLower =
+                    message.content.toLowerCase();
 
         if (
             contentLower.includes('sell') ||
@@ -5672,12 +5764,14 @@ client.on(Events.MessageCreate, async message => {
                 components: [row]
             });
         }
-    } catch (err) {
-        console.error(
-            'Lỗi MessageCreate:',
-            err.message
-        );
-    }
+            } catch (err) {
+                console.error(
+                    'Lỗi MessageCreate:',
+                    err.message
+                );
+            }
+        })();
+    });
 });
 
 // ============================================================
@@ -5696,6 +5790,10 @@ client.on(Events.InteractionCreate, async interaction => {
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === 'tuyendung') {
                 return await sbSetupSlashCommand(interaction);
+            }
+
+            if (DEPOSIT_COMMAND_NAMES.includes(interaction.commandName)) {
+                return await sbSetDepositCommand(interaction);
             }
 
             if (SELLER_BUILDER_COMMAND_NAMES.includes(interaction.commandName)) {
