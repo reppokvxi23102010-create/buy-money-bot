@@ -6082,6 +6082,22 @@ console.log(`🧾 [BOOT] PID=${process.pid} HOST=${process.env.HOSTNAME || 'unkn
 console.log(`🔐 [BOOT] Token present=${Boolean(botToken)} length=${botToken ? botToken.length : 0}`);
 console.log(`🆔 [BOOT] CLIENT_ID present=${Boolean(process.env.CLIENT_ID || process.env.APPLICATION_ID)} GUILD_ID present=${Boolean(process.env.GUILD_ID)}`);
 
+function getWsStatusName(status) {
+    const names = {
+        0: 'READY',
+        1: 'CONNECTING',
+        2: 'AUTHENTICATING',
+        3: 'CONNECTED',
+        4: 'DISCONNECTING',
+        5: 'DISCONNECTED',
+        6: 'WAITING_FOR_AUTHENTICATION',
+        7: 'IDENTIFYING',
+        8: 'RESUMING',
+        9: 'IDLE'
+    };
+    return names[status] || (status === undefined || status === null ? 'UNKNOWN' : String(status));
+}
+
 client.on('debug', info => {
     if (/identify|session|gateway|resume|heartbeat|disallowed|close|disconnect|ws|hello/i.test(info)) {
         console.log(`🛰️ [DISCORD DEBUG] ${info}`);
