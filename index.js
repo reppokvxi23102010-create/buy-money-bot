@@ -66,15 +66,24 @@ http.createServer((req, res) => {
 // 2. CLIENT
 // ============================================================
 
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildPresences
-    ]
-});
+const wantsMessageContent = String(process.env.ENABLE_MESSAGE_CONTENT || 'false').toLowerCase() === 'true';
+const wantsGuildMembers = String(process.env.ENABLE_GUILD_MEMBERS || 'false').toLowerCase() === 'true';
+const wantsGuildPresences = String(process.env.ENABLE_GUILD_PRESENCES || 'false').toLowerCase() === 'true';
+
+const discordIntents = [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages
+];
+if (wantsMessageContent) discordIntents.push(GatewayIntentBits.MessageContent);
+if (wantsGuildMembers) discordIntents.push(GatewayIntentBits.GuildMembers);
+if (wantsGuildPresences) discordIntents.push(GatewayIntentBits.GuildPresences);
+
+console.log('🔌 [INTENTS] Guilds=true GuildMessages=true' +
+    ` MessageContent=${wantsMessageContent}` +
+    ` GuildMembers=${wantsGuildMembers}` +
+    ` GuildPresences=${wantsGuildPresences}`);
+
+const client = new Client({ intents: discordIntents });
 
 // ============================================================
 // 3. CONFIG
@@ -6072,16 +6081,37 @@ const botToken =
 
 console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
 console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
+console.log(`🧾 [BOOT] PID=${process.pid} HOST=${process.env.HOSTNAME || 'unknown'}`);
+console.log(`🔐 [BOOT] Token present=${Boolean(botToken)} length=${botToken ? botToken.length : 0}`);
+console.log(`🆔 [BOOT] CLIENT_ID present=${Boolean(process.env.CLIENT_ID || process.env.APPLICATION_ID)} GUILD_ID present=${Boolean(process.env.GUILD_ID)}`);
+
+client.on('debug', info => {
+    if (/identify|session|gateway|resume|heartbeat|disallowed|close|disconnect/i.test(info)) {
+        console.log(`🛰️ [DISCORD DEBUG] ${info}`);
+    }
+});
+client.on('error', err => console.error('❌ [DISCORD CLIENT ERROR]', err));
+client.on('shardError', (error, shardId) => console.error(`❌ [DISCORD SHARD ERROR] shard=${shardId}`, error));
+client.on('shardDisconnect', (event, shardId) => console.error(`🔌 [DISCORD SHARD DISCONNECT] shard=${shardId} code=${event?.code ?? 'unknown'} reason=${event?.reason || 'unknown'}`));
+client.on('shardReconnecting', shardId => console.warn(`🔄 [DISCORD RECONNECTING] shard=${shardId}`));
+client.on('shardReady', (shardId, unavailableGuilds) => console.log(`✅ [DISCORD SHARD READY] shard=${shardId} unavailableGuilds=${unavailableGuilds?.size ?? 0}`));
 
 if (!botToken) {
-    console.error(
-        '❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong .env!'
-    );
+    console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong Environment Variables!');
 } else {
-    client.login(botToken).catch(err => {
-        console.error(
-            '❌ Login Discord thất bại:',
-            err.message
-        );
-    });
+    console.log('🚀 [LOGIN] Đang kết nối Discord Gateway...');
+    const loginStartedAt = Date.now();
+    client.login(botToken)
+        .then(tokenUser => console.log(`✅ [LOGIN] Promise resolved sau ${Date.now() - loginStartedAt}ms (${tokenUser})`))
+        .catch(err => {
+            console.error('❌ [LOGIN] Discord login thất bại:', err);
+            if (err?.code === 4014 || /disallowed intent/i.test(err?.message || '')) {
+                console.error('🚨 [LOGIN] Privileged Intent bị Discord từ chối. Kiểm tra Developer Portal → Bot → Privileged Gateway Intents.');
+            }
+        });
+    setTimeout(() => {
+        if (!client.isReady()) {
+            console.error('⏱️ [LOGIN TIMEOUT] Sau 20 giây bot vẫn chưa ClientReady.');
+        }
+    }, 20_000).unref();
 }
