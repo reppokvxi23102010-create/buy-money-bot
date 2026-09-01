@@ -29,8 +29,6 @@ const {
 const PORT = process.env.PORT || 10000;
 
 process.env.ADMIN_ROLE_ID = (process.env.ADMIN_ROLE_ID || '1516082552530800875').trim();
-process.env.SELLER_ROLE_ID = (process.env.SELLER_ROLE_ID || '1531205202265247794').trim();
-process.env.BUILDER_ROLE_ID = (process.env.BUILDER_ROLE_ID || '1531202502681301094').trim();
 
 const ADMIN_DISCORD_ID = String(process.env.ADMIN_DISCORD_ID || '').trim();
 
@@ -45,15 +43,6 @@ const ACC_STOCK_FILE = path.join(__dirname, 'accounts.json');
 const ACC_DETAIL_FILE = path.join(__dirname, 'accounts_detail.json');
 
 const TICKET_CONFIG_KEY = 'ticketPanel';
-
-// Seller IDs used by the ticket menu.
-// These are kept as simple fixed Seller accounts so the recruitment/shop system is gone.
-const ITEM_SELLERS = [
-    { id: '1513494095559921775', label: 'T1', emoji: '1️⃣' },
-    { id: '1542430933724962817', label: 'T2', emoji: '2️⃣' },
-    { id: '1198608624080142517', label: 'T3', emoji: '3️⃣' },
-    { id: '908316104391266325', label: 'T4', emoji: '4️⃣' }
-];
 
 // ============================================================
 // 2. WEB SERVER (KEEP RENDER ALIVE)
@@ -145,6 +134,10 @@ async function safeReply(interaction, data) {
         return await interaction.reply(data);
     } catch (err) {
         if (err?.code === 40060) return null;
+        if (err?.code === 10062) {
+            console.warn('⚠️ Interaction đã hết hạn trước khi reply (Unknown interaction).');
+            return null;
+        }
         console.error('safeReply:', err.message);
         return null;
     }
@@ -157,6 +150,10 @@ async function safeDeferReply(interaction, data = {}) {
         return true;
     } catch (err) {
         if (err?.code === 40060) return false;
+        if (err?.code === 10062) {
+            console.warn('⚠️ Interaction đã hết hạn trước khi deferReply (Unknown interaction).');
+            return false;
+        }
         console.error('safeDeferReply:', err.message);
         return false;
     }
@@ -169,6 +166,10 @@ async function safeDeferUpdate(interaction) {
         return true;
     } catch (err) {
         if (err?.code === 40060) return false;
+        if (err?.code === 10062) {
+            console.warn('⚠️ Interaction đã hết hạn trước khi deferUpdate (Unknown interaction).');
+            return false;
+        }
         console.error('safeDeferUpdate:', err.message);
         return false;
     }
@@ -247,51 +248,6 @@ function getTicketAdminMention() {
     return roleId ? `<@&${roleId}>` : 'Admin';
 }
 
-function getSellerInfo(sellerId) {
-    return ITEM_SELLERS.find(s => s.id === String(sellerId)) || null;
-}
-
-async function isSellerOnline(guild, sellerId) {
-    try {
-        const member = await guild.members.fetch(String(sellerId));
-        return Boolean(member?.presence?.status && member.presence.status !== 'offline');
-    } catch {
-        return false;
-    }
-}
-
-async function getSellerDisplayName(guild, sellerId) {
-    try {
-        const member = await guild.members.fetch(String(sellerId));
-        return member?.displayName || member?.user?.globalName || member?.user?.username || `Seller ${sellerId.slice(-4)}`;
-    } catch {
-        return `Seller ${String(sellerId).slice(-4)}`;
-    }
-}
-
-async function buildSellerSelectMenu(guild) {
-    const menu = new StringSelectMenuBuilder()
-        .setCustomId('ticket_seller_select')
-        .setPlaceholder('🛒 Chọn Seller bạn yêu thích...');
-
-    for (const seller of ITEM_SELLERS) {
-        const [name, online] = await Promise.all([
-            getSellerDisplayName(guild, seller.id),
-            isSellerOnline(guild, seller.id)
-        ]);
-
-        menu.addOptions(
-            new StringSelectMenuOptionBuilder()
-                .setLabel(String(name).slice(0, 100))
-                .setDescription((online ? '🟢 ONLINE' : '🔴 OFFLINE').slice(0, 100))
-                .setEmoji(seller.emoji)
-                .setValue(String(seller.id))
-        );
-    }
-
-    return new ActionRowBuilder().addComponents(menu);
-}
-
 // ============================================================
 // 7. GENERAL TICKET SYSTEM
 // ============================================================
@@ -313,11 +269,9 @@ function buildTicketPanel() {
         .setTitle('🎫 HỖ TRỢ & GIAO DỊCH')
         .setDescription(
             'Bấm **Mở Menu Ticket** để chọn nhu cầu.\n\n' +
-            '🛒 **Mua vật phẩm KingSMP / DonutSMP** → Chọn Seller\n' +
-            '🏗️ **Builder / Dịch vụ xây dựng** → Ping Builder\n' +
-            '🛠️ **Hỗ trợ / Khác** → Ping Admin\n' +
-            '💎 **Thu mua Account Minecraft Premium** → Ping Admin\n' +
-            '🛒 **Mua Account Minecraft** → Mở từ nút Mua Ngay ở bài đăng Account'
+            '🛠️ **Hỗ trợ / Khác** → Tạo Ticket và ping Admin\n' +
+            '💎 **Thu mua Account Minecraft Premium** → Tạo Ticket và ping Admin\n' +
+            '🛒 **Mua Account Minecraft** → Bấm nút **Mua Ngay** ở bài đăng Account'
         )
         .setFooter({ text: 'Chọn đúng mục để được hỗ trợ nhanh.' })
         .setTimestamp();
@@ -342,16 +296,6 @@ function buildTicketTypeMenu() {
         .setPlaceholder('🎫 Chọn loại Ticket...')
         .addOptions(
             new StringSelectMenuOptionBuilder()
-                .setLabel('Mua vật phẩm KingSMP / DonutSMP')
-                .setDescription('Tạo ticket và chọn Seller')
-                .setEmoji('🛒')
-                .setValue('buy_items'),
-            new StringSelectMenuOptionBuilder()
-                .setLabel('Builder / Dịch vụ xây dựng')
-                .setDescription('Tạo ticket và ping Builder')
-                .setEmoji('🏗️')
-                .setValue('builder'),
-            new StringSelectMenuOptionBuilder()
                 .setLabel('Hỗ trợ / Khác')
                 .setDescription('Tạo ticket và ping Admin')
                 .setEmoji('🛠️')
@@ -368,24 +312,6 @@ function buildTicketTypeMenu() {
 
 function ticketTypeInfo(type) {
     const map = {
-        buy_items: {
-            prefix: 'buy',
-            title: '🛒 MUA VẬT PHẨM KINGSMP / DONUTSMP',
-            description: 'Seller sẽ vào ticket để hỗ trợ giao dịch.',
-            roleId: String(process.env.SELLER_ROLE_ID || '').trim(),
-            ping: String(process.env.SELLER_ROLE_ID || '').trim()
-                ? `<@&${String(process.env.SELLER_ROLE_ID).trim()}>`
-                : 'Seller'
-        },
-        builder: {
-            prefix: 'builder',
-            title: '🏗️ BUILDER / DỊCH VỤ XÂY DỰNG',
-            description: 'Builder sẽ vào ticket để trao đổi yêu cầu và giá.',
-            roleId: String(process.env.BUILDER_ROLE_ID || '').trim(),
-            ping: String(process.env.BUILDER_ROLE_ID || '').trim()
-                ? `<@&${String(process.env.BUILDER_ROLE_ID).trim()}>`
-                : 'Builder'
-        },
         support: {
             prefix: 'support',
             title: '🛠️ HỖ TRỢ / KHÁC',
@@ -401,13 +327,11 @@ function ticketTypeInfo(type) {
             ping: getTicketAdminMention()
         }
     };
-
     return map[type] || null;
 }
 
 function ticketRoleOverwrite(roleId) {
     if (!roleId) return [];
-
     return [{
         id: roleId,
         allow: [
@@ -418,9 +342,8 @@ function ticketRoleOverwrite(roleId) {
     }];
 }
 
-async function createGeneralTicket(interaction, type, sellerId = null) {
+async function createGeneralTicket(interaction, type) {
     const info = ticketTypeInfo(type);
-
     if (!info || !interaction.guild) {
         return safeReply(interaction, {
             content: '❌ Không xác định được loại Ticket.',
@@ -428,6 +351,7 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
         });
     }
 
+    // Acknowledge immediately; Discord interactions expire quickly.
     if (!(await safeDeferUpdate(interaction))) return;
 
     const baseName = `${info.prefix}-${interaction.user.username}`
@@ -437,10 +361,7 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
 
     try {
         const rawOverwrites = [
-            {
-                id: interaction.guild.id,
-                deny: [PermissionsBitField.Flags.ViewChannel]
-            },
+            { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
             {
                 id: interaction.user.id,
                 allow: [
@@ -464,14 +385,9 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
         const ticketChannel = await interaction.guild.channels.create({
             name: `ticket-${baseName}`,
             type: ChannelType.GuildText,
-            topic: `generalTicket:${type}:${interaction.user.id}${sellerId ? `:${sellerId}` : ''}`,
+            topic: `generalTicket:${type}:${interaction.user.id}`,
             permissionOverwrites
         });
-
-        const seller = sellerId ? getSellerInfo(sellerId) : null;
-        const responsiblePing = seller ? `<@${seller.id}>` : info.ping;
-        const sellerDisplayName = seller ? await getSellerDisplayName(interaction.guild, seller.id) : '';
-        const sellerOnline = seller ? await isSellerOnline(interaction.guild, seller.id) : false;
 
         const embed = new EmbedBuilder()
             .setColor('#5865F2')
@@ -479,25 +395,13 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
             .setDescription(
                 `Xin chào <@${interaction.user.id}>!\n\n` +
                 `${info.description}\n\n` +
-                `📌 **Người phụ trách:** ${responsiblePing}\n` +
-                (seller
-                    ? `🏷️ **Seller:** ${sellerDisplayName}\n📡 **Trạng thái:** ${sellerOnline ? 'ONLINE' : 'OFFLINE'}\n`
-                    : '') +
-                '🔒 Khi xong giao dịch, Admin có thể đóng ticket.'
+                `📌 **Người phụ trách:** ${info.ping}\n` +
+                '🔒 Khi hoàn tất, Admin có thể đóng ticket.'
             )
             .setFooter({ text: `Ticket của ${interaction.user.tag}` })
             .setTimestamp();
 
         const closeRow = new ActionRowBuilder().addComponents(
-            ...(seller
-                ? [
-                    new ButtonBuilder()
-                        .setCustomId('ticket_change_seller')
-                        .setLabel('Chuyển Seller')
-                        .setEmoji('🔄')
-                        .setStyle(ButtonStyle.Primary)
-                ]
-                : []),
             new ButtonBuilder()
                 .setCustomId('close_ticket')
                 .setLabel('Đóng Ticket')
@@ -505,17 +409,12 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
                 .setStyle(ButtonStyle.Danger)
         );
 
-        const allowedUsers = [interaction.user.id];
-        if (seller) allowedUsers.push(seller.id);
-
         await ticketChannel.send({
-            content: seller
-                ? `<@${interaction.user.id}> <@${seller.id}>`
-                : `<@${interaction.user.id}> ${info.ping}`,
+            content: `<@${interaction.user.id}> ${info.ping}`,
             embeds: [embed],
             components: [closeRow],
             allowedMentions: {
-                users: allowedUsers,
+                users: [interaction.user.id],
                 roles: info.roleId ? [info.roleId] : []
             }
         });
@@ -526,87 +425,6 @@ async function createGeneralTicket(interaction, type, sellerId = null) {
     } catch (err) {
         return safeEditReply(interaction, {
             content: `❌ Không thể tạo Ticket: \`${err.message}\``
-        });
-    }
-}
-
-async function switchTicketSeller(interaction, sellerId) {
-    const channel = interaction.channel;
-    const guild = interaction.guild;
-
-    if (!channel || !guild) {
-        return safeReply(interaction, {
-            content: '❌ Không tìm thấy ticket.',
-            flags: MessageFlags.Ephemeral
-        });
-    }
-
-    const match = String(channel.topic || '').match(/^generalTicket:buy_items:(\d+)(?::(\d+))?$/);
-
-    if (!match) {
-        return safeReply(interaction, {
-            content: '❌ Ticket này không hỗ trợ chuyển Seller.',
-            flags: MessageFlags.Ephemeral
-        });
-    }
-
-    const customerId = match[1];
-    const oldSellerId = match[2] || null;
-
-    if (interaction.user.id !== customerId && !isAdminUser(interaction)) {
-        return safeReply(interaction, {
-            content: '❌ Chỉ khách trong ticket hoặc Admin mới được đổi Seller.',
-            flags: MessageFlags.Ephemeral
-        });
-    }
-
-    const newSeller = getSellerInfo(sellerId);
-    if (!newSeller) {
-        return safeReply(interaction, {
-            content: '❌ Seller không hợp lệ.',
-            flags: MessageFlags.Ephemeral
-        });
-    }
-
-    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
-
-    try {
-        if (oldSellerId) {
-            await channel.permissionOverwrites.delete(oldSellerId).catch(() => {});
-        }
-
-        await channel.permissionOverwrites.edit(newSeller.id, {
-            ViewChannel: true,
-            SendMessages: true,
-            AttachFiles: true
-        });
-
-        await channel.setTopic(`generalTicket:buy_items:${customerId}:${newSeller.id}`);
-
-        const displayName = await getSellerDisplayName(guild, newSeller.id);
-        const online = await isSellerOnline(guild, newSeller.id);
-
-        await channel.send({
-            content: `<@${customerId}> <@${newSeller.id}>`,
-            embeds: [
-                new EmbedBuilder()
-                    .setColor('#5865F2')
-                    .setTitle('🔄 ĐÃ CHUYỂN SELLER')
-                    .setDescription(
-                        `👤 Seller mới: **${displayName}**\n` +
-                        `📡 Trạng thái: **${online ? 'ONLINE' : 'OFFLINE'}**`
-                    )
-                    .setTimestamp()
-            ],
-            allowedMentions: { users: [customerId, newSeller.id] }
-        });
-
-        return safeEditReply(interaction, {
-            content: `✅ Đã chuyển ticket sang **${displayName}**.`
-        });
-    } catch (err) {
-        return safeEditReply(interaction, {
-            content: `❌ Không thể chuyển Seller: \`${err.message}\``
         });
     }
 }
@@ -1845,14 +1663,6 @@ client.on(Events.InteractionCreate, async interaction => {
                 });
             }
 
-            if (id === 'ticket_change_seller') {
-                return safeReply(interaction, {
-                    content: '🔄 **Chọn Seller bạn muốn chuyển sang:**',
-                    components: [await buildSellerSelectMenu(interaction.guild)],
-                    flags: MessageFlags.Ephemeral
-                });
-            }
-
             if (
                 id.startsWith('buy_single_') ||
                 id.startsWith('confirm_delete_') ||
@@ -1870,28 +1680,7 @@ client.on(Events.InteractionCreate, async interaction => {
             const id = interaction.customId;
 
             if (id === 'ticket_type_select') {
-                const type = interaction.values[0];
-
-                if (type === 'buy_items') {
-                    return safeReply(interaction, {
-                        content: '🛒 **Chọn Seller bạn yêu thích:**',
-                        components: [await buildSellerSelectMenu(interaction.guild)],
-                        flags: MessageFlags.Ephemeral
-                    });
-                }
-
-                return createGeneralTicket(interaction, type);
-            }
-
-            if (id === 'ticket_seller_select') {
-                const sellerId = interaction.values[0];
-
-                const topic = String(interaction.channel?.topic || '');
-                if (topic.startsWith('generalTicket:buy_items:')) {
-                    return switchTicketSeller(interaction, sellerId);
-                }
-
-                return createGeneralTicket(interaction, 'buy_items', sellerId);
+                return createGeneralTicket(interaction, interaction.values[0]);
             }
 
             if (
@@ -1922,7 +1711,7 @@ client.on(Events.InteractionCreate, async interaction => {
 // ============================================================
 
 client.once(Events.ClientReady, async c => {
-    console.log(`🤖 Bot đã online: ${c.user.tag}`);
+    console.log(`🤖 BOT ĐÃ ONLINE: ${c.user.tag} (${c.user.id})`);
 
     ensureJsonFile(CONFIG_FILE, {});
     ensureJsonFile(ACC_STOCK_FILE, []);
@@ -1939,12 +1728,21 @@ process.on('uncaughtException', err => {
     console.error('⚠️ Uncaught Exception:', err);
 });
 
-const botToken = process.env.DISCORD_TOKEN || process.env.TOKEN;
+const botToken = String(process.env.DISCORD_TOKEN || process.env.TOKEN || '').trim();
+
+console.log('🔐 Discord config:', {
+    tokenConfigured: Boolean(botToken),
+    clientIdConfigured: Boolean(String(process.env.CLIENT_ID || process.env.APPLICATION_ID || '').trim()),
+    guildIdConfigured: Boolean(String(process.env.GUILD_ID || '').trim())
+});
 
 if (!botToken) {
-    console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong .env!');
+    console.error('❌ THIẾU DISCORD_TOKEN (hoặc TOKEN) trên Render → Environment Variables.');
 } else {
-    client.login(botToken).catch(err => {
-        console.error('❌ Login Discord thất bại:', err.message);
-    });
+    client.login(botToken)
+        .then(() => console.log('✅ Discord login() đã được gọi thành công, đang chờ READY...'))
+        .catch(err => {
+            console.error('❌ LOGIN DISCORD THẤT BẠI:', err?.message || err);
+            console.error('🔎 Code:', err?.code || 'unknown');
+        });
 }
