@@ -1447,6 +1447,25 @@ async function handleMoneyCommand(interaction) {
 
 // Modal phải là phản hồi đầu tiên của Button Interaction.
 // Không defer/reply trước showModal và không thực hiện request mạng trước đó.
+async function safeShowModal(interaction, modal, label = 'modal') {
+    logInteractionLatency(interaction, label);
+    try {
+        await interaction.showModal(modal);
+        return true;
+    } catch (err) {
+        if (err?.code === 40060) {
+            console.warn(`⚠️ ${label}: interaction đã được acknowledge.`);
+            return true;
+        }
+        if (isUnknownInteractionError(err)) {
+            console.warn(`⏱️ ${label}: Unknown interaction sau ${getInteractionAgeMs(interaction)}ms.`);
+            return true;
+        }
+        console.error(`❌ ${label}:`, err);
+        return true;
+    }
+}
+
 async function showMoneyModal(interaction, id) {
     logInteractionLatency(interaction, id);
 
@@ -1533,21 +1552,7 @@ async function showMoneyModal(interaction, id) {
 
     if (!modal) return false;
 
-    try {
-        await interaction.showModal(modal);
-        return true;
-    } catch (err) {
-        if (err?.code === 40060) {
-            console.log(`⚠️ Modal ${id} đã được acknowledge.`);
-            return true;
-        }
-        if (isUnknownInteractionError(err)) {
-            console.warn(`⏱️ Modal ${id} không gửi được: interaction ${interaction.id} đã hết hạn ở ${getInteractionAgeMs(interaction)}ms.`);
-            return true;
-        }
-        console.error(`Lỗi show modal ${id}:`, err);
-        return true;
-    }
+    return safeShowModal(interaction, modal, `Money modal ${id}`);
 }
 
 async function handleMoneyButton(interaction) {
@@ -5217,17 +5222,17 @@ async function sbHandleButton(interaction) {
             flags: MessageFlags.Ephemeral
         });
     }
-    if (id === 'sb_apply_seller') return interaction.showModal(sbApplicationModal('seller'));
-    if (id === 'sb_apply_builder') return interaction.showModal(sbApplicationModal('builder'));
+    if (id === 'sb_apply_seller') return safeShowModal(interaction, sbApplicationModal('seller'), 'sb_apply_seller');
+    if (id === 'sb_apply_builder') return safeShowModal(interaction, sbApplicationModal('builder'), 'sb_apply_builder');
     if (id === 'sb_begin_setup_seller') return sbHandleBeginSetup(interaction, 'seller');
     if (id === 'sb_begin_setup_builder') return sbHandleBeginSetup(interaction, 'builder');
     if (id === 'sb_setup_shop_seller') {
         const modal = new ModalBuilder().setCustomId('sb_shop_name_seller').setTitle('👑 SETUP SHOP SELLER').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop_name').setLabel('Tên Shop').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Khang Store').setRequired(true).setMaxLength(50)));
-        return interaction.showModal(modal);
+        return safeShowModal(interaction, modal, 'sb_setup_shop_seller');
     }
     if (id === 'sb_setup_shop_builder') {
         const modal = new ModalBuilder().setCustomId('sb_shop_name_builder').setTitle('🛠️ SETUP BUILDER').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop_name').setLabel('Tên Builder').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Khang').setRequired(true).setMaxLength(50)));
-        return interaction.showModal(modal);
+        return safeShowModal(interaction, modal, 'sb_setup_shop_builder');
     }
     if (id.startsWith('sb_pay_approve_')) return sbHandlePaymentApproval(interaction, id.replace('sb_pay_approve_', ''));
     return false;
@@ -5260,7 +5265,7 @@ async function sbHandleSelect(interaction) {
             sbSaveDataForType('builder', data);
             return safeEditReply(interaction, { content: '✅ Builder không có phí được cấu hình. Bạn có thể đặt tên Builder ngay.', components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sb_setup_shop_builder').setLabel('🛠️ Đặt tên Builder').setStyle(ButtonStyle.Primary))] });
         }
-        return interaction.showModal(sbSetupPaymentModal(type, plan));
+        return safeShowModal(interaction, sbSetupPaymentModal(type, plan), `sb_plan_select_${type}`);
     }
     return false;
 }
@@ -5793,6 +5798,13 @@ client.on(Events.InteractionCreate, async interaction => {
             return await showMoneyModal(interaction, interaction.customId);
         }
 
+        if (interaction.isButton() && ['sb_apply_seller', 'sb_apply_builder', 'sb_setup_shop_seller', 'sb_setup_shop_builder'].includes(interaction.customId)) {
+            if (interactionAge >= 2500) {
+                console.warn(`⚠️ ${interaction.customId} nhận quá muộn (${interactionAge}ms). Kiểm tra duplicate bot process/session nếu vẫn tái diễn.`);
+            }
+            return await sbHandleButton(interaction);
+        }
+
         if (interaction.isModalSubmit()) {
             // Modal Submit cũng phải được acknowledge ngay; phần tạo ticket phía sau có thể mất nhiều giây.
             if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
@@ -5953,6 +5965,12 @@ client.on(Events.InteractionCreate, async interaction => {
                 return await handleMoneyModal(interaction);
             }
 
+            if (!interaction.replied && !interaction.deferred) {
+                return safeReply(interaction, {
+                    content: '❌ Interaction này không còn được hỗ trợ hoặc đã hết hạn.',
+                    flags: MessageFlags.Ephemeral
+                });
+            }
             return;
         }
     } catch (err) {
