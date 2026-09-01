@@ -6138,42 +6138,25 @@ function httpProbe(url, options = {}, timeoutMs = 12_000) {
     });
 }
 
-async function diagnoseDiscordNetwork() {
-    console.log('🧪 [NET] Bắt đầu kiểm tra DNS/HTTPS Discord...');
-    try {
-        const lookup = await dns.promises.lookup('discord.com', { all: true });
-        console.log(`✅ [NET] DNS discord.com: ${lookup.map(x => `${x.address}/${x.family}`).join(', ')}`);
-    } catch (err) {
-        console.error(`❌ [NET] DNS discord.com thất bại: ${err?.code || ''} ${err?.message || err}`);
-        throw new Error('DNS discord.com không phân giải được');
-    }
+async function diagnoseDiscordNetwork({includeGatewayProbe = false} = {}) {
+    console.log('🧪 [NET] Kiểm tra DNS Discord...');
+    const lookup = await dns.promises.lookup('discord.com', { all: true });
+    console.log(`✅ [NET] DNS discord.com: ${lookup.map(x => `${x.address}/${x.family}`).join(', ')}`);
 
-    try {
-        const res = await httpProbe('https://discord.com/api/v10/gateway');
-        console.log(`✅ [NET] GET /gateway -> HTTP ${res.statusCode} trong ${res.elapsedMs}ms`);
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-            throw new Error(`Discord /gateway trả HTTP ${res.statusCode}`);
-        }
-    } catch (err) {
-        console.error(`❌ [NET] HTTPS Discord thất bại: ${err?.code || ''} ${err?.message || err}`);
-        throw err;
-    }
+    // Không gọi /gateway liên tục: endpoint này có rate limit và 429 không có nghĩa
+    // Discord Gateway đang hỏng. Chỉ probe 1 lần khi explicitly yêu cầu.
+    if (!includeGatewayProbe) return;
 
-    if (botToken) {
-        try {
-            const res = await httpProbe('https://discord.com/api/v10/gateway/bot', {
-                headers: { Authorization: `Bot ${botToken}` }
-            });
-            console.log(`✅ [NET] GET /gateway/bot -> HTTP ${res.statusCode} trong ${res.elapsedMs}ms`);
-            if (res.statusCode === 401) throw new Error('Bot Token bị Discord từ chối (401 Unauthorized)');
-            if (res.statusCode < 200 || res.statusCode >= 300) {
-                throw new Error(`Discord /gateway/bot trả HTTP ${res.statusCode}`);
-            }
-        } catch (err) {
-            console.error(`❌ [NET] Bot Gateway probe thất bại: ${err?.message || err}`);
-            throw err;
-        }
+    const res = await httpProbe('https://discord.com/api/v10/gateway', {
+        headers: { 'User-Agent': 'buy-money-bot/1.0' }
+    });
+    console.log(`ℹ️ [NET] GET /gateway -> HTTP ${res.statusCode} trong ${res.elapsedMs}ms`);
+    if (res.statusCode >= 200 && res.statusCode < 300) return;
+    if (res.statusCode === 429) {
+        console.warn('⚠️ [NET] Discord /gateway đang rate-limit (429). Bỏ qua probe và để discord.js tự quản lý Gateway.');
+        return;
     }
+    throw new Error(`Discord /gateway trả HTTP ${res.statusCode}`);
 }
 
 async function connectDiscordWithRetry() {
@@ -6182,44 +6165,62 @@ async function connectDiscordWithRetry() {
         return;
     }
 
-    const maxAttempts = Math.max(1, Number(process.env.DISCORD_LOGIN_ATTEMPTS) || 5);
+    const maxAttempts = Math.max(1, Number(process.env.DISCORD_LOGIN_ATTEMPTS) || 6);
+    const firstDelay = Math.max(5000, Number(process.env.DISCORD_LOGIN_FIRST_DELAY) || 5000);
+
+    // Chỉ kiểm tra DNS một lần trước khi login. Không spam /gateway.
+    try {
+        await diagnoseDiscordNetwork({ includeGatewayProbe: false });
+    } catch (err) {
+        console.error(`❌ [NET] DNS Discord thất bại: ${err?.code || ''} ${err?.message || err}`);
+    }
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             if (attempt > 1) {
-                const delay = Math.min(30_000, 3_000 * 2 ** (attempt - 2));
+                const delay = Math.min(60_000, firstDelay * 2 ** (attempt - 2));
                 console.log(`🔄 [LOGIN] Chờ ${delay}ms trước lần thử ${attempt}/${maxAttempts}...`);
                 await new Promise(resolve => setTimeout(resolve, delay));
             }
 
             console.log(`🚀 [LOGIN] Attempt ${attempt}/${maxAttempts}`);
-            await diagnoseDiscordNetwork();
-
             const loginStartedAt = Date.now();
+
+            // Nếu có client state cũ từ attempt trước thì hủy sạch trước khi login lại.
+            try {
+                if (client.ws?.status !== 0 && client.ws?.status !== undefined) {
+                    client.destroy();
+                }
+            } catch (_) {}
+
             console.log('🔐 [LOGIN] Đang gọi client.login()...');
             await client.login(botToken);
             console.log(`✅ [LOGIN] client.login() resolved sau ${Date.now() - loginStartedAt}ms`);
 
-            const readyDeadline = Date.now() + 35_000;
+            if (client.isReady()) {
+                console.log(`🎉 [LOGIN] Discord READY thành công. Guilds=${client.guilds.cache.size}`);
+                return;
+            }
+
+            // Không poll quá dày. ClientReady event sẽ là nguồn xác nhận chính.
+            const readyDeadline = Date.now() + 45_000;
             while (!client.isReady() && Date.now() < readyDeadline) {
-                await new Promise(resolve => setTimeout(resolve, 250));
+                await new Promise(resolve => setTimeout(resolve, 500));
             }
 
             if (!client.isReady()) {
-                throw new Error('Gateway kết nối nhưng không nhận READY trong 35 giây');
+                throw new Error('Gateway chưa phát READY trong 45 giây');
             }
 
             console.log(`🎉 [LOGIN] Discord READY thành công. Guilds=${client.guilds.cache.size}`);
             return;
         } catch (err) {
-            console.error(`❌ [LOGIN] Lần ${attempt}/${maxAttempts} thất bại:`, err);
-            if (attempt < maxAttempts) {
-                try { client.destroy(); } catch (_) {}
-            }
+            console.error(`❌ [LOGIN] Lần ${attempt}/${maxAttempts} thất bại:`, err?.message || err);
+            if (attempt === maxAttempts) break;
         }
     }
 
-    console.error('🛑 [LOGIN] Không thể kết nối Discord sau nhiều lần thử. Render sẽ restart process nếu cấu hình restart policy cho service.');
+    console.error('🛑 [LOGIN] Không thể kết nối Discord sau nhiều lần thử. Kiểm tra Gateway/Token/Render network và restart policy.');
 }
 
 void connectDiscordWithRetry();
