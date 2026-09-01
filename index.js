@@ -90,15 +90,19 @@ console.log('🔌 [INTENTS] Guilds=true GuildMessages=true' +
     ` GuildMembers=${wantsGuildMembers}` +
     ` GuildPresences=${wantsGuildPresences}`);
 
+// Giữ Client options ở mức tối thiểu để Render không bị ảnh hưởng bởi
+// các WS timeout tùy chỉnh không cần thiết. Discord.js tự quản lý Gateway.
 const client = new Client({
     intents: discordIntents,
-    rest: { timeout: 15_000, retries: 2 },
-    ws: {
-        handshakeTimeout: 15_000,
-        helloTimeout: 15_000,
-        readyTimeout: 30_000
-    }
+    rest: { timeout: 15_000, retries: 2 }
 });
+
+let GatewayWebSocket;
+try {
+    GatewayWebSocket = require('ws');
+} catch (err) {
+    console.error('❌ [NET] Không load được package ws:', err?.message || err);
+}
 
 // ============================================================
 // 3. CONFIG
@@ -6138,6 +6142,65 @@ function httpProbe(url, options = {}, timeoutMs = 12_000) {
     });
 }
 
+async function probeDiscordGatewayWebSocket(timeoutMs = 12000) {
+    if (!GatewayWebSocket) return { ok: false, error: 'package ws unavailable' };
+
+    return new Promise(resolve => {
+        const started = Date.now();
+        let settled = false;
+        let socket;
+        const finish = (result) => {
+            if (settled) return;
+            settled = true;
+            try { socket?.removeAllListeners(); socket?.close(); socket?.terminate(); } catch (_) {}
+            resolve({ elapsedMs: Date.now() - started, ...result });
+        };
+
+        const timer = setTimeout(() => {
+            finish({ ok: false, error: `WebSocket timeout sau ${timeoutMs}ms` });
+        }, timeoutMs);
+        timer.unref?.();
+
+        try {
+            console.log('🧪 [NET] Mở WebSocket trực tiếp tới gateway.discord.gg...');
+            socket = new GatewayWebSocket('wss://gateway.discord.gg/?v=10&encoding=json', {
+                handshakeTimeout: timeoutMs,
+                perMessageDeflate: false,
+                family: 4,
+                headers: { 'User-Agent': 'DiscordBot (buy-money-bot, 1.0)' }
+            });
+
+            socket.once('open', () => {
+                clearTimeout(timer);
+                console.log(`✅ [NET] Gateway WebSocket OPEN sau ${Date.now() - started}ms`);
+                finish({ ok: true });
+            });
+            socket.once('message', data => {
+                clearTimeout(timer);
+                let preview = '';
+                try { preview = JSON.stringify(JSON.parse(String(data))).slice(0, 180); } catch (_) { preview = String(data).slice(0, 180); }
+                console.log(`✅ [NET] Gateway HELLO/DATA nhận được: ${preview}`);
+                finish({ ok: true });
+            });
+            socket.once('error', err => {
+                clearTimeout(timer);
+                console.error(`❌ [NET] Gateway WebSocket error sau ${Date.now() - started}ms:`, err?.message || err);
+                finish({ ok: false, error: err?.message || String(err) });
+            });
+            socket.once('close', (code, reason) => {
+                if (settled) return;
+                clearTimeout(timer);
+                const reasonText = reason ? String(reason) : '';
+                console.error(`🔌 [NET] Gateway WebSocket CLOSED code=${code} reason=${reasonText}`);
+                finish({ ok: false, error: `closed code=${code}${reasonText ? ` reason=${reasonText}` : ''}` });
+            });
+        } catch (err) {
+            clearTimeout(timer);
+            finish({ ok: false, error: err?.message || String(err) });
+        }
+    });
+}
+
 async function diagnoseDiscordNetwork({includeGatewayProbe = false} = {}) {
     console.log('🧪 [NET] Kiểm tra DNS Discord...');
     const lookup = await dns.promises.lookup('discord.com', { all: true });
@@ -6211,6 +6274,15 @@ async function connectDiscordWithRetry() {
         console.error(`❌ [NET] DNS Discord thất bại: ${err?.code || ''} ${err?.message || err}`);
     }
 
+    // Kiểm tra đường WebSocket thật đúng một lần. Không gọi REST /gateway lặp lại.
+    const wsProbe = await probeDiscordGatewayWebSocket(12000);
+    if (!wsProbe.ok) {
+        console.warn(`⚠️ [NET] WebSocket Gateway probe thất bại: ${wsProbe.error}`);
+        console.warn('⚠️ [NET] Vẫn thử client.login(); nếu tiếp tục timeout thì Render đang không đi được tới Discord Gateway.');
+    } else {
+        console.log(`✅ [NET] WebSocket Gateway hoạt động (${wsProbe.elapsedMs}ms).`);
+    }
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             if (attempt > 1) {
@@ -6228,11 +6300,12 @@ async function connectDiscordWithRetry() {
             // "Manager was destroyed" và không giúp ích cho một client vừa khởi tạo.
             if (attempt > 1) {
                 try {
-                    client.destroy();
-                    await wait(500);
+                    // Chỉ hủy session cũ nếu client còn giữ trạng thái socket khác IDLE.
+                    if (client.ws && client.ws.status !== 3) client.destroy();
                 } catch (destroyErr) {
                     console.warn(`⚠️ [LOGIN] destroy client cũ: ${destroyErr?.message || destroyErr}`);
                 }
+                await wait(500);
             }
 
             console.log('🔐 [LOGIN] Đang gọi client.login()...');
