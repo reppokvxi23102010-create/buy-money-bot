@@ -27,13 +27,6 @@ const MONEY_ADMIN_CHECK_ID = '1458470035763888250';
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const https = require('https');
-const dns = require('dns');
-
-// Prefer IPv4 on hosts where IPv6/DNS routing is unreliable (e.g. some Render regions).
-try {
-    dns.setDefaultResultOrder('ipv4first');
-} catch (_) {}
 
 const {
     Client,
@@ -73,32 +66,14 @@ http.createServer((req, res) => {
 // 2. CLIENT
 // ============================================================
 
-const wantsMessageContent = String(process.env.ENABLE_MESSAGE_CONTENT || 'false').toLowerCase() === 'true';
-const wantsGuildMembers = String(process.env.ENABLE_GUILD_MEMBERS || 'false').toLowerCase() === 'true';
-const wantsGuildPresences = String(process.env.ENABLE_GUILD_PRESENCES || 'false').toLowerCase() === 'true';
-
-const discordIntents = [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages
-];
-if (wantsMessageContent) discordIntents.push(GatewayIntentBits.MessageContent);
-if (wantsGuildMembers) discordIntents.push(GatewayIntentBits.GuildMembers);
-if (wantsGuildPresences) discordIntents.push(GatewayIntentBits.GuildPresences);
-
-console.log('🔌 [INTENTS] Guilds=true GuildMessages=true' +
-    ` MessageContent=${wantsMessageContent}` +
-    ` GuildMembers=${wantsGuildMembers}` +
-    ` GuildPresences=${wantsGuildPresences}`);
-
 const client = new Client({
-    intents: discordIntents,
-    // Dùng Gateway discovery + WebSocket chuẩn của discord.js.
-    // Không tự chèn Gateway URL giả hoặc tự gọi /gateway liên tục.
-    rest: { timeout: 20_000, retries: 2 },
-    ws: {
-        handshakeTimeout: 30_000,
-        helloTimeout: 15_000
-    }
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildPresences
+    ]
 });
 
 // ============================================================
@@ -179,19 +154,6 @@ function writeJson(file, data) {
 // Chống cùng một Interaction bị xử lý 2 lần trong cùng process.
 const seenInteractions = new Set();
 
-function getInteractionAgeMs(interaction) {
-    const created = Number(interaction?.createdTimestamp);
-    return Number.isFinite(created) ? Math.max(0, Date.now() - created) : 0;
-}
-
-function logInteractionLatency(interaction, label = '') {
-    const age = getInteractionAgeMs(interaction);
-    if (age >= 1500) {
-        console.warn(`🐢 [Interaction] ${label || interaction?.customId || interaction?.commandName || 'unknown'} đang trễ ${age}ms`);
-    }
-    return age;
-}
-
 function claimInteraction(interaction) {
     if (seenInteractions.has(interaction.id)) return false;
 
@@ -204,11 +166,6 @@ function claimInteraction(interaction) {
     return true;
 }
 
-function isUnknownInteractionError(err) {
-    return err?.code === 10062 ||
-        String(err?.message || '').toLowerCase().includes('unknown interaction');
-}
-
 async function safeReply(interaction, data) {
     try {
         if (interaction.replied || interaction.deferred) {
@@ -218,10 +175,6 @@ async function safeReply(interaction, data) {
     } catch (err) {
         if (err?.code === 40060) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge trước đó.`);
-            return null;
-        }
-        if (isUnknownInteractionError(err)) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi reply (${getInteractionAgeMs(interaction)}ms).`);
             return null;
         }
 
@@ -240,10 +193,6 @@ async function safeDeferReply(interaction, data = {}) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
             return false;
         }
-        if (isUnknownInteractionError(err)) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước deferReply (${getInteractionAgeMs(interaction)}ms).`);
-            return false;
-        }
 
         console.error('Lỗi deferReply:', err.message);
         return false;
@@ -260,10 +209,6 @@ async function safeDeferUpdate(interaction) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
             return false;
         }
-        if (isUnknownInteractionError(err)) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước deferUpdate (${getInteractionAgeMs(interaction)}ms).`);
-            return false;
-        }
 
         console.error('Lỗi deferUpdate:', err.message);
         return false;
@@ -278,10 +223,6 @@ async function safeEditReply(interaction, data) {
 
         return await interaction.editReply(data);
     } catch (err) {
-        if (isUnknownInteractionError(err)) {
-            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước editReply (${getInteractionAgeMs(interaction)}ms).`);
-            return null;
-        }
         console.error('Lỗi editReply:', err.message);
         return null;
     }
@@ -827,7 +768,26 @@ async function buildSellerSelectMenu(guild) {
     const activeRecords = getActiveSellerRecords();
     const dynamicIds = new Set(activeRecords.map(record => String(record.userId)));
 
-    // Seller cũ cấu hình sẵn hiển thị trước. Seller mới được tuyển hiển thị phía cuối.
+    for (const record of activeRecords) {
+        const sellerId = String(record.userId);
+        const [displayName, online] = await Promise.all([
+            getSellerDisplayName(guild, sellerId),
+            isSellerOnline(guild, sellerId)
+        ]);
+
+        const label = (record.shopName || displayName || `Seller ${sellerId.slice(-4)}`).slice(0, 100);
+        const description = `${online ? '🟢 ONLINE' : '🔴 OFFLINE'} • Seller đã xác thực`.slice(0, 100);
+
+        menu.addOptions(
+            new StringSelectMenuOptionBuilder()
+                .setLabel(label)
+                .setDescription(description)
+                .setEmoji('👑')
+                .setValue(sellerId)
+        );
+    }
+
+    // Giữ tương thích với các Seller cũ chưa có dữ liệu sellers.json.
     for (const seller of ITEM_SELLERS) {
         if (dynamicIds.has(String(seller.id))) continue;
 
@@ -842,26 +802,6 @@ async function buildSellerSelectMenu(guild) {
                 .setDescription(online ? '🟢 ONLINE' : '🔴 OFFLINE')
                 .setEmoji('👑')
                 .setValue(String(seller.id))
-        );
-    }
-
-    // Seller mới tuyển: giữ thứ tự createdAt để người mới nhất nằm cuối.
-    for (const record of activeRecords) {
-        const sellerId = String(record.userId);
-        const [displayName, online] = await Promise.all([
-            getSellerDisplayName(guild, sellerId),
-            isSellerOnline(guild, sellerId)
-        ]);
-
-        const label = (record.shopName || displayName || `Seller ${sellerId.slice(-4)}`).slice(0, 100);
-        const description = online ? '🟢 ONLINE' : '🔴 OFFLINE';
-
-        menu.addOptions(
-            new StringSelectMenuOptionBuilder()
-                .setLabel(label)
-                .setDescription(description)
-                .setEmoji('👑')
-                .setValue(sellerId)
         );
     }
 
@@ -1470,116 +1410,6 @@ async function handleMoneyCommand(interaction) {
 // 11. MONEY BUTTONS
 // ============================================================
 
-// Modal phải là phản hồi đầu tiên của Button Interaction.
-// Không defer/reply trước showModal và không thực hiện request mạng trước đó.
-async function safeShowModal(interaction, modal, label = 'modal') {
-    logInteractionLatency(interaction, label);
-    try {
-        await interaction.showModal(modal);
-        return true;
-    } catch (err) {
-        if (err?.code === 40060) {
-            console.warn(`⚠️ ${label}: interaction đã được acknowledge.`);
-            return true;
-        }
-        if (isUnknownInteractionError(err)) {
-            console.warn(`⏱️ ${label}: Unknown interaction sau ${getInteractionAgeMs(interaction)}ms.`);
-            return true;
-        }
-        console.error(`❌ ${label}:`, err);
-        return true;
-    }
-}
-
-async function showMoneyModal(interaction, id) {
-    logInteractionLatency(interaction, id);
-
-    let modal;
-
-    if (id === 'buy_bank') {
-        modal = new ModalBuilder()
-            .setCustomId('modal_bank')
-            .setTitle(`Mua Bank - Rate ${RATE}đ/1M`)
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('bank_name')
-                        .setLabel('Tên Ingame')
-                        .setStyle(TextInputStyle.Short)
-                        .setRequired(true)
-                ),
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('bank_vnd')
-                        .setLabel('Số tiền nạp (VNĐ)')
-                        .setStyle(TextInputStyle.Short)
-                        .setPlaceholder('Ví dụ: 10k, 20k, 50k')
-                        .setRequired(true)
-                )
-            );
-    } else if (id === 'buy_card') {
-        modal = new ModalBuilder()
-            .setCustomId('modal_card')
-            .setTitle(`Nạp Thẻ - Rate ${RATE}đ/1M`)
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('card_ign')
-                        .setLabel('Tên Ingame')
-                        .setStyle(TextInputStyle.Short)
-                        .setRequired(true)
-                ),
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('card_type')
-                        .setLabel('Loại thẻ')
-                        .setStyle(TextInputStyle.Short)
-                        .setPlaceholder('Viettel, Zing...')
-                        .setRequired(true)
-                ),
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('card_val')
-                        .setLabel('Mệnh giá thẻ')
-                        .setStyle(TextInputStyle.Short)
-                        .setPlaceholder('10k, 20k, 50k...')
-                        .setRequired(true)
-                ),
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('card_code')
-                        .setLabel('Mã thẻ (Pin)')
-                        .setStyle(TextInputStyle.Short)
-                        .setRequired(true)
-                ),
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('card_seri')
-                        .setLabel('Mã Seri')
-                        .setStyle(TextInputStyle.Short)
-                        .setRequired(true)
-                )
-            );
-    } else if (id === 'calc_price') {
-        modal = new ModalBuilder()
-            .setCustomId('modal_calc')
-            .setTitle('Tính Tiền Money')
-            .addComponents(
-                new ActionRowBuilder().addComponents(
-                    new TextInputBuilder()
-                        .setCustomId('calc_money')
-                        .setLabel('Nhập số Money (b, m, k)')
-                        .setStyle(TextInputStyle.Short)
-                        .setRequired(true)
-                )
-            );
-    }
-
-    if (!modal) return false;
-
-    return safeShowModal(interaction, modal, `Money modal ${id}`);
-}
-
 async function handleMoneyButton(interaction) {
     const id = interaction.customId;
 
@@ -1783,9 +1613,120 @@ async function handleMoneyButton(interaction) {
         });
     }
 
-    // Modal buttons are intentionally handled before any defer/reply.
-    if (id === 'buy_bank' || id === 'buy_card' || id === 'calc_price') {
-        return showMoneyModal(interaction, id);
+    if (id === 'buy_bank') {
+        const modal = new ModalBuilder()
+            .setCustomId('modal_bank')
+            .setTitle(`Mua Bank - Rate ${RATE}đ/1M`);
+
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('bank_name')
+                    .setLabel('Tên Ingame')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('bank_vnd')
+                    .setLabel('Số tiền nạp (VNĐ)')
+                    .setStyle(TextInputStyle.Short)
+                    .setPlaceholder('Ví dụ: 10k, 20k, 50k')
+                    .setRequired(true)
+            )
+        );
+
+        try {
+            return await interaction.showModal(modal);
+        } catch (err) {
+            if (err?.code === 40060) {
+                console.log('⚠️ Modal bank đã được acknowledge.');
+                return;
+            }
+            console.error('Lỗi show modal bank:', err.message);
+        }
+    }
+
+    if (id === 'buy_card') {
+        const modal = new ModalBuilder()
+            .setCustomId('modal_card')
+            .setTitle(`Nạp Thẻ - Rate ${RATE}đ/1M`);
+
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('card_ign')
+                    .setLabel('Tên Ingame')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('card_type')
+                    .setLabel('Loại thẻ')
+                    .setStyle(TextInputStyle.Short)
+                    .setPlaceholder('Viettel, Zing...')
+                    .setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('card_val')
+                    .setLabel('Mệnh giá thẻ')
+                    .setStyle(TextInputStyle.Short)
+                    .setPlaceholder('10k, 20k, 50k...')
+                    .setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('card_code')
+                    .setLabel('Mã thẻ (Pin)')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+            ),
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('card_seri')
+                    .setLabel('Mã Seri')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+            )
+        );
+
+        try {
+            return await interaction.showModal(modal);
+        } catch (err) {
+            if (err?.code === 40060) {
+                console.log('⚠️ Modal card đã được acknowledge.');
+                return;
+            }
+            console.error('Lỗi show modal card:', err.message);
+        }
+    }
+
+    if (id === 'calc_price') {
+        const modal = new ModalBuilder()
+            .setCustomId('modal_calc')
+            .setTitle('Tính Tiền Money');
+
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('calc_money')
+                    .setLabel('Nhập số Money (b, m, k)')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+            )
+        );
+
+        try {
+            return await interaction.showModal(modal);
+        } catch (err) {
+            if (err?.code === 40060) {
+                console.log('⚠️ Modal calc đã được acknowledge.');
+                return;
+            }
+            console.error('Lỗi show modal calc:', err.message);
+        }
     }
 
     if (id === 'guide') {
@@ -1822,9 +1763,9 @@ async function handleMoneyModal(interaction) {
                 ? Math.floor(vndAmount / RATE)
                 : 0;
 
-        if (vndAmount < 10000) {
+        if (vndAmount < 1000) {
             return safeReply(interaction, {
-                content: '❌ Số tiền không hợp lệ! Tối thiểu 10.000 VNĐ.',
+                content: '❌ Số tiền không hợp lệ! Tối thiểu 1.000 VNĐ.',
                 flags: MessageFlags.Ephemeral
             });
         }
@@ -2058,9 +1999,9 @@ async function handleMoneyModal(interaction) {
 
         const cardValueVnd = Math.floor(parseCardValue(val));
 
-        if (cardValueVnd < 10000) {
+        if (cardValueVnd < 1000) {
             return safeReply(interaction, {
-                content: '❌ Mệnh giá thẻ không hợp lệ! Tối thiểu 10.000 VNĐ.',
+                content: '❌ Mệnh giá thẻ không hợp lệ.',
                 flags: MessageFlags.Ephemeral
             });
         }
@@ -3587,7 +3528,6 @@ const SB_ENV = {
     memberRoleId: String(process.env.MEMBER_ROLE_ID || '1507904869997219840').trim(),
     memberUserId: String(process.env.MEMBER_USER_ID || '').trim(),
     sellerMinDeposit: Math.max(0, Number.parseInt(process.env.SELLER_MIN_DEPOSIT || '100000', 10) || 100000),
-    builderMinDeposit: Math.max(0, Number.parseInt(process.env.BUILDER_MIN_DEPOSIT || '100000', 10) || 100000),
     sellerWeeklyPrice: Math.max(0, Number.parseInt(process.env.SELLER_WEEKLY_PRICE || '30000', 10) || 30000),
     sellerMonthlyPrice: Math.max(0, Number.parseInt(process.env.SELLER_MONTHLY_PRICE || '100000', 10) || 100000),
     builderWeeklyPrice: Math.max(0, Number.parseInt(process.env.BUILDER_WEEKLY_PRICE || '30000', 10) || 30000),
@@ -3610,8 +3550,6 @@ function sbEnsureFiles() {
         ensureJsonFile(SB_CONFIG_FILE, {
             sellerWeeklyPrice: SB_ENV.sellerWeeklyPrice,
             sellerMonthlyPrice: SB_ENV.sellerMonthlyPrice,
-            sellerMinDeposit: SB_ENV.sellerMinDeposit,
-            builderMinDeposit: SB_ENV.builderMinDeposit,
             builderWeeklyPrice: SB_ENV.builderWeeklyPrice,
             builderMonthlyPrice: SB_ENV.builderMonthlyPrice,
             builderPricingVersion: 2,
@@ -3647,8 +3585,6 @@ function sbGetConfig() {
     return {
         sellerWeeklyPrice: Number.isFinite(Number(cfg.sellerWeeklyPrice)) ? Number(cfg.sellerWeeklyPrice) : SB_ENV.sellerWeeklyPrice,
         sellerMonthlyPrice: Number.isFinite(Number(cfg.sellerMonthlyPrice)) ? Number(cfg.sellerMonthlyPrice) : SB_ENV.sellerMonthlyPrice,
-        sellerMinDeposit: Number.isFinite(Number(cfg.sellerMinDeposit)) ? Math.max(0, Number(cfg.sellerMinDeposit)) : SB_ENV.sellerMinDeposit,
-        builderMinDeposit: Number.isFinite(Number(cfg.builderMinDeposit)) ? Math.max(0, Number(cfg.builderMinDeposit)) : SB_ENV.builderMinDeposit,
         builderWeeklyPrice: Number.isFinite(Number(cfg.builderWeeklyPrice)) ? Number(cfg.builderWeeklyPrice) : SB_ENV.builderWeeklyPrice,
         builderMonthlyPrice: Number.isFinite(Number(cfg.builderMonthlyPrice)) ? Number(cfg.builderMonthlyPrice) : SB_ENV.builderMonthlyPrice,
         panel: cfg.panel || {}
@@ -3659,11 +3595,6 @@ function sbSetConfig(patch) {
     const cfg = sbGetConfig();
     const next = { ...cfg, ...patch };
     return sbWrite(SB_CONFIG_FILE, next);
-}
-
-function sbGetMinDeposit(type) {
-    const cfg = sbGetConfig();
-    return type === 'seller' ? cfg.sellerMinDeposit : cfg.builderMinDeposit;
 }
 
 function sbFormatVnd(amount) {
@@ -3927,7 +3858,7 @@ async function sbSendApplication(type, interaction) {
         fields.push(
             { name: '📅 Gói tuần', value: sbFormatVnd(type === 'seller' ? cfg.sellerWeeklyPrice : cfg.builderWeeklyPrice), inline: true },
             { name: '📅 Gói tháng', value: sbFormatVnd(type === 'seller' ? cfg.sellerMonthlyPrice : cfg.builderMonthlyPrice), inline: true },
-            { name: '🛡️ Cọc tối thiểu', value: sbFormatVnd(sbGetMinDeposit(type)), inline: true }
+            { name: '🛡️ Cọc tối thiểu', value: sbFormatVnd(type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit), inline: true }
         );
 
         const embed = new EmbedBuilder()
@@ -4096,7 +4027,7 @@ async function sbBuildPlanMenu(type) {
 }
 
 function sbSetupPaymentModal(type, plan) {
-    const minDeposit = sbGetMinDeposit(type);
+    const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit;
     const modal = new ModalBuilder()
         .setCustomId(`sb_payment_modal_${type}_${plan}`)
         .setTitle(type === 'seller' ? `👑 Thanh toán Seller • ${sbPlanLabel(plan)}` : `🛠️ Thanh toán Builder • ${sbPlanLabel(plan)}`);
@@ -5015,7 +4946,7 @@ async function sbAdminAdd(interaction, type, userId, plan, deposit, shopName) {
         shopSlug: '',
         channelId: null,
         categoryId: sbCategoryId(type),
-        deposit: Math.max(sbGetMinDeposit(type), Number(deposit) || 0),
+        deposit: type === 'seller' ? Math.max(SB_ENV.sellerMinDeposit, Number(deposit) || 0) : Math.max(SB_ENV.builderMinDeposit, Number(deposit) || 0),
         plan: plan || 'monthly',
         startDate: now.toISOString(),
         expireDate: new Date(now.getTime() + sbPlanDays(plan || 'monthly') * 86400000).toISOString(),
@@ -5114,34 +5045,6 @@ async function sbAdminSetPlan(interaction, type, plan, price) {
     const key = type === 'seller' ? (plan === 'weekly' ? 'sellerWeeklyPrice' : 'sellerMonthlyPrice') : (plan === 'weekly' ? 'builderWeeklyPrice' : 'builderMonthlyPrice');
     sbSetConfig({ [key]: Math.max(0, Number(price) || 0) });
     return safeReply(interaction, { content: `✅ Giá ${type} ${sbPlanLabel(plan)} đã đổi thành **${sbFormatVnd(price)}**.`, flags: MessageFlags.Ephemeral });
-}
-
-async function sbSetDepositCommand(interaction) {
-    if (!isAdminUser(interaction)) {
-        return safeReply(interaction, { content: '❌ Chỉ Admin.', flags: MessageFlags.Ephemeral });
-    }
-
-    const type = interaction.options.getString('type');
-    const amount = interaction.options.getInteger('amount');
-    const key = type === 'seller' ? 'sellerMinDeposit' : 'builderMinDeposit';
-    const oldAmount = sbGetMinDeposit(type);
-    const newAmount = Math.max(0, Number(amount) || 0);
-
-    sbSetConfig({ [key]: newAmount });
-
-    const cfg = sbGetConfig();
-    if (cfg.panel?.channelId && cfg.panel?.messageId) {
-        const channel = await client.channels.fetch(String(cfg.panel.channelId)).catch(() => null);
-        if (channel?.isTextBased()) {
-            const msg = await channel.messages.fetch(String(cfg.panel.messageId)).catch(() => null);
-            if (msg) await msg.edit(sbApplicationPanel()).catch(() => {});
-        }
-    }
-
-    return safeReply(interaction, {
-        content: `✅ Đã đổi **cọc tối thiểu ${type === 'seller' ? 'Seller' : 'Builder'}** từ **${sbFormatVnd(oldAmount)}** → **${sbFormatVnd(newAmount)}**.`,
-        flags: MessageFlags.Ephemeral
-    });
 }
 
 async function sbHandleCommand(interaction) {
@@ -5247,17 +5150,17 @@ async function sbHandleButton(interaction) {
             flags: MessageFlags.Ephemeral
         });
     }
-    if (id === 'sb_apply_seller') return safeShowModal(interaction, sbApplicationModal('seller'), 'sb_apply_seller');
-    if (id === 'sb_apply_builder') return safeShowModal(interaction, sbApplicationModal('builder'), 'sb_apply_builder');
+    if (id === 'sb_apply_seller') return interaction.showModal(sbApplicationModal('seller'));
+    if (id === 'sb_apply_builder') return interaction.showModal(sbApplicationModal('builder'));
     if (id === 'sb_begin_setup_seller') return sbHandleBeginSetup(interaction, 'seller');
     if (id === 'sb_begin_setup_builder') return sbHandleBeginSetup(interaction, 'builder');
     if (id === 'sb_setup_shop_seller') {
         const modal = new ModalBuilder().setCustomId('sb_shop_name_seller').setTitle('👑 SETUP SHOP SELLER').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop_name').setLabel('Tên Shop').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Khang Store').setRequired(true).setMaxLength(50)));
-        return safeShowModal(interaction, modal, 'sb_setup_shop_seller');
+        return interaction.showModal(modal);
     }
     if (id === 'sb_setup_shop_builder') {
         const modal = new ModalBuilder().setCustomId('sb_shop_name_builder').setTitle('🛠️ SETUP BUILDER').addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('shop_name').setLabel('Tên Builder').setStyle(TextInputStyle.Short).setPlaceholder('Ví dụ: Khang').setRequired(true).setMaxLength(50)));
-        return safeShowModal(interaction, modal, 'sb_setup_shop_builder');
+        return interaction.showModal(modal);
     }
     if (id.startsWith('sb_pay_approve_')) return sbHandlePaymentApproval(interaction, id.replace('sb_pay_approve_', ''));
     return false;
@@ -5290,7 +5193,7 @@ async function sbHandleSelect(interaction) {
             sbSaveDataForType('builder', data);
             return safeEditReply(interaction, { content: '✅ Builder không có phí được cấu hình. Bạn có thể đặt tên Builder ngay.', components: [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('sb_setup_shop_builder').setLabel('🛠️ Đặt tên Builder').setStyle(ButtonStyle.Primary))] });
         }
-        return safeShowModal(interaction, sbSetupPaymentModal(type, plan), `sb_plan_select_${type}`);
+        return interaction.showModal(sbSetupPaymentModal(type, plan));
     }
     return false;
 }
@@ -5303,7 +5206,7 @@ async function sbHandleModal(interaction) {
         const type = parts[3];
         const plan = parts[4];
         const deposit = sbParseVnd(interaction.fields.getTextInputValue('deposit'));
-        const minDeposit = sbGetMinDeposit(type);
+        const minDeposit = type === 'seller' ? SB_ENV.sellerMinDeposit : SB_ENV.builderMinDeposit;
         if (deposit < minDeposit) return safeReply(interaction, { content: `❌ Cọc tối thiểu là **${sbFormatVnd(minDeposit)}**.`, flags: MessageFlags.Ephemeral });
         if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
         return sbCreatePaymentTicket(interaction, type, plan, deposit);
@@ -5374,7 +5277,6 @@ const MONEY_COMMAND_NAMES = [
 ];
 
 const SELLER_BUILDER_COMMAND_NAMES = ['seller', 'builder'];
-const DEPOSIT_COMMAND_NAMES = ['coc'];
 
 const THU_MONEY_COMMAND_NAMES = [
     'thumoney', 'thu-time'
@@ -5474,25 +5376,6 @@ const commands = [
     new SlashCommandBuilder()
         .setName('tuyendung')
         .setDescription('Tạo panel tuyển dụng Seller / Builder cố định'),
-
-    new SlashCommandBuilder()
-        .setName('coc')
-        .setDescription('Đổi mức cọc tối thiểu khi tuyển dụng')
-        .addStringOption(o => o
-            .setName('type')
-            .setDescription('Loại tuyển dụng')
-            .addChoices(
-                { name: 'Seller', value: 'seller' },
-                { name: 'Builder', value: 'builder' }
-            )
-            .setRequired(true)
-        )
-        .addIntegerOption(o => o
-            .setName('amount')
-            .setDescription('Mức cọc tối thiểu (VNĐ)')
-            .setMinValue(0)
-            .setRequired(true)
-        ),
 
     new SlashCommandBuilder()
         .setName('seller')
@@ -5810,38 +5693,9 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
-        const interactionAge = logInteractionLatency(
-            interaction,
-            interaction.isButton() ? interaction.customId : interaction.commandName || interaction.customId
-        );
-
-        // Phải xử lý các nút mở Modal ngay lập tức.
-        if (interaction.isButton() && ['buy_bank', 'buy_card', 'calc_price'].includes(interaction.customId)) {
-            if (interactionAge >= 2500) {
-                console.warn(`⚠️ ${interaction.customId} nhận quá muộn (${interactionAge}ms). Kiểm tra duplicate bot process/session nếu vẫn tái diễn.`);
-            }
-            return await showMoneyModal(interaction, interaction.customId);
-        }
-
-        if (interaction.isButton() && ['sb_apply_seller', 'sb_apply_builder', 'sb_setup_shop_seller', 'sb_setup_shop_builder'].includes(interaction.customId)) {
-            if (interactionAge >= 2500) {
-                console.warn(`⚠️ ${interaction.customId} nhận quá muộn (${interactionAge}ms). Kiểm tra duplicate bot process/session nếu vẫn tái diễn.`);
-            }
-            return await sbHandleButton(interaction);
-        }
-
-        if (interaction.isModalSubmit()) {
-            // Modal Submit cũng phải được acknowledge ngay; phần tạo ticket phía sau có thể mất nhiều giây.
-            if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
-        }
-
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === 'tuyendung') {
                 return await sbSetupSlashCommand(interaction);
-            }
-
-            if (DEPOSIT_COMMAND_NAMES.includes(interaction.commandName)) {
-                return await sbSetDepositCommand(interaction);
             }
 
             if (SELLER_BUILDER_COMMAND_NAMES.includes(interaction.commandName)) {
@@ -5883,10 +5737,10 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             if (id === 'ticket_change_seller') {
-                if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
-                return safeEditReply(interaction, {
+                return safeReply(interaction, {
                     content: '🔄 **Chọn Seller bạn yêu thích để chuyển sang:**',
-                    components: [await buildSellerSelectMenu(interaction.guild)]
+                    components: [await buildSellerSelectMenu(interaction.guild)],
+                    flags: MessageFlags.Ephemeral
                 });
             }
 
@@ -5938,10 +5792,10 @@ client.on(Events.InteractionCreate, async interaction => {
             if (id === 'ticket_type_select') {
                 const type = interaction.values[0];
                 if (type === 'buy_items') {
-                    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
-                    return safeEditReply(interaction, {
+                    return safeReply(interaction, {
                         content: '🛒 **Chọn Seller bạn yêu thích:**\n\nTên Seller ở trên, trạng thái Online/Offline ở dưới.',
-                        components: [await buildSellerSelectMenu(interaction.guild)]
+                        components: [await buildSellerSelectMenu(interaction.guild)],
+                        flags: MessageFlags.Ephemeral
                     });
                 }
                 return await createGeneralTicket(interaction, type);
@@ -5990,12 +5844,6 @@ client.on(Events.InteractionCreate, async interaction => {
                 return await handleMoneyModal(interaction);
             }
 
-            if (!interaction.replied && !interaction.deferred) {
-                return safeReply(interaction, {
-                    content: '❌ Interaction này không còn được hỗ trợ hoặc đã hết hạn.',
-                    flags: MessageFlags.Ephemeral
-                });
-            }
             return;
         }
     } catch (err) {
@@ -6032,7 +5880,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
 client.once(Events.ClientReady, async c => {
     console.log(
-        `🤖 Bot đã online thành công: ${c.user.tag} | PID=${process.pid} | HOST=${process.env.HOSTNAME || 'unknown'}`
+        `🤖 Bot đã online thành công: ${c.user.tag}`
     );
 
     ensureJsonFile(STOCK_FILE, { stockM: 5000 });
@@ -6071,95 +5919,25 @@ process.on('uncaughtException', err => {
 });
 
 // ============================================================
-// 24. LOGIN — Render-safe / discord.js standard Gateway
+// 24. LOGIN
 // ============================================================
 
-const botToken = process.env.DISCORD_TOKEN || process.env.TOKEN;
+const botToken =
+    process.env.DISCORD_TOKEN ||
+    process.env.TOKEN;
 
 console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
 console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
-console.log(`🧾 [BOOT] PID=${process.pid} HOST=${process.env.HOSTNAME || 'unknown'}`);
-console.log(`🔐 [BOOT] Token present=${Boolean(botToken)} length=${botToken ? botToken.length : 0}`);
-console.log(`🆔 [BOOT] CLIENT_ID present=${Boolean(process.env.CLIENT_ID || process.env.APPLICATION_ID)} GUILD_ID present=${Boolean(process.env.GUILD_ID)}`);
 
-function getWsStatusName(status) {
-    const names = {
-        0: 'READY',
-        1: 'CONNECTING',
-        2: 'AUTHENTICATING',
-        3: 'CONNECTED',
-        4: 'DISCONNECTING',
-        5: 'DISCONNECTED',
-        6: 'WAITING_FOR_AUTHENTICATION',
-        7: 'IDENTIFYING',
-        8: 'RESUMING',
-        9: 'IDLE'
-    };
-    return names[status] || (status === undefined || status === null ? 'UNKNOWN' : String(status));
+if (!botToken) {
+    console.error(
+        '❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong .env!'
+    );
+} else {
+    client.login(botToken).catch(err => {
+        console.error(
+            '❌ Login Discord thất bại:',
+            err.message
+        );
+    });
 }
-
-client.on('debug', info => {
-    if (/identify|session|gateway|resume|heartbeat|disallowed|close|disconnect|ws|hello/i.test(info)) {
-        console.log(`🛰️ [DISCORD DEBUG] ${info}`);
-    }
-});
-client.on('warn', warning => console.warn('⚠️ [DISCORD WARN]', warning));
-client.on('error', err => console.error('❌ [DISCORD CLIENT ERROR]', err));
-client.on('shardError', (error, shardId) => console.error(`❌ [DISCORD SHARD ERROR] shard=${shardId}`, error));
-client.on('shardDisconnect', (event, shardId) => console.error(`🔌 [DISCORD SHARD DISCONNECT] shard=${shardId} code=${event?.code ?? 'unknown'} reason=${event?.reason || 'unknown'}`));
-client.on('shardReconnecting', shardId => console.warn(`🔄 [DISCORD RECONNECTING] shard=${shardId}`));
-client.on('shardReady', (shardId, unavailableGuilds) => console.log(`✅ [DISCORD SHARD READY] shard=${shardId} unavailableGuilds=${unavailableGuilds?.size ?? 0}`));
-
-let shuttingDown = false;
-async function gracefulShutdown(signal) {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`🛑 [SHUTDOWN] Nhận ${signal}, đóng Discord client...`);
-    try { client.destroy(); } catch (err) {
-        console.error('❌ Lỗi khi destroy Discord client:', err?.message || err);
-    }
-    setTimeout(() => process.exit(0), 500).unref?.();
-}
-process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.once('SIGINT', () => gracefulShutdown('SIGINT'));
-
-async function connectDiscord() {
-    if (!botToken) {
-        console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong Environment Variables!');
-        process.exitCode = 1;
-        return;
-    }
-
-    console.log('🔐 [LOGIN] Đang dùng Gateway chuẩn của discord.js (không custom Gateway URL).');
-    console.log(`🛰️ [LOGIN] WS status trước login: ${getWsStatusName(client.ws?.status)}`);
-
-    let readyLogged = false;
-    const markReady = () => {
-        readyLogged = true;
-        console.log(`🎉 [LOGIN] Discord READY thành công. User=${client.user?.tag || client.user?.username || 'unknown'} Guilds=${client.guilds.cache.size}`);
-    };
-    client.once(Events.ClientReady, markReady);
-
-    try {
-        // Không probe /gateway hay /gateway/bot thủ công. discord.js tự lấy
-        // Gateway info bằng REST có auth và tự quản lý reconnect/session.
-        await client.login(botToken);
-        if (!readyLogged && !client.isReady()) {
-            throw new Error(`client.login() hoàn tất nhưng Client chưa READY (ws=${getWsStatusName(client.ws?.status)})`);
-        }
-    } catch (err) {
-        console.error('❌ [LOGIN] Discord login thất bại:', err?.stack || err?.message || err);
-        const code = err?.code;
-        if (code === 4004) {
-            console.error('🔐 [LOGIN] Discord báo 4004: Bot Token không hợp lệ.');
-        } else if (code === 4014) {
-            console.error('🔐 [LOGIN] Discord báo 4014: Privileged Gateway Intents chưa được bật trong Developer Portal.');
-        } else {
-            console.error('ℹ️ [LOGIN] Không nhận được READY. Kiểm tra tiếp các dòng [SHARD ERROR]/[DISCORD DEBUG].');
-        }
-        process.exitCode = 1;
-        return;
-    }
-}
-
-void connectDiscord();
