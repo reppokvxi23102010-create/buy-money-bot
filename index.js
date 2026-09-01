@@ -27,6 +27,13 @@ const MONEY_ADMIN_CHECK_ID = '1458470035763888250';
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const dns = require('dns');
+
+// Prefer IPv4 on hosts where IPv6/DNS routing is unreliable (e.g. some Render regions).
+try {
+    dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
 
 const {
     Client,
@@ -83,7 +90,15 @@ console.log('🔌 [INTENTS] Guilds=true GuildMessages=true' +
     ` GuildMembers=${wantsGuildMembers}` +
     ` GuildPresences=${wantsGuildPresences}`);
 
-const client = new Client({ intents: discordIntents });
+const client = new Client({
+    intents: discordIntents,
+    rest: { timeout: 15_000, retries: 2 },
+    ws: {
+        handshakeTimeout: 15_000,
+        helloTimeout: 15_000,
+        readyTimeout: 30_000
+    }
+});
 
 // ============================================================
 // 3. CONFIG
@@ -6086,32 +6101,125 @@ console.log(`🔐 [BOOT] Token present=${Boolean(botToken)} length=${botToken ? 
 console.log(`🆔 [BOOT] CLIENT_ID present=${Boolean(process.env.CLIENT_ID || process.env.APPLICATION_ID)} GUILD_ID present=${Boolean(process.env.GUILD_ID)}`);
 
 client.on('debug', info => {
-    if (/identify|session|gateway|resume|heartbeat|disallowed|close|disconnect/i.test(info)) {
+    if (/identify|session|gateway|resume|heartbeat|disallowed|close|disconnect|ws/i.test(info)) {
         console.log(`🛰️ [DISCORD DEBUG] ${info}`);
     }
 });
+client.on('warn', warning => console.warn('⚠️ [DISCORD WARN]', warning));
 client.on('error', err => console.error('❌ [DISCORD CLIENT ERROR]', err));
 client.on('shardError', (error, shardId) => console.error(`❌ [DISCORD SHARD ERROR] shard=${shardId}`, error));
 client.on('shardDisconnect', (event, shardId) => console.error(`🔌 [DISCORD SHARD DISCONNECT] shard=${shardId} code=${event?.code ?? 'unknown'} reason=${event?.reason || 'unknown'}`));
 client.on('shardReconnecting', shardId => console.warn(`🔄 [DISCORD RECONNECTING] shard=${shardId}`));
 client.on('shardReady', (shardId, unavailableGuilds) => console.log(`✅ [DISCORD SHARD READY] shard=${shardId} unavailableGuilds=${unavailableGuilds?.size ?? 0}`));
 
-if (!botToken) {
-    console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong Environment Variables!');
-} else {
-    console.log('🚀 [LOGIN] Đang kết nối Discord Gateway...');
-    const loginStartedAt = Date.now();
-    client.login(botToken)
-        .then(tokenUser => console.log(`✅ [LOGIN] Promise resolved sau ${Date.now() - loginStartedAt}ms (${tokenUser})`))
-        .catch(err => {
-            console.error('❌ [LOGIN] Discord login thất bại:', err);
-            if (err?.code === 4014 || /disallowed intent/i.test(err?.message || '')) {
-                console.error('🚨 [LOGIN] Privileged Intent bị Discord từ chối. Kiểm tra Developer Portal → Bot → Privileged Gateway Intents.');
-            }
+function httpProbe(url, options = {}, timeoutMs = 12_000) {
+    return new Promise((resolve, reject) => {
+        const started = Date.now();
+        const req = https.request(url, {
+            method: options.method || 'GET',
+            headers: options.headers || {},
+            timeout: timeoutMs
+        }, res => {
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', chunk => { body += chunk; });
+            res.on('end', () => {
+                resolve({
+                    statusCode: res.statusCode || 0,
+                    headers: res.headers,
+                    body,
+                    elapsedMs: Date.now() - started
+                });
+            });
         });
-    setTimeout(() => {
-        if (!client.isReady()) {
-            console.error('⏱️ [LOGIN TIMEOUT] Sau 20 giây bot vẫn chưa ClientReady.');
-        }
-    }, 20_000).unref();
+        req.on('timeout', () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
+        req.on('error', reject);
+        req.end();
+    });
 }
+
+async function diagnoseDiscordNetwork() {
+    console.log('🧪 [NET] Bắt đầu kiểm tra DNS/HTTPS Discord...');
+    try {
+        const lookup = await dns.promises.lookup('discord.com', { all: true });
+        console.log(`✅ [NET] DNS discord.com: ${lookup.map(x => `${x.address}/${x.family}`).join(', ')}`);
+    } catch (err) {
+        console.error(`❌ [NET] DNS discord.com thất bại: ${err?.code || ''} ${err?.message || err}`);
+        throw new Error('DNS discord.com không phân giải được');
+    }
+
+    try {
+        const res = await httpProbe('https://discord.com/api/v10/gateway');
+        console.log(`✅ [NET] GET /gateway -> HTTP ${res.statusCode} trong ${res.elapsedMs}ms`);
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+            throw new Error(`Discord /gateway trả HTTP ${res.statusCode}`);
+        }
+    } catch (err) {
+        console.error(`❌ [NET] HTTPS Discord thất bại: ${err?.code || ''} ${err?.message || err}`);
+        throw err;
+    }
+
+    if (botToken) {
+        try {
+            const res = await httpProbe('https://discord.com/api/v10/gateway/bot', {
+                headers: { Authorization: `Bot ${botToken}` }
+            });
+            console.log(`✅ [NET] GET /gateway/bot -> HTTP ${res.statusCode} trong ${res.elapsedMs}ms`);
+            if (res.statusCode === 401) throw new Error('Bot Token bị Discord từ chối (401 Unauthorized)');
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+                throw new Error(`Discord /gateway/bot trả HTTP ${res.statusCode}`);
+            }
+        } catch (err) {
+            console.error(`❌ [NET] Bot Gateway probe thất bại: ${err?.message || err}`);
+            throw err;
+        }
+    }
+}
+
+async function connectDiscordWithRetry() {
+    if (!botToken) {
+        console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong Environment Variables!');
+        return;
+    }
+
+    const maxAttempts = Math.max(1, Number(process.env.DISCORD_LOGIN_ATTEMPTS) || 5);
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (attempt > 1) {
+                const delay = Math.min(30_000, 3_000 * 2 ** (attempt - 2));
+                console.log(`🔄 [LOGIN] Chờ ${delay}ms trước lần thử ${attempt}/${maxAttempts}...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+
+            console.log(`🚀 [LOGIN] Attempt ${attempt}/${maxAttempts}`);
+            await diagnoseDiscordNetwork();
+
+            const loginStartedAt = Date.now();
+            console.log('🔐 [LOGIN] Đang gọi client.login()...');
+            await client.login(botToken);
+            console.log(`✅ [LOGIN] client.login() resolved sau ${Date.now() - loginStartedAt}ms`);
+
+            const readyDeadline = Date.now() + 35_000;
+            while (!client.isReady() && Date.now() < readyDeadline) {
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+
+            if (!client.isReady()) {
+                throw new Error('Gateway kết nối nhưng không nhận READY trong 35 giây');
+            }
+
+            console.log(`🎉 [LOGIN] Discord READY thành công. Guilds=${client.guilds.cache.size}`);
+            return;
+        } catch (err) {
+            console.error(`❌ [LOGIN] Lần ${attempt}/${maxAttempts} thất bại:`, err);
+            if (attempt < maxAttempts) {
+                try { client.destroy(); } catch (_) {}
+            }
+        }
+    }
+
+    console.error('🛑 [LOGIN] Không thể kết nối Discord sau nhiều lần thử. Render sẽ restart process nếu cấu hình restart policy cho service.');
+}
+
+void connectDiscordWithRetry();
