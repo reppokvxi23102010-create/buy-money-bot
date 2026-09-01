@@ -154,6 +154,19 @@ function writeJson(file, data) {
 // Chống cùng một Interaction bị xử lý 2 lần trong cùng process.
 const seenInteractions = new Set();
 
+function getInteractionAgeMs(interaction) {
+    const created = Number(interaction?.createdTimestamp);
+    return Number.isFinite(created) ? Math.max(0, Date.now() - created) : 0;
+}
+
+function logInteractionLatency(interaction, label = '') {
+    const age = getInteractionAgeMs(interaction);
+    if (age >= 1500) {
+        console.warn(`🐢 [Interaction] ${label || interaction?.customId || interaction?.commandName || 'unknown'} đang trễ ${age}ms`);
+    }
+    return age;
+}
+
 function claimInteraction(interaction) {
     if (seenInteractions.has(interaction.id)) return false;
 
@@ -166,6 +179,11 @@ function claimInteraction(interaction) {
     return true;
 }
 
+function isUnknownInteractionError(err) {
+    return err?.code === 10062 ||
+        String(err?.message || '').toLowerCase().includes('unknown interaction');
+}
+
 async function safeReply(interaction, data) {
     try {
         if (interaction.replied || interaction.deferred) {
@@ -175,6 +193,10 @@ async function safeReply(interaction, data) {
     } catch (err) {
         if (err?.code === 40060) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge trước đó.`);
+            return null;
+        }
+        if (isUnknownInteractionError(err)) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước khi reply (${getInteractionAgeMs(interaction)}ms).`);
             return null;
         }
 
@@ -193,6 +215,10 @@ async function safeDeferReply(interaction, data = {}) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
             return false;
         }
+        if (isUnknownInteractionError(err)) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước deferReply (${getInteractionAgeMs(interaction)}ms).`);
+            return false;
+        }
 
         console.error('Lỗi deferReply:', err.message);
         return false;
@@ -209,6 +235,10 @@ async function safeDeferUpdate(interaction) {
             console.log(`⚠️ Interaction ${interaction.id} đã được acknowledge.`);
             return false;
         }
+        if (isUnknownInteractionError(err)) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước deferUpdate (${getInteractionAgeMs(interaction)}ms).`);
+            return false;
+        }
 
         console.error('Lỗi deferUpdate:', err.message);
         return false;
@@ -223,6 +253,10 @@ async function safeEditReply(interaction, data) {
 
         return await interaction.editReply(data);
     } catch (err) {
+        if (isUnknownInteractionError(err)) {
+            console.warn(`⏱️ Interaction ${interaction.id} đã hết hạn trước editReply (${getInteractionAgeMs(interaction)}ms).`);
+            return null;
+        }
         console.error('Lỗi editReply:', err.message);
         return null;
     }
@@ -1411,6 +1445,111 @@ async function handleMoneyCommand(interaction) {
 // 11. MONEY BUTTONS
 // ============================================================
 
+// Modal phải là phản hồi đầu tiên của Button Interaction.
+// Không defer/reply trước showModal và không thực hiện request mạng trước đó.
+async function showMoneyModal(interaction, id) {
+    logInteractionLatency(interaction, id);
+
+    let modal;
+
+    if (id === 'buy_bank') {
+        modal = new ModalBuilder()
+            .setCustomId('modal_bank')
+            .setTitle(`Mua Bank - Rate ${RATE}đ/1M`)
+            .addComponents(
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('bank_name')
+                        .setLabel('Tên Ingame')
+                        .setStyle(TextInputStyle.Short)
+                        .setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('bank_vnd')
+                        .setLabel('Số tiền nạp (VNĐ)')
+                        .setStyle(TextInputStyle.Short)
+                        .setPlaceholder('Ví dụ: 10k, 20k, 50k')
+                        .setRequired(true)
+                )
+            );
+    } else if (id === 'buy_card') {
+        modal = new ModalBuilder()
+            .setCustomId('modal_card')
+            .setTitle(`Nạp Thẻ - Rate ${RATE}đ/1M`)
+            .addComponents(
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('card_ign')
+                        .setLabel('Tên Ingame')
+                        .setStyle(TextInputStyle.Short)
+                        .setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('card_type')
+                        .setLabel('Loại thẻ')
+                        .setStyle(TextInputStyle.Short)
+                        .setPlaceholder('Viettel, Zing...')
+                        .setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('card_val')
+                        .setLabel('Mệnh giá thẻ')
+                        .setStyle(TextInputStyle.Short)
+                        .setPlaceholder('10k, 20k, 50k...')
+                        .setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('card_code')
+                        .setLabel('Mã thẻ (Pin)')
+                        .setStyle(TextInputStyle.Short)
+                        .setRequired(true)
+                ),
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('card_seri')
+                        .setLabel('Mã Seri')
+                        .setStyle(TextInputStyle.Short)
+                        .setRequired(true)
+                )
+            );
+    } else if (id === 'calc_price') {
+        modal = new ModalBuilder()
+            .setCustomId('modal_calc')
+            .setTitle('Tính Tiền Money')
+            .addComponents(
+                new ActionRowBuilder().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('calc_money')
+                        .setLabel('Nhập số Money (b, m, k)')
+                        .setStyle(TextInputStyle.Short)
+                        .setRequired(true)
+                )
+            );
+    }
+
+    if (!modal) return false;
+
+    try {
+        await interaction.showModal(modal);
+        return true;
+    } catch (err) {
+        if (err?.code === 40060) {
+            console.log(`⚠️ Modal ${id} đã được acknowledge.`);
+            return true;
+        }
+        if (isUnknownInteractionError(err)) {
+            console.warn(`⏱️ Modal ${id} không gửi được: interaction ${interaction.id} đã hết hạn ở ${getInteractionAgeMs(interaction)}ms.`);
+            return true;
+        }
+        console.error(`Lỗi show modal ${id}:`, err);
+        return true;
+    }
+}
+
 async function handleMoneyButton(interaction) {
     const id = interaction.customId;
 
@@ -1614,120 +1753,9 @@ async function handleMoneyButton(interaction) {
         });
     }
 
-    if (id === 'buy_bank') {
-        const modal = new ModalBuilder()
-            .setCustomId('modal_bank')
-            .setTitle(`Mua Bank - Rate ${RATE}đ/1M`);
-
-        modal.addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('bank_name')
-                    .setLabel('Tên Ingame')
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('bank_vnd')
-                    .setLabel('Số tiền nạp (VNĐ)')
-                    .setStyle(TextInputStyle.Short)
-                    .setPlaceholder('Ví dụ: 10k, 20k, 50k')
-                    .setRequired(true)
-            )
-        );
-
-        try {
-            return await interaction.showModal(modal);
-        } catch (err) {
-            if (err?.code === 40060) {
-                console.log('⚠️ Modal bank đã được acknowledge.');
-                return;
-            }
-            console.error('Lỗi show modal bank:', err.message);
-        }
-    }
-
-    if (id === 'buy_card') {
-        const modal = new ModalBuilder()
-            .setCustomId('modal_card')
-            .setTitle(`Nạp Thẻ - Rate ${RATE}đ/1M`);
-
-        modal.addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('card_ign')
-                    .setLabel('Tên Ingame')
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('card_type')
-                    .setLabel('Loại thẻ')
-                    .setStyle(TextInputStyle.Short)
-                    .setPlaceholder('Viettel, Zing...')
-                    .setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('card_val')
-                    .setLabel('Mệnh giá thẻ')
-                    .setStyle(TextInputStyle.Short)
-                    .setPlaceholder('10k, 20k, 50k...')
-                    .setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('card_code')
-                    .setLabel('Mã thẻ (Pin)')
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true)
-            ),
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('card_seri')
-                    .setLabel('Mã Seri')
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true)
-            )
-        );
-
-        try {
-            return await interaction.showModal(modal);
-        } catch (err) {
-            if (err?.code === 40060) {
-                console.log('⚠️ Modal card đã được acknowledge.');
-                return;
-            }
-            console.error('Lỗi show modal card:', err.message);
-        }
-    }
-
-    if (id === 'calc_price') {
-        const modal = new ModalBuilder()
-            .setCustomId('modal_calc')
-            .setTitle('Tính Tiền Money');
-
-        modal.addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('calc_money')
-                    .setLabel('Nhập số Money (b, m, k)')
-                    .setStyle(TextInputStyle.Short)
-                    .setRequired(true)
-            )
-        );
-
-        try {
-            return await interaction.showModal(modal);
-        } catch (err) {
-            if (err?.code === 40060) {
-                console.log('⚠️ Modal calc đã được acknowledge.');
-                return;
-            }
-            console.error('Lỗi show modal calc:', err.message);
-        }
+    // Modal buttons are intentionally handled before any defer/reply.
+    if (id === 'buy_bank' || id === 'buy_card' || id === 'calc_price') {
+        return showMoneyModal(interaction, id);
     }
 
     if (id === 'guide') {
@@ -5752,6 +5780,24 @@ client.on(Events.InteractionCreate, async interaction => {
             return;
         }
 
+        const interactionAge = logInteractionLatency(
+            interaction,
+            interaction.isButton() ? interaction.customId : interaction.commandName || interaction.customId
+        );
+
+        // Phải xử lý các nút mở Modal ngay lập tức.
+        if (interaction.isButton() && ['buy_bank', 'buy_card', 'calc_price'].includes(interaction.customId)) {
+            if (interactionAge >= 2500) {
+                console.warn(`⚠️ ${interaction.customId} nhận quá muộn (${interactionAge}ms). Kiểm tra duplicate bot process/session nếu vẫn tái diễn.`);
+            }
+            return await showMoneyModal(interaction, interaction.customId);
+        }
+
+        if (interaction.isModalSubmit()) {
+            // Modal Submit cũng phải được acknowledge ngay; phần tạo ticket phía sau có thể mất nhiều giây.
+            if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+        }
+
         if (interaction.isChatInputCommand()) {
             if (interaction.commandName === 'tuyendung') {
                 return await sbSetupSlashCommand(interaction);
@@ -5800,10 +5846,10 @@ client.on(Events.InteractionCreate, async interaction => {
             }
 
             if (id === 'ticket_change_seller') {
-                return safeReply(interaction, {
+                if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+                return safeEditReply(interaction, {
                     content: '🔄 **Chọn Seller bạn yêu thích để chuyển sang:**',
-                    components: [await buildSellerSelectMenu(interaction.guild)],
-                    flags: MessageFlags.Ephemeral
+                    components: [await buildSellerSelectMenu(interaction.guild)]
                 });
             }
 
@@ -5855,10 +5901,10 @@ client.on(Events.InteractionCreate, async interaction => {
             if (id === 'ticket_type_select') {
                 const type = interaction.values[0];
                 if (type === 'buy_items') {
-                    return safeReply(interaction, {
+                    if (!(await safeDeferReply(interaction, { flags: MessageFlags.Ephemeral }))) return;
+                    return safeEditReply(interaction, {
                         content: '🛒 **Chọn Seller bạn yêu thích:**\n\nTên Seller ở trên, trạng thái Online/Offline ở dưới.',
-                        components: [await buildSellerSelectMenu(interaction.guild)],
-                        flags: MessageFlags.Ephemeral
+                        components: [await buildSellerSelectMenu(interaction.guild)]
                     });
                 }
                 return await createGeneralTicket(interaction, type);
@@ -5943,7 +5989,7 @@ client.on(Events.InteractionCreate, async interaction => {
 
 client.once(Events.ClientReady, async c => {
     console.log(
-        `🤖 Bot đã online thành công: ${c.user.tag}`
+        `🤖 Bot đã online thành công: ${c.user.tag} | PID=${process.pid} | HOST=${process.env.HOSTNAME || 'unknown'}`
     );
 
     ensureJsonFile(STOCK_FILE, { stockM: 5000 });
@@ -5984,6 +6030,23 @@ process.on('uncaughtException', err => {
 // ============================================================
 // 24. LOGIN
 // ============================================================
+
+// Khi Render restart/deploy, đóng Gateway sạch để tránh session cũ tranh interaction với instance mới.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`🛑 [SHUTDOWN] Nhận ${signal}, đóng Discord client...`);
+    try {
+        client.destroy();
+    } catch (err) {
+        console.error('❌ Lỗi khi destroy Discord client:', err?.message || err);
+    }
+    setTimeout(() => process.exit(0), 250);
+}
+
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 
 const botToken =
     process.env.DISCORD_TOKEN ||
