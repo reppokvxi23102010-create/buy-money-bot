@@ -6159,6 +6159,42 @@ async function diagnoseDiscordNetwork({includeGatewayProbe = false} = {}) {
     throw new Error(`Discord /gateway trả HTTP ${res.statusCode}`);
 }
 
+function wait(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getWsStatusName(status) {
+    const names = {
+        0: 'READY',
+        1: 'CONNECTING',
+        2: 'RECONNECTING',
+        3: 'IDLE',
+        4: 'NEARLY',
+        5: 'DISCONNECTED',
+        6: 'WAITING_FOR_AUTHENTICATION'
+    };
+    return names[status] || String(status ?? 'unknown');
+}
+
+async function loginWithTimeout(token, timeoutMs) {
+    const started = Date.now();
+    let timer;
+    try {
+        const loginPromise = client.login(token);
+        const timeoutPromise = new Promise((_, reject) => {
+            timer = setTimeout(() => {
+                reject(new Error(`client.login() timeout sau ${timeoutMs}ms (ws=${getWsStatusName(client.ws?.status)})`));
+            }, timeoutMs);
+            timer.unref?.();
+        });
+        const result = await Promise.race([loginPromise, timeoutPromise]);
+        console.log(`✅ [LOGIN] client.login() resolved sau ${Date.now() - started}ms`);
+        return result;
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 async function connectDiscordWithRetry() {
     if (!botToken) {
         console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong Environment Variables!');
@@ -6167,8 +6203,8 @@ async function connectDiscordWithRetry() {
 
     const maxAttempts = Math.max(1, Number(process.env.DISCORD_LOGIN_ATTEMPTS) || 6);
     const firstDelay = Math.max(5000, Number(process.env.DISCORD_LOGIN_FIRST_DELAY) || 5000);
+    const loginTimeout = Math.max(15000, Number(process.env.DISCORD_LOGIN_TIMEOUT) || 35000);
 
-    // Chỉ kiểm tra DNS một lần trước khi login. Không spam /gateway.
     try {
         await diagnoseDiscordNetwork({ includeGatewayProbe: false });
     } catch (err) {
@@ -6178,49 +6214,44 @@ async function connectDiscordWithRetry() {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             if (attempt > 1) {
-                const delay = Math.min(60_000, firstDelay * 2 ** (attempt - 2));
+                const base = Math.min(60000, firstDelay * 2 ** (attempt - 2));
+                const jitter = Math.floor(Math.random() * 1500);
+                const delay = base + jitter;
                 console.log(`🔄 [LOGIN] Chờ ${delay}ms trước lần thử ${attempt}/${maxAttempts}...`);
-                await new Promise(resolve => setTimeout(resolve, delay));
+                await wait(delay);
             }
 
             console.log(`🚀 [LOGIN] Attempt ${attempt}/${maxAttempts}`);
-            const loginStartedAt = Date.now();
+            console.log(`🛰️ [LOGIN] Gateway WS status trước login: ${getWsStatusName(client.ws?.status)}`);
 
-            // Nếu có client state cũ từ attempt trước thì hủy sạch trước khi login lại.
-            try {
-                if (client.ws?.status !== 0 && client.ws?.status !== undefined) {
+            // Không destroy trước lần login đầu tiên. Việc destroy trước đó gây log
+            // "Manager was destroyed" và không giúp ích cho một client vừa khởi tạo.
+            if (attempt > 1) {
+                try {
                     client.destroy();
+                    await wait(500);
+                } catch (destroyErr) {
+                    console.warn(`⚠️ [LOGIN] destroy client cũ: ${destroyErr?.message || destroyErr}`);
                 }
-            } catch (_) {}
+            }
 
             console.log('🔐 [LOGIN] Đang gọi client.login()...');
-            await client.login(botToken);
-            console.log(`✅ [LOGIN] client.login() resolved sau ${Date.now() - loginStartedAt}ms`);
-
-            if (client.isReady()) {
-                console.log(`🎉 [LOGIN] Discord READY thành công. Guilds=${client.guilds.cache.size}`);
-                return;
-            }
-
-            // Không poll quá dày. ClientReady event sẽ là nguồn xác nhận chính.
-            const readyDeadline = Date.now() + 45_000;
-            while (!client.isReady() && Date.now() < readyDeadline) {
-                await new Promise(resolve => setTimeout(resolve, 500));
-            }
+            await loginWithTimeout(botToken, loginTimeout);
 
             if (!client.isReady()) {
-                throw new Error('Gateway chưa phát READY trong 45 giây');
+                throw new Error(`client.login() hoàn tất nhưng Client chưa READY (ws=${getWsStatusName(client.ws?.status)})`);
             }
 
             console.log(`🎉 [LOGIN] Discord READY thành công. Guilds=${client.guilds.cache.size}`);
             return;
         } catch (err) {
-            console.error(`❌ [LOGIN] Lần ${attempt}/${maxAttempts} thất bại:`, err?.message || err);
+            console.error(`❌ [LOGIN] Lần ${attempt}/${maxAttempts} thất bại:`, err?.stack || err?.message || err);
+            try { client.destroy(); } catch (_) {}
             if (attempt === maxAttempts) break;
         }
     }
 
-    console.error('🛑 [LOGIN] Không thể kết nối Discord sau nhiều lần thử. Kiểm tra Gateway/Token/Render network và restart policy.');
+    console.error('🛑 [LOGIN] Không thể kết nối Discord sau nhiều lần thử. Nếu timeout tiếp tục, hãy dùng log [DISCORD SHARD ERROR/DISCONNECT] để xác định đường WebSocket.');
 }
 
 void connectDiscordWithRetry();
