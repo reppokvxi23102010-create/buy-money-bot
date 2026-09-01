@@ -92,22 +92,12 @@ console.log('🔌 [INTENTS] Guilds=true GuildMessages=true' +
 
 const client = new Client({
     intents: discordIntents,
-    // Giảm phụ thuộc vào REST /gateway/bot trên Render.
-    // Bot shop này chỉ cần 1 shard nên có thể dùng Gateway URL trực tiếp.
-    rest: { timeout: 15_000, retries: 2 },
+    // Dùng Gateway discovery + WebSocket chuẩn của discord.js.
+    // Không tự chèn Gateway URL giả hoặc tự gọi /gateway liên tục.
+    rest: { timeout: 20_000, retries: 2 },
     ws: {
-        // discord.js hỗ trợ custom fetchGatewayInformation.
-        // Trả thẳng Gateway URL để tránh /gateway/bot bị rate-limit.
-        fetchGatewayInformation: async () => ({
-            url: 'wss://gateway.discord.gg',
-            shards: 1,
-            session_start_limit: {
-                total: 1000,
-                remaining: 1000,
-                reset_after: 24 * 60 * 60 * 1000,
-                max_concurrency: 1
-            }
-        })
+        handshakeTimeout: 30_000,
+        helloTimeout: 15_000
     }
 });
 
@@ -6081,29 +6071,10 @@ process.on('uncaughtException', err => {
 });
 
 // ============================================================
-// 24. LOGIN
+// 24. LOGIN — Render-safe / discord.js standard Gateway
 // ============================================================
 
-// Khi Render restart/deploy, đóng Gateway sạch để tránh session cũ tranh interaction với instance mới.
-let shuttingDown = false;
-async function gracefulShutdown(signal) {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    console.log(`🛑 [SHUTDOWN] Nhận ${signal}, đóng Discord client...`);
-    try {
-        client.destroy();
-    } catch (err) {
-        console.error('❌ Lỗi khi destroy Discord client:', err?.message || err);
-    }
-    setTimeout(() => process.exit(0), 250);
-}
-
-process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.once('SIGINT', () => gracefulShutdown('SIGINT'));
-
-const botToken =
-    process.env.DISCORD_TOKEN ||
-    process.env.TOKEN;
+const botToken = process.env.DISCORD_TOKEN || process.env.TOKEN;
 
 console.log('🔒 Interaction handler: SINGLE LISTENER MODE');
 console.log(`🌐 Runtime: ${process.env.RENDER ? 'Render' : 'Local/Other'}`);
@@ -6112,7 +6083,7 @@ console.log(`🔐 [BOOT] Token present=${Boolean(botToken)} length=${botToken ? 
 console.log(`🆔 [BOOT] CLIENT_ID present=${Boolean(process.env.CLIENT_ID || process.env.APPLICATION_ID)} GUILD_ID present=${Boolean(process.env.GUILD_ID)}`);
 
 client.on('debug', info => {
-    if (/identify|session|gateway|resume|heartbeat|disallowed|close|disconnect|ws/i.test(info)) {
+    if (/identify|session|gateway|resume|heartbeat|disallowed|close|disconnect|ws|hello/i.test(info)) {
         console.log(`🛰️ [DISCORD DEBUG] ${info}`);
     }
 });
@@ -6123,119 +6094,56 @@ client.on('shardDisconnect', (event, shardId) => console.error(`🔌 [DISCORD SH
 client.on('shardReconnecting', shardId => console.warn(`🔄 [DISCORD RECONNECTING] shard=${shardId}`));
 client.on('shardReady', (shardId, unavailableGuilds) => console.log(`✅ [DISCORD SHARD READY] shard=${shardId} unavailableGuilds=${unavailableGuilds?.size ?? 0}`));
 
-function httpProbe(url, options = {}, timeoutMs = 12_000) {
-    return new Promise((resolve, reject) => {
-        const started = Date.now();
-        const req = https.request(url, {
-            method: options.method || 'GET',
-            headers: options.headers || {},
-            timeout: timeoutMs
-        }, res => {
-            let body = '';
-            res.setEncoding('utf8');
-            res.on('data', chunk => { body += chunk; });
-            res.on('end', () => {
-                resolve({
-                    statusCode: res.statusCode || 0,
-                    headers: res.headers,
-                    body,
-                    elapsedMs: Date.now() - started
-                });
-            });
-        });
-        req.on('timeout', () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
-        req.on('error', reject);
-        req.end();
-    });
-}
-
-async function diagnoseDiscordNetwork({includeGatewayProbe = false} = {}) {
-    console.log('🧪 [NET] Kiểm tra DNS Discord...');
-    const lookup = await dns.promises.lookup('discord.com', { all: true });
-    console.log(`✅ [NET] DNS discord.com: ${lookup.map(x => `${x.address}/${x.family}`).join(', ')}`);
-
-    // Không gọi /gateway liên tục: endpoint này có rate limit và 429 không có nghĩa
-    // Discord Gateway đang hỏng. Chỉ probe 1 lần khi explicitly yêu cầu.
-    if (!includeGatewayProbe) return;
-
-    const res = await httpProbe('https://discord.com/api/v10/gateway', {
-        headers: { 'User-Agent': 'buy-money-bot/1.0' }
-    });
-    console.log(`ℹ️ [NET] GET /gateway -> HTTP ${res.statusCode} trong ${res.elapsedMs}ms`);
-    if (res.statusCode >= 200 && res.statusCode < 300) return;
-    if (res.statusCode === 429) {
-        console.warn('⚠️ [NET] Discord /gateway đang rate-limit (429). Bỏ qua probe và để discord.js tự quản lý Gateway.');
-        return;
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`🛑 [SHUTDOWN] Nhận ${signal}, đóng Discord client...`);
+    try { client.destroy(); } catch (err) {
+        console.error('❌ Lỗi khi destroy Discord client:', err?.message || err);
     }
-    throw new Error(`Discord /gateway trả HTTP ${res.statusCode}`);
+    setTimeout(() => process.exit(0), 500).unref?.();
 }
+process.once('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.once('SIGINT', () => gracefulShutdown('SIGINT'));
 
-function wait(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function getWsStatusName(status) {
-    const names = {
-        0: 'READY',
-        1: 'CONNECTING',
-        2: 'RECONNECTING',
-        3: 'IDLE',
-        4: 'NEARLY',
-        5: 'DISCONNECTED',
-        6: 'WAITING_FOR_AUTHENTICATION'
-    };
-    return names[status] || String(status ?? 'unknown');
-}
-
-async function loginWithTimeout(token, timeoutMs) {
-    const started = Date.now();
-    let timer;
-    try {
-        const loginPromise = client.login(token);
-        const timeoutPromise = new Promise((_, reject) => {
-            timer = setTimeout(() => {
-                reject(new Error(`client.login() timeout sau ${timeoutMs}ms (ws=${getWsStatusName(client.ws?.status)})`));
-            }, timeoutMs);
-            timer.unref?.();
-        });
-        const result = await Promise.race([loginPromise, timeoutPromise]);
-        console.log(`✅ [LOGIN] client.login() resolved sau ${Date.now() - started}ms`);
-        return result;
-    } finally {
-        if (timer) clearTimeout(timer);
-    }
-}
-
-async function connectDiscordWithRetry() {
+async function connectDiscord() {
     if (!botToken) {
         console.error('❌ Không tìm thấy DISCORD_TOKEN/TOKEN trong Environment Variables!');
         process.exitCode = 1;
         return;
     }
 
-    const loginTimeout = Math.max(15_000, Number(process.env.DISCORD_LOGIN_TIMEOUT) || 45_000);
+    console.log('🔐 [LOGIN] Đang dùng Gateway chuẩn của discord.js (không custom Gateway URL).');
+    console.log(`🛰️ [LOGIN] WS status trước login: ${getWsStatusName(client.ws?.status)}`);
 
-    console.log('🧪 [NET] Kiểm tra DNS Discord...');
-    try {
-        const lookup = await dns.promises.lookup('discord.com', { all: true });
-        console.log(`✅ [NET] DNS discord.com: ${lookup.map(x => `${x.address}/${x.family}`).join(', ')}`);
-    } catch (err) {
-        console.warn(`⚠️ [NET] DNS Discord lỗi: ${err?.code || ''} ${err?.message || err}`);
-    }
-
-    console.log('🚀 [LOGIN] Dùng Gateway URL trực tiếp: wss://gateway.discord.gg');
-    console.log(`🛰️ [LOGIN] Gateway WS status trước login: ${getWsStatusName(client.ws?.status)}`);
+    let readyLogged = false;
+    const markReady = () => {
+        readyLogged = true;
+        console.log(`🎉 [LOGIN] Discord READY thành công. User=${client.user?.tag || client.user?.username || 'unknown'} Guilds=${client.guilds.cache.size}`);
+    };
+    client.once(Events.ClientReady, markReady);
 
     try {
-        await loginWithTimeout(botToken, loginTimeout);
-        if (!client.isReady()) {
+        // Không probe /gateway hay /gateway/bot thủ công. discord.js tự lấy
+        // Gateway info bằng REST có auth và tự quản lý reconnect/session.
+        await client.login(botToken);
+        if (!readyLogged && !client.isReady()) {
             throw new Error(`client.login() hoàn tất nhưng Client chưa READY (ws=${getWsStatusName(client.ws?.status)})`);
         }
-        console.log(`🎉 [LOGIN] Discord READY thành công. Guilds=${client.guilds.cache.size}`);
     } catch (err) {
-        console.error('❌ [LOGIN] Không thể kết nối Discord:', err?.stack || err?.message || err);
-        console.error('ℹ️ [LOGIN] Nếu lỗi có mã 4004 thì Token sai. Nếu là timeout/socket error thì kiểm tra Gateway/WebSocket.');
+        console.error('❌ [LOGIN] Discord login thất bại:', err?.stack || err?.message || err);
+        const code = err?.code;
+        if (code === 4004) {
+            console.error('🔐 [LOGIN] Discord báo 4004: Bot Token không hợp lệ.');
+        } else if (code === 4014) {
+            console.error('🔐 [LOGIN] Discord báo 4014: Privileged Gateway Intents chưa được bật trong Developer Portal.');
+        } else {
+            console.error('ℹ️ [LOGIN] Không nhận được READY. Kiểm tra tiếp các dòng [SHARD ERROR]/[DISCORD DEBUG].');
+        }
         process.exitCode = 1;
+        return;
     }
 }
-void connectDiscordWithRetry();
+
+void connectDiscord();
